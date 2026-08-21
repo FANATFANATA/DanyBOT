@@ -1,0 +1,5 @@
+telethon
+openai
+python-dotenv
+python-socks
+httpx

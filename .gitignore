@@ -1,0 +1,10 @@
+.env
+*.session
+*.session-journal
+__pycache__/
+.venv/
+state.json
+history.json
+working_proxies.json
+proxy_cache.txt
+tdata2session.py
