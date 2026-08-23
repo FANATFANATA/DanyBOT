@@ -8,3 +8,10 @@ history.json
 working_proxies.json
 proxy_cache.txt
 tdata2session.py
+.coverage
+.coverage.*
+htmlcov/
+toolrun.log
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/

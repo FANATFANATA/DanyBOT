@@ -27,30 +27,29 @@ WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
-_log_fh = None
+_log_lines: list[str] = []
 
 
 def log_open():
-    global _log_fh
-    _log_fh = open(LOG_FILE, "w", encoding="utf-8")
-    _log_write(
-        f"DanyBOT self-check :: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"python {sys.version.split()[0]} :: {sys.platform}\n"
-        f"cwd: {PROJECT_DIR}\n"
-    )
+    global _log_lines
+    _log_lines = [
+        (
+            f"DanyBOT self-check :: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"python {sys.version.split()[0]} :: {sys.platform}\n"
+            f"cwd: {PROJECT_DIR}\n"
+        ),
+    ]
 
 
 def log_close():
-    global _log_fh
-    if _log_fh is not None:
-        _log_fh.close()
-        _log_fh = None
+    global _log_lines
+    if _log_lines:
+        LOG_FILE.write_text("".join(_log_lines), encoding="utf-8")
+        _log_lines = []
 
 
 def _log_write(text):
-    if _log_fh is not None:
-        _log_fh.write(text)
-        _log_fh.flush()
+    _log_lines.append(text)
 
 
 def _cmd_str(cmd):
@@ -1168,48 +1167,62 @@ def run_linters():
 
 
 def print_summary(unit_result, lint_results):
-    total = unit_result.testsRun
-    failures = len(unit_result.failures)
-    errors = len(unit_result.errors)
-    skipped = len(unit_result.skipped)
+    failures = 0
+    errors = 0
+    skipped = 0
+    total = 0
+    if unit_result is not None:
+        total = unit_result.testsRun
+        failures = len(unit_result.failures)
+        errors = len(unit_result.errors)
+        skipped = len(unit_result.skipped)
     print()
     print("=" * 64)
     print("СВОДКА")
     print("=" * 64)
-    print(
-        f"Юнит-тесты : {total - failures - errors - skipped}/{total} OK, "
-        f"fail={failures}, error={errors}, skip={skipped}"
-    )
-    for name, status, note in lint_results:
+    if unit_result is not None:
+        print(
+            f"Юнит-тесты : {total - failures - errors - skipped}/{total} OK, "
+            f"fail={failures}, error={errors}, skip={skipped}"
+        )
+    else:
+        print("Юнит-тесты : ПРОПУЩЕНО")
+    for name, status, note, _elapsed in lint_results:
         line = f"{name:<13} {status:<5}"
         if note:
             line += f"  {note}"
         print(line)
     print("=" * 64)
-    lint_failed = any(status == "FAIL" for _, status, _ in lint_results)
-    verdict_ok = unit_result.wasSuccessful() and not lint_failed
+    lint_failed = any(status == "FAIL" for _, status, _, _ in lint_results)
+    verdict_ok = (
+        unit_result is None or unit_result.wasSuccessful()
+    ) and not lint_failed
     print("ВЕРДИКТ   :", "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" if verdict_ok else "ЕСТЬ ПРОВАЛЫ")
     return verdict_ok
 
 
 def main(argv=None):
     _reconfigure_stdio()
-    parser = argparse.ArgumentParser(description="DanyBOT self-check runner")
-    parser.add_argument("--skip-unit", action="store_true")
-    parser.add_argument("--skip-lint", action="store_true")
-    args = parser.parse_args(argv)
+    log_open()
+    try:
+        parser = argparse.ArgumentParser(description="DanyBOT self-check runner")
+        parser.add_argument("--skip-unit", action="store_true")
+        parser.add_argument("--skip-lint", action="store_true")
+        args = parser.parse_args(argv)
 
-    unit_result = None
-    lint_results = []
-    if not args.skip_unit:
-        print("--- Юнит-тесты ---")
-        unit_result = run_unit_tests()
-    if not args.skip_lint:
-        print("--- Линтеры и статический анализ ---")
-        lint_results = run_linters()
+        unit_result = None
+        lint_results = []
+        if not args.skip_unit:
+            print("--- Юнит-тесты ---")
+            unit_result = run_unit_tests()
+        if not args.skip_lint:
+            print("--- Линтеры и статический анализ ---")
+            lint_results = run_linters()
 
-    ok = print_summary(unit_result, lint_results)
-    return 0 if ok else 1
+        ok = print_summary(unit_result, lint_results)
+        return 0 if ok else 1
+    finally:
+        log_close()
 
 
 if __name__ == "__main__":
