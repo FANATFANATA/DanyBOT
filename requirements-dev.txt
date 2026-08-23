@@ -1,0 +1,14 @@
+coverage
+pyflakes
+flake8
+ruff
+black
+isort
+pylint
+vulture
+bandit
+mypy
+pyright
+radon
+codespell
+pip-audit
