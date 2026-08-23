@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections import deque
 from pathlib import Path
@@ -25,6 +26,54 @@ PY_FILES = ("bot.py", "proxies.py", "tests.py")
 WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
+LOG_FILE = PROJECT_DIR / "toolrun.log"
+_log_fh = None
+
+
+def log_open():
+    global _log_fh
+    _log_fh = open(LOG_FILE, "w", encoding="utf-8")
+    _log_write(
+        f"DanyBOT self-check :: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"python {sys.version.split()[0]} :: {sys.platform}\n"
+        f"cwd: {PROJECT_DIR}\n"
+    )
+
+
+def log_close():
+    global _log_fh
+    if _log_fh is not None:
+        _log_fh.close()
+        _log_fh = None
+
+
+def _log_write(text):
+    if _log_fh is not None:
+        _log_fh.write(text)
+        _log_fh.flush()
+
+
+def _cmd_str(cmd):
+    return " ".join(str(part) for part in cmd)
+
+
+def run_logged(cmd):
+    started = time.perf_counter()
+    _log_write(f"\n$ {_cmd_str(cmd)}\n")
+    proc = subprocess.run(
+        cmd,
+        cwd=PROJECT_DIR,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    elapsed = time.perf_counter() - started
+    _log_write(proc.stdout or "")
+    _log_write(proc.stderr or "")
+    _log_write(f"[rc={proc.returncode}] {elapsed:.2f}s\n")
+    return proc, elapsed
 
 
 def _reconfigure_stdio():
@@ -1054,8 +1103,8 @@ def extract_note(name, proc):
 
 def run_coverage():
     base = [sys.executable, "-m", "coverage"]
-    subprocess.run([*base, "erase"], cwd=PROJECT_DIR, capture_output=True, check=False)
-    run_proc = subprocess.run(
+    run_logged([*base, "erase"])
+    run_proc, elapsed1 = run_logged(
         [
             *base,
             "run",
@@ -1067,63 +1116,54 @@ def run_coverage():
             ".",
             "-p",
             "tests.py",
-        ],
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+        ]
     )
     if run_proc.returncode != 0:
         tail = (run_proc.stdout + run_proc.stderr).strip().splitlines()
-        return ("coverage", "FAIL", " | ".join(tail[-2:])[:120])
-    rep = subprocess.run(
-        [*base, "report"],
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+        return ("coverage", "FAIL", " | ".join(tail[-2:])[:120], elapsed1)
+    rep, elapsed2 = run_logged([*base, "report"])
     note = extract_note("coverage", rep)
-    return ("coverage", "PASS", note)
+    return ("coverage", "PASS", note, elapsed1 + elapsed2)
 
 
 def run_linters():
     results = []
-    for name, cmd in build_linters():
+    tools = build_linters()
+    total = len(tools)
+    for idx, (name, cmd) in enumerate(tools, start=1):
+        print(f"[{idx:>2}/{total}] {name}")
         if name == "coverage":
             if find_spec_or_none("coverage"):
                 results.append(run_coverage())
             else:
-                results.append((name, "SKIP", "инструмент не найден"))
+                results.append((name, "SKIP", "инструмент не найден", 0.0))
+                print("      SKIP: инструмент не найден")
             continue
         if cmd is None:
-            results.append((name, "SKIP", "инструмент не найден"))
+            results.append((name, "SKIP", "инструмент не найден", 0.0))
+            print(f"      $ {_cmd_str(cmd) if cmd else name}")
+            print("      SKIP: инструмент не найден")
             continue
-        proc = subprocess.run(
-            cmd,
-            cwd=PROJECT_DIR,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        print(f"      $ {_cmd_str(cmd)}")
+        proc, elapsed = run_logged(cmd)
+        status = "PASS" if proc.returncode == 0 else "FAIL"
+        note = ""
         if proc.returncode == 0:
-            results.append((name, "PASS", extract_note(name, proc)))
-            continue
-        combined = proc.stdout + proc.stderr
-        if name == "pip-audit" and (
-            "Traceback" in combined or "Connection" in combined
-        ):
-            results.append((name, "SKIP", "нет доступа к сети или реестру"))
-            continue
-        tail = combined.strip().splitlines()
-        note = " | ".join(tail[-3:])[:120]
-        results.append((name, "FAIL", note))
+            note = extract_note(name, proc)
+        else:
+            combined = proc.stdout + proc.stderr
+            if name == "pip-audit" and (
+                "Traceback" in combined or "Connection" in combined
+            ):
+                status = "SKIP"
+                note = "нет доступа к сети или реестру"
+            else:
+                tail = combined.strip().splitlines()
+                note = " | ".join(tail[-3:])[:120]
+        results.append((name, status, note, elapsed))
+        print(f"      rc={proc.returncode} · {elapsed:.2f}s · {status}")
+        if note:
+            print(f"      {note}")
     return results
 
 
