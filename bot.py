@@ -5,14 +5,16 @@ import logging
 import math
 import os
 import re
+import struct
 import time
 from collections import deque
 from pathlib import Path
+from typing import Any, cast
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAIError
 from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import AuthKeyError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
 
 import proxies
@@ -25,7 +27,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("danybot")
 
-API_ID = int(os.getenv("API_ID", "2040") or "2040")
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if value else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env_str(name, "")
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env_str(name, "")
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+API_ID = _env_int("API_ID", 2040)
 API_HASH = os.getenv("API_HASH", "") or "b18441a1ff607e10a989891a5462e627"
 SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
@@ -70,20 +94,18 @@ def _build_trigger_re():
 
 TRIGGER_RE = _build_trigger_re()
 
-EDIT_INTERVAL = float(os.getenv("EDIT_INTERVAL", "1"))
-GROUP_HISTORY_LIMIT = int(os.getenv("GROUP_HISTORY_LIMIT", "40"))
-DM_HISTORY_LIMIT = int(os.getenv("DM_HISTORY_LIMIT", "100"))
-MAX_TOKENS = int(os.getenv("MAX_TOKENS", "4096"))
-MAX_REQUEST_LEN = int(os.getenv("MAX_REQUEST_LEN", "8000"))
-MAX_TOOL_ROUNDS = int(os.getenv("MAX_TOOL_ROUNDS", "8"))
-AUTO_RESPOND_GLOBAL = os.getenv("AUTO_RESPOND", "0").strip() in (
-    "1",
-    "true",
-    "yes",
-)
-COOLDOWN = float(os.getenv("COOLDOWN", "0"))
-BOT_NAME = os.getenv("BOT_NAME", "DanyBOT").strip()
-SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "").strip()
+EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
+GROUP_HISTORY_LIMIT = max(2, _env_int("GROUP_HISTORY_LIMIT", 40))
+DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
+MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
+MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
+MAX_TOOL_ROUNDS = max(1, _env_int("MAX_TOOL_ROUNDS", 8))
+AUTO_RESPOND_GLOBAL = _env_str("AUTO_RESPOND", "0").lower() in ("1", "true", "yes")
+COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
+BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
+SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
+
+REPLY_ATTEMPTS = 3
 
 EXTRA_SYSTEM = ""
 if SYSTEM_PROMPT_FILE:
@@ -95,18 +117,17 @@ if SYSTEM_PROMPT_FILE:
 STATE_FILE = Path(__file__).parent / "state.json"
 HISTORY_FILE = Path(__file__).parent / "history.json"
 
-MODELS = ["deepseek-v4-flash"]
+MODELS: list[str] = ["deepseek-v4-flash"]
 
-model_overrides = {}
-auto_respond = set()
-ignored_chats = set()
-ignored_users = set()
+model_overrides: dict[int, str] = {}
+auto_respond: set[int] = set()
+ignored_chats: set[int] = set()
+ignored_users: set[int] = set()
 
-chat_history = {}
+chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
-recent_reply_ids = set()
-last_chat_activity = {}
-me_self = None
+recent_reply_ids: set[int] = set()
+last_chat_activity: dict[int, float] = {}
 
 
 def make_session(name: str):
@@ -114,7 +135,7 @@ def make_session(name: str):
     if value.startswith("1"):
         try:
             return StringSession(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, struct.error):
             return name
     return name
 
@@ -143,7 +164,13 @@ def load_state():
         auto_respond = {int(x) for x in data.get("auto_respond", [])}
         ignored_chats = {int(x) for x in data.get("ignored_chats", [])}
         ignored_users = {int(x) for x in data.get("ignored_users", [])}
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as exc:
         logger.warning("Не удалось загрузить state.json: %s", exc)
 
 
@@ -163,7 +190,6 @@ def save_state():
 
 
 def load_history():
-    global chat_history
     if not HISTORY_FILE.exists():
         return
     try:
@@ -173,12 +199,15 @@ def load_history():
                 chat_id = int(key)
             except (ValueError, TypeError):
                 continue
-            if chat_id > 0:
-                limit = DM_HISTORY_LIMIT
-            else:
-                limit = GROUP_HISTORY_LIMIT
+            limit = DM_HISTORY_LIMIT if chat_id > 0 else GROUP_HISTORY_LIMIT
             chat_history[chat_id] = deque(value, maxlen=limit)
-    except (json.JSONDecodeError, ValueError, KeyError) as exc:
+    except (
+        json.JSONDecodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ) as exc:
         logger.warning("Не удалось загрузить history.json: %s", exc)
 
 
@@ -362,6 +391,9 @@ SAFE_FUNCS = {
     "tan": math.tan,
     "log": math.log,
     "log10": math.log10,
+}
+
+SAFE_CONSTS = {
     "pi": math.pi,
     "e": math.e,
 }
@@ -402,8 +434,8 @@ def _eval_node(node):
             return -operand
         raise ValueError("Недопустимый унарный оператор")
     if isinstance(node, ast.Name):
-        if node.id in SAFE_FUNCS:
-            return SAFE_FUNCS[node.id]
+        if node.id in SAFE_CONSTS:
+            return SAFE_CONSTS[node.id]
         raise ValueError("Недопустимое имя")
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS:
@@ -438,7 +470,7 @@ async def execute_tool(name: str, arguments: dict, chat_id):
             limit = 20
         limit = max(1, min(limit, 100))
         try:
-            msgs = await client.get_messages(chat_id, limit=limit)
+            msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
         except (RPCError, OSError, ValueError) as exc:
             return f"Ошибка получения истории: {exc}"
         if not msgs:
@@ -532,7 +564,7 @@ async def execute_tool(name: str, arguments: dict, chat_id):
             limit = 20
         limit = max(1, min(limit, 100))
         try:
-            msgs = await client.get_messages(chat, limit=limit)
+            msgs = cast(Any, await client.get_messages(chat, limit=limit))
         except (RPCError, OSError, ValueError) as exc:
             return f"Ошибка получения истории: {exc}"
         if not msgs:
@@ -546,7 +578,7 @@ async def execute_tool(name: str, arguments: dict, chat_id):
     if name == "get_message_by_id":
         try:
             message_id = int(arguments.get("message_id", 0))
-            msgs = await client.get_messages(chat_id, ids=[message_id])
+            msgs = cast(Any, await client.get_messages(chat_id, ids=[message_id]))
         except (RPCError, OSError, ValueError, TypeError) as exc:
             return f"Ошибка получения сообщения: {exc}"
         if not msgs:
@@ -575,9 +607,9 @@ async def execute_tool(name: str, arguments: dict, chat_id):
 async def stream_with_tools(
     messages: list, model: str, chat_id, on_delta, on_reasoning
 ):
-    working = [dict(m) for m in messages]
+    working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
-    content_parts = []
+    content_parts: list[str] = []
     while True:
         rounds += 1
         if rounds > MAX_TOOL_ROUNDS:
@@ -586,16 +618,17 @@ async def stream_with_tools(
                 if content_parts
                 else "Достигнут лимит циклов инструментов."
             )
-        tool_calls = {}
+        tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
-        stream = await ai.chat.completions.create(
+        raw_stream = await ai.chat.completions.create(
             model=model,
-            messages=working,
+            messages=cast(Any, working),
             temperature=0.7,
             max_tokens=MAX_TOKENS,
             stream=True,
-            tools=TOOLS,
+            tools=cast(Any, TOOLS),
         )
+        stream = cast(Any, raw_stream)
         async for chunk in stream:
             if not chunk.choices:
                 continue
@@ -672,29 +705,33 @@ async def get_sender_label(event):
 
 
 async def safe_reply(event, text):
-    try:
-        sent = await event.reply(text)
+    for _attempt in range(REPLY_ATTEMPTS):
+        try:
+            sent = await event.reply(text)
+        except FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 30))
+            continue
+        except (RPCError, OSError, ValueError, TypeError):
+            return None
         if sent:
             recent_reply_ids.add(sent.id)
             if len(recent_reply_ids) > 5000:
                 recent_reply_ids.clear()
         return sent
-    except FloodWaitError as e:
-        await asyncio.sleep(min(e.seconds, 30))
-        return await safe_reply(event, text)
-    except (RPCError, OSError, ValueError, TypeError):
-        return None
+    return None
 
 
 async def edit_text(chat_id, msg_id, text):
-    try:
-        await client.edit_message(chat_id, msg_id, text)
-        return True
-    except FloodWaitError as e:
-        await asyncio.sleep(min(e.seconds, 30))
-        return await edit_text(chat_id, msg_id, text)
-    except (RPCError, OSError, ValueError, TypeError):
-        return False
+    for _attempt in range(REPLY_ATTEMPTS):
+        try:
+            await client.edit_message(chat_id, msg_id, text)
+            return True
+        except FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 30))
+            continue
+        except (RPCError, OSError, ValueError, TypeError):
+            return False
+    return False
 
 
 SUB_ALIASES = {
@@ -718,11 +755,14 @@ def _strip_alias_prefix(low):
     )
     for a in all_aliases:
         if low.startswith(a):
-            return low[len(a) :].strip(), a
+            tail = low[len(a) :]
+            if tail and not tail[0].isspace():
+                continue
+            return tail.strip(), a
     return None, None
 
 
-def handle_commands(text):
+def handle_commands(text) -> tuple[str, Any] | None:
     low = text.strip()
     lowlower = low.lower()
     if not low.startswith("."):
@@ -745,21 +785,21 @@ def handle_commands(text):
             return ("autorespond", False)
 
     if sub in SUB_ALIASES["reset"]:
-        return ("reset",)
+        return ("reset", None)
     if sub in SUB_ALIASES["models"]:
-        return ("models",)
+        return ("models", None)
     if sub in SUB_ALIASES["model"]:
         return ("model", arg or None)
     if sub in SUB_ALIASES["history"]:
-        return ("history",)
+        return ("history", None)
     if sub in SUB_ALIASES["help"]:
-        return ("help",)
+        return ("help", None)
     if sub in SUB_ALIASES["ping"]:
-        return ("ping",)
+        return ("ping", None)
     if sub in SUB_ALIASES["ignore"]:
-        return ("ignore",)
+        return ("ignore", None)
     if sub in SUB_ALIASES["unignore"]:
-        return ("unignore",)
+        return ("unignore", None)
 
     return None
 
@@ -815,6 +855,8 @@ async def handler(event: events.NewMessage.Event):
     text = message.message
     msg_id = message.id
     chat_id = event.chat_id
+    if chat_id is None:
+        return
     sender_id = event.sender_id
     is_self = bool(message.out)
 
@@ -993,7 +1035,7 @@ async def handler(event: events.NewMessage.Event):
     try:
         full_answer = ""
         last_edit = 0.0
-        reasoning_parts = []
+        reasoning_parts: list[str] = []
 
         def render():
             out = prefix
@@ -1018,7 +1060,7 @@ async def handler(event: events.NewMessage.Event):
                 await edit_text(chat_id, edit_id, render())
                 last_edit = now_m
 
-        async with client.action(chat_id, "typing"):
+        async with cast(Any, client.action(chat_id, "typing")):
             if not is_self:
                 placeholder = await event.reply("…")
                 if placeholder:
@@ -1047,8 +1089,6 @@ async def handler(event: events.NewMessage.Event):
 
 
 async def main():
-    global me_self
-
     load_state()
     load_history()
     await refresh_models()
@@ -1063,32 +1103,33 @@ async def main():
             logger.info("Пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
             client.set_proxy(proxy)
         try:
-            await asyncio.wait_for(client.start(), timeout=25)
-            me_self = await client.get_me()
+            start_coro = cast(Any, client.start())
+            await asyncio.wait_for(start_coro, timeout=25)
+            me = await client.get_me()
             logger.info(
-                "Бот запущен как %s (@%s)", me_self.first_name, me_self.username
+                "Бот запущен как %s (@%s)",
+                getattr(me, "first_name", "?"),
+                getattr(me, "username", "?"),
             )
             break
-        except (
-            OSError,
-            RPCError,
-            ConnectionError,
-            asyncio.TimeoutError,
-            FloodWaitError,
-        ) as exc:
+        except AuthKeyError as exc:
+            logger.error("Сессия невалидна, подключение прервано: %s", exc)
+            return
+        except (OSError, RPCError, ConnectionError, TimeoutError) as exc:
             logger.warning(
                 "Не удалось подключиться через %s: %s", proxy, type(exc).__name__
             )
+            try:
+                await cast(Any, client.disconnect())
+            except (RPCError, OSError, ConnectionError) as exc2:
+                logger.warning("Ошибка отключения от прокси: %s", exc2)
             if proxy:
-                try:
-                    await client.disconnect()
-                except (RPCError, OSError, ConnectionError) as exc:
-                    logger.warning("Ошибка отключения от прокси: %s", exc)
+                proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
     else:
         logger.error("Не удалось подключиться ни через один прокси")
         return
 
-    await client.run_until_disconnected()
+    await cast(Any, client.run_until_disconnected())
 
 
 if __name__ == "__main__":

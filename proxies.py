@@ -1,12 +1,16 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import re
 from pathlib import Path
+from typing import Any, cast
 
 import httpx
 from telethon import TelegramClient
+from telethon.errors import InvalidChecksumError, RPCError
+from telethon.errors.common import ReadCancelledError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 
@@ -19,6 +23,18 @@ PROTOCOLS = {"socks5", "socks4", "http"}
 
 VALIDATE_API_ID = 2040
 VALIDATE_API_HASH = "b18441a1ff607e10a989891a5462e627"
+
+VALIDATION_ERRORS = (
+    RPCError,
+    ConnectionError,
+    OSError,
+    TimeoutError,
+    BufferError,
+    ValueError,
+    TypeError,
+    InvalidChecksumError,
+    ReadCancelledError,
+)
 
 SOURCES = [
     (
@@ -108,16 +124,22 @@ def save_raw_cache(proxies):
 
 
 async def fetch_sources():
-    proxies = []
     async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        for protocol, url in SOURCES:
+
+        async def fetch_one(protocol: str, url: str):
             try:
                 resp = await client.get(url)
                 resp.raise_for_status()
-                parsed = parse_proxy_lines(resp.text, protocol)
-                proxies.extend(parsed)
-            except Exception as exc:
+                return parse_proxy_lines(resp.text, protocol)
+            except (httpx.HTTPError, OSError, ValueError) as exc:
                 logger.debug("Не удалось скачать %s: %s", url, exc)
+                return []
+
+        results = await asyncio.gather(
+            *(fetch_one(protocol, url) for protocol, url in SOURCES)
+        )
+        proxies = [item for chunk in results for item in chunk]
+    logger.info("Собрано %d прокси из %d источников", len(proxies), len(SOURCES))
     return proxies
 
 
@@ -139,6 +161,12 @@ def proxy_to_telethon(item):
     return {"proxy_type": protocol, "addr": host, "port": port}
 
 
+def telethon_to_item(proxy_dict):
+    if not proxy_dict:
+        return None
+    return (proxy_dict["proxy_type"], proxy_dict["addr"], proxy_dict["port"])
+
+
 async def validate_one_mtproto(proxy_dict, timeout=12):
     tmp = TelegramClient(
         MemorySession(),
@@ -153,13 +181,11 @@ async def validate_one_mtproto(proxy_dict, timeout=12):
         await asyncio.wait_for(tmp.connect(), timeout=timeout)
         await asyncio.wait_for(tmp(GetConfigRequest()), timeout=timeout)
         return True
-    except Exception:
+    except VALIDATION_ERRORS:
         return False
     finally:
-        try:
-            await tmp.disconnect()
-        except Exception:
-            pass
+        with contextlib.suppress(Exception):
+            await cast(Any, tmp.disconnect())
 
 
 async def validate_one(proto_name, host, port, timeout=12):
@@ -182,15 +208,18 @@ async def validate_many(proxies, limit=10, concurrency=20):
             return None
 
     tasks = [asyncio.create_task(run(p)) for p in proxies]
-    for coro in asyncio.as_completed(tasks):
-        res = await coro
-        if res:
-            working.append(res)
-            logger.info("Рабочий прокси: %s %s:%s", *res)
-            if len(working) >= limit:
-                for t in tasks:
-                    t.cancel()
-                break
+    try:
+        for coro in asyncio.as_completed(tasks):
+            res = await cast(Any, coro)
+            if res:
+                working.append(res)
+                logger.info("Рабочий прокси: %s %s:%s", *res)
+                if len(working) >= limit:
+                    break
+    finally:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
     return working
 
 
@@ -200,7 +229,7 @@ def load_proxy_cache():
     try:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
         return [(p["protocol"], p["host"], p["port"]) for p in data]
-    except Exception:
+    except (OSError, ValueError, KeyError, TypeError):
         return []
 
 
@@ -220,6 +249,8 @@ async def get_working_proxies(limit=10, prefer_protocol="socks5"):
     fetched = await fetch_sources()
     raw_cached = load_raw_cache()
     all_proxies = dedupe(fetched + raw_cached)
+    if prefer_protocol:
+        all_proxies.sort(key=lambda p: p[0] != prefer_protocol)
     if all_proxies:
         save_raw_cache(all_proxies[:5000])
 
@@ -240,7 +271,7 @@ async def get_working_proxy(prefer_protocol="socks5"):
 def mark_bad_proxy(item):
     if not item:
         return
-    protocol, host, port = item
+    _protocol, host, port = item
     cached = load_proxy_cache()
     cached = [p for p in cached if not (p[1] == host and p[2] == port)]
     save_proxy_cache(cached)
