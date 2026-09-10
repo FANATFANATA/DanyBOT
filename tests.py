@@ -12,6 +12,7 @@ import unittest
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any, ClassVar
 from unittest import mock
 
 from telethon.crypto import AuthKey
@@ -20,9 +21,10 @@ from telethon.sessions import StringSession
 
 import bot
 import proxies
+import userbot
 
 PROJECT_DIR = Path(__file__).resolve().parent
-PY_FILES = ("bot.py", "proxies.py", "tests.py")
+PY_FILES = ("main.py", "bot.py", "userbot.py", "proxies.py", "tests.py")
 WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
@@ -89,8 +91,8 @@ def patch_paths(testcase):
     for mod, attr, fname in (
         (proxies, "CACHE_FILE", "working_proxies.json"),
         (proxies, "RAW_CACHE_FILE", "proxy_cache.txt"),
-        (bot, "STATE_FILE", "state.json"),
-        (bot, "HISTORY_FILE", "history.json"),
+        (userbot, "STATE_FILE", "state_userbot.json"),
+        (userbot, "HISTORY_FILE", "history_userbot.json"),
     ):
         saved.append((mod, attr, getattr(mod, attr)))
         setattr(mod, attr, tmp / fname)
@@ -105,24 +107,24 @@ def patch_paths(testcase):
 
 def snapshot_bot_state():
     return {
-        "model_overrides": dict(bot.model_overrides),
-        "auto_respond": set(bot.auto_respond),
-        "ignored_chats": set(bot.ignored_chats),
-        "ignored_users": set(bot.ignored_users),
+        "model_overrides": dict(userbot.model_overrides),
+        "auto_respond": set(userbot.auto_respond),
+        "ignored_chats": set(userbot.ignored_chats),
+        "ignored_users": set(userbot.ignored_users),
         "chat_history": {
-            k: deque(v, maxlen=v.maxlen) for k, v in bot.chat_history.items()
+            k: deque(v, maxlen=v.maxlen) for k, v in userbot.chat_history.items()
         },
-        "MODELS": list(bot.MODELS),
+        "MODELS": list(userbot.MODELS),
     }
 
 
 def restore_bot_state(snap):
-    bot.model_overrides = snap["model_overrides"]
-    bot.auto_respond = snap["auto_respond"]
-    bot.ignored_chats = snap["ignored_chats"]
-    bot.ignored_users = snap["ignored_users"]
-    bot.chat_history = snap["chat_history"]
-    bot.MODELS = snap["MODELS"]
+    userbot.model_overrides = snap["model_overrides"]
+    userbot.auto_respond = snap["auto_respond"]
+    userbot.ignored_chats = snap["ignored_chats"]
+    userbot.ignored_users = snap["ignored_users"]
+    userbot.chat_history = snap["chat_history"]
+    userbot.MODELS = snap["MODELS"]
 
 
 class BotTestCase(unittest.TestCase):
@@ -249,53 +251,53 @@ class EnvHelpersTest(BotTestCase):
     def test_env_int_default_when_unset(self):
         with mock.patch.dict(os.environ):
             os.environ.pop("DANYBOT_TEST_INT", None)
-            self.assertEqual(bot._env_int("DANYBOT_TEST_INT", 7), 7)
+            self.assertEqual(userbot._env_int("DANYBOT_TEST_INT", 7), 7)
 
     def test_env_int_valid_and_garbage(self):
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_INT": "42"}):
-            self.assertEqual(bot._env_int("DANYBOT_TEST_INT", 7), 42)
+            self.assertEqual(userbot._env_int("DANYBOT_TEST_INT", 7), 42)
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_INT": "abc"}):
-            self.assertEqual(bot._env_int("DANYBOT_TEST_INT", 7), 7)
+            self.assertEqual(userbot._env_int("DANYBOT_TEST_INT", 7), 7)
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_INT": "3.9"}):
-            self.assertEqual(bot._env_int("DANYBOT_TEST_INT", 7), 7)
+            self.assertEqual(userbot._env_int("DANYBOT_TEST_INT", 7), 7)
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_INT": "-5"}):
-            self.assertEqual(bot._env_int("DANYBOT_TEST_INT", 7), -5)
+            self.assertEqual(userbot._env_int("DANYBOT_TEST_INT", 7), -5)
 
     def test_env_float_valid_garbage_empty(self):
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_FLT": "2.5"}):
-            self.assertEqual(bot._env_float("DANYBOT_TEST_FLT", 1.0), 2.5)
+            self.assertEqual(userbot._env_float("DANYBOT_TEST_FLT", 1.0), 2.5)
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_FLT": "junk"}):
-            self.assertEqual(bot._env_float("DANYBOT_TEST_FLT", 1.0), 1.0)
+            self.assertEqual(userbot._env_float("DANYBOT_TEST_FLT", 1.0), 1.0)
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_FLT": ""}):
-            self.assertEqual(bot._env_float("DANYBOT_TEST_FLT", 1.0), 1.0)
+            self.assertEqual(userbot._env_float("DANYBOT_TEST_FLT", 1.0), 1.0)
 
     def test_env_str_strips_and_defaults(self):
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_STR": "  hi  "}):
-            self.assertEqual(bot._env_str("DANYBOT_TEST_STR", "d"), "hi")
+            self.assertEqual(userbot._env_str("DANYBOT_TEST_STR", "d"), "hi")
         with mock.patch.dict(os.environ, {"DANYBOT_TEST_STR": "   "}):
-            self.assertEqual(bot._env_str("DANYBOT_TEST_STR", "d"), "")
+            self.assertEqual(userbot._env_str("DANYBOT_TEST_STR", "d"), "")
         with mock.patch.dict(os.environ):
             os.environ.pop("DANYBOT_TEST_STR", None)
-            self.assertEqual(bot._env_str("DANYBOT_TEST_STR", "d"), "d")
+            self.assertEqual(userbot._env_str("DANYBOT_TEST_STR", "d"), "d")
 
 
 class MakeSessionTest(unittest.TestCase):
     def test_plain_name_passthrough(self):
-        self.assertEqual(bot.make_session("plainname"), "plainname")
+        self.assertEqual(userbot.make_session("plainname"), "plainname")
 
     def test_valid_string_session(self):
         session = StringSession()
         session.set_dc(2, "149.154.167.50", 443)
         session.auth_key = AuthKey(bytes(256))
         raw = session.save()
-        result = bot.make_session(raw)
+        result = userbot.make_session(raw)
         self.assertIsInstance(result, StringSession)
 
     def test_struct_error_fallback(self):
-        self.assertEqual(bot.make_session("1AAAA"), "1AAAA")
+        self.assertEqual(userbot.make_session("1AAAA"), "1AAAA")
 
     def test_binascii_error_fallback(self):
-        self.assertEqual(bot.make_session("1notvalid@@@"), "1notvalid@@@")
+        self.assertEqual(userbot.make_session("1notvalid@@@"), "1notvalid@@@")
 
 
 class TriggerRegexTest(unittest.TestCase):
@@ -320,19 +322,22 @@ class TriggerRegexTest(unittest.TestCase):
     def test_matches(self):
         for case in self.MATCH_CASES:
             with self.subTest(case=case):
-                self.assertIsNotNone(bot.TRIGGER_RE.search(case))
+                self.assertIsNotNone(userbot.TRIGGER_RE.search(case))
 
     def test_no_match(self):
         for case in self.NO_MATCH_CASES:
             with self.subTest(case=case):
-                self.assertIsNone(bot.TRIGGER_RE.search(case))
+                self.assertIsNone(userbot.TRIGGER_RE.search(case))
 
 
 class HandleCommandsTest(unittest.TestCase):
     CHECKS = (
-        (".db reset", ("reset", None)),
-        ("  .DB RESET ", ("reset", None)),
-        (".db reset extra args", ("reset", None)),
+        (".db clear", ("clear", None)),
+        ("  .DB CLEAR ", ("clear", None)),
+        (".db clear extra args", ("clear", None)),
+        (".db очистить", ("clear", None)),
+        (".db очистка", ("clear", None)),
+        (".db сброс", ("clear", None)),
         (".gpt модель gpt-x", ("model", "gpt-x")),
         (".db model", ("model", None)),
         (".da on", ("autorespond", True)),
@@ -354,18 +359,18 @@ class HandleCommandsTest(unittest.TestCase):
         ".da maybe",
         ".db unknowncmd",
         ".dbmodel",
-        ".unknown reset",
+        ".unknown clear",
     )
 
     def test_commands_parsed(self):
         for text, expected in self.CHECKS:
             with self.subTest(text=text):
-                self.assertEqual(bot.handle_commands(text), expected)
+                self.assertEqual(userbot.handle_commands(text), expected)
 
     def test_commands_none(self):
         for text in self.NONE_CASES:
             with self.subTest(text=text):
-                self.assertIsNone(bot.handle_commands(text))
+                self.assertIsNone(userbot.handle_commands(text))
 
 
 class StripRoleTagTest(unittest.TestCase):
@@ -380,7 +385,7 @@ class StripRoleTagTest(unittest.TestCase):
         }
         for src, expected in cases.items():
             with self.subTest(src=src):
-                self.assertEqual(bot.strip_role_tag(src), expected)
+                self.assertEqual(userbot.strip_role_tag(src), expected)
 
 
 class SafeEvalTest(unittest.TestCase):
@@ -414,12 +419,12 @@ class SafeEvalTest(unittest.TestCase):
     def test_exact(self):
         for expr, expected in self.EXACT_CASES:
             with self.subTest(expr=expr):
-                self.assertEqual(bot.safe_eval(expr), expected)
+                self.assertEqual(userbot.safe_eval(expr), expected)
 
     def test_errors(self):
         for expr in self.ERROR_CASES:
             with self.subTest(expr=expr):
-                result = bot.safe_eval(expr)
+                result = userbot.safe_eval(expr)
                 self.assertTrue(result.startswith("Ошибка вычисления"), result)
 
 
@@ -528,6 +533,73 @@ class ProxyParsingTest(BotTestCase):
         self.assertFalse(proxies.CACHE_FILE.exists())
 
 
+class ProxyToggleTest(BotTestCase):
+    def test_enabled_by_default(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("PROXY_ENABLED", None)
+            self.assertTrue(proxies.proxies_enabled())
+
+    def test_disabled_values(self):
+        for value in ("0", "false", "no", "", "FALSE", "No", " "):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"PROXY_ENABLED": value}),
+            ):
+                self.assertFalse(proxies.proxies_enabled())
+
+    def test_enabled_values(self):
+        for value in ("1", "true", "yes", "on", "TRUE", "Yes"):
+            with (
+                self.subTest(value=value),
+                mock.patch.dict(os.environ, {"PROXY_ENABLED": value}),
+            ):
+                self.assertTrue(proxies.proxies_enabled())
+
+    def test_disabled_returns_no_candidates(self):
+        async def fail_get_working(*_args, **_kwargs):
+            raise AssertionError("get_working_proxies не должен вызываться")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PROXY_ENABLED": "0",
+                    "PROXY_HOST": "1.2.3.4",
+                    "PROXY_PORT": "1080",
+                },
+            ),
+            mock.patch.object(proxies, "get_working_proxies", fail_get_working),
+        ):
+            result = asyncio.run(proxies.get_proxy_candidates(limit=5))
+        self.assertEqual(result, [])
+
+    def test_enabled_collects_manual_and_auto(self):
+        async def fake_get_working(limit=10, prefer_protocol="socks5"):
+            return [("socks5", "9.9.9.9", 1080)]
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PROXY_ENABLED": "1",
+                    "PROXY_HOST": "1.2.3.4",
+                    "PROXY_PORT": "1080",
+                    "PROXY_TYPE": "http",
+                    "PROXY_AUTO": "1",
+                },
+            ),
+            mock.patch.object(proxies, "get_working_proxies", fake_get_working),
+        ):
+            result = asyncio.run(proxies.get_proxy_candidates(limit=5))
+        self.assertEqual(
+            result,
+            [
+                {"proxy_type": "http", "addr": "1.2.3.4", "port": 1080},
+                {"proxy_type": "socks5", "addr": "9.9.9.9", "port": 1080},
+            ],
+        )
+
+
 class ValidateManyTest(BotTestCase):
     @staticmethod
     async def fake_validate_one(proto, host, port, timeout=12):
@@ -550,6 +622,85 @@ class ValidateManyTest(BotTestCase):
         with mock.patch.object(proxies, "validate_one", self.fake_validate_one):
             working = asyncio.run(proxies.validate_many(items, limit=5))
         self.assertEqual(working, [])
+
+    @staticmethod
+    async def exploding_validate_one(proto, host, port, timeout=12):
+        if port == 3:
+            raise RuntimeError("unexpected validator crash")
+        return port <= 2
+
+    def test_survives_validator_crash(self):
+        items = [
+            ("socks5", "h1", 1),
+            ("socks5", "h2", 2),
+            ("socks5", "h3", 3),
+        ]
+        with mock.patch.object(proxies, "validate_one", self.exploding_validate_one):
+            working = asyncio.run(proxies.validate_many(items, limit=5))
+        self.assertEqual(sorted(w[2] for w in working), [1, 2])
+
+
+class ValidateOneMtprotoTest(BotTestCase):
+    PROXY_DICT: ClassVar[dict[str, Any]] = {
+        "proxy_type": "socks5",
+        "addr": "h",
+        "port": 1080,
+    }
+
+    @staticmethod
+    def broken_client_factory(exc):
+        class BrokenClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def connect(self):
+                raise exc
+
+            async def disconnect(self):
+                return None
+
+        return BrokenClient
+
+    @staticmethod
+    def build_working_client():
+        class WorkingClient:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def connect(self):
+                return True
+
+            async def __call__(self, _request):
+                return SimpleNamespace()
+
+            async def disconnect(self):
+                return None
+
+        return WorkingClient
+
+    def test_incomplete_read_is_dead_proxy_not_crash(self):
+        cls = self.broken_client_factory(asyncio.IncompleteReadError(b"", 8))
+        with mock.patch.object(proxies, "TelegramClient", cls):
+            ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        self.assertFalse(ok)
+
+    def test_eof_error_is_dead_proxy_not_crash(self):
+        cls = self.broken_client_factory(EOFError())
+        with mock.patch.object(proxies, "TelegramClient", cls):
+            ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        self.assertFalse(ok)
+
+    def test_unexpected_error_is_dead_proxy_not_crash(self):
+        cls = self.broken_client_factory(RuntimeError("boom"))
+        with mock.patch.object(proxies, "TelegramClient", cls):
+            ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        self.assertFalse(ok)
+
+    def test_working_proxy_passes_validation(self):
+        cls = self.build_working_client()
+        with mock.patch.object(proxies, "TelegramClient", cls):
+            ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        self.assertTrue(ok)
 
 
 class GetWorkingProxiesTest(BotTestCase):
@@ -609,79 +760,79 @@ class GetWorkingProxiesTest(BotTestCase):
 
 class StateRoundtripTest(BotTestCase):
     def test_save_load_roundtrip(self):
-        bot.model_overrides = {123: "model-a", -456: "model-b"}
-        bot.auto_respond = {1, -2}
-        bot.ignored_chats = {-100}
-        bot.ignored_users = {777}
-        bot.save_state()
-        bot.model_overrides = {}
-        bot.auto_respond = set()
-        bot.ignored_chats = set()
-        bot.ignored_users = set()
-        bot.load_state()
-        self.assertEqual(bot.model_overrides, {123: "model-a", -456: "model-b"})
-        self.assertEqual(bot.auto_respond, {1, -2})
-        self.assertEqual(bot.ignored_chats, {-100})
-        self.assertEqual(bot.ignored_users, {777})
+        userbot.model_overrides = {123: "model-a", -456: "model-b"}
+        userbot.auto_respond = {1, -2}
+        userbot.ignored_chats = {-100}
+        userbot.ignored_users = {777}
+        userbot.save_state()
+        userbot.model_overrides = {}
+        userbot.auto_respond = set()
+        userbot.ignored_chats = set()
+        userbot.ignored_users = set()
+        userbot.load_state()
+        self.assertEqual(userbot.model_overrides, {123: "model-a", -456: "model-b"})
+        self.assertEqual(userbot.auto_respond, {1, -2})
+        self.assertEqual(userbot.ignored_chats, {-100})
+        self.assertEqual(userbot.ignored_users, {777})
 
     def test_corrupt_json_tolerated(self):
-        bot.STATE_FILE.write_text("{not json", encoding="utf-8")
-        bot.model_overrides = {}
-        bot.load_state()
-        self.assertEqual(bot.model_overrides, {})
-        self.assertEqual(bot.auto_respond, set())
+        userbot.STATE_FILE.write_text("{not json", encoding="utf-8")
+        userbot.model_overrides = {}
+        userbot.load_state()
+        self.assertEqual(userbot.model_overrides, {})
+        self.assertEqual(userbot.auto_respond, set())
 
     def test_wrong_structure_tolerated(self):
-        bot.STATE_FILE.write_text('{"model_overrides": [1, 2]}', encoding="utf-8")
-        bot.model_overrides = {}
-        bot.load_state()
-        self.assertEqual(bot.model_overrides, {})
+        userbot.STATE_FILE.write_text('{"model_overrides": [1, 2]}', encoding="utf-8")
+        userbot.model_overrides = {}
+        userbot.load_state()
+        self.assertEqual(userbot.model_overrides, {})
 
 
 class HistoryRoundtripTest(BotTestCase):
     def test_roundtrip_and_maxlen(self):
         dm_msgs = [{"role": "user", "content": f"m{i}"} for i in range(3)]
         group_msgs = [{"role": "assistant", "content": "g"}]
-        bot.chat_history = {
-            111: deque(dm_msgs, maxlen=bot.DM_HISTORY_LIMIT),
-            -222: deque(group_msgs, maxlen=bot.GROUP_HISTORY_LIMIT),
+        userbot.chat_history = {
+            111: deque(dm_msgs, maxlen=userbot.DM_HISTORY_LIMIT),
+            -222: deque(group_msgs, maxlen=userbot.GROUP_HISTORY_LIMIT),
         }
-        bot.save_history()
-        bot.chat_history = {}
-        bot.load_history()
-        self.assertEqual(list(bot.chat_history[111]), dm_msgs)
-        self.assertEqual(bot.chat_history[111].maxlen, bot.DM_HISTORY_LIMIT)
-        self.assertEqual(list(bot.chat_history[-222]), group_msgs)
-        self.assertEqual(bot.chat_history[-222].maxlen, bot.GROUP_HISTORY_LIMIT)
+        userbot.save_history()
+        userbot.chat_history = {}
+        userbot.load_history()
+        self.assertEqual(list(userbot.chat_history[111]), dm_msgs)
+        self.assertEqual(userbot.chat_history[111].maxlen, userbot.DM_HISTORY_LIMIT)
+        self.assertEqual(list(userbot.chat_history[-222]), group_msgs)
+        self.assertEqual(userbot.chat_history[-222].maxlen, userbot.GROUP_HISTORY_LIMIT)
 
     def test_bad_keys_skipped(self):
-        bot.HISTORY_FILE.write_text(
+        userbot.HISTORY_FILE.write_text(
             json.dumps({"abc": [], "111": [{"role": "user", "content": "x"}]}),
             encoding="utf-8",
         )
-        bot.load_history()
-        self.assertNotIn("abc", {str(k) for k in bot.chat_history})
-        self.assertIn(111, bot.chat_history)
+        userbot.load_history()
+        self.assertNotIn("abc", {str(k) for k in userbot.chat_history})
+        self.assertIn(111, userbot.chat_history)
 
     def test_corrupt_tolerated(self):
-        bot.HISTORY_FILE.write_text("[[[broken", encoding="utf-8")
-        bot.chat_history = {}
-        bot.load_history()
-        self.assertEqual(bot.chat_history, {})
+        userbot.HISTORY_FILE.write_text("[[[broken", encoding="utf-8")
+        userbot.chat_history = {}
+        userbot.load_history()
+        self.assertEqual(userbot.chat_history, {})
 
 
 class ModelsTextTest(BotTestCase):
     def test_default_model_marked_once(self):
-        bot.MODELS = ["deepseek-v4-flash"]
-        bot.model_overrides = {}
-        text = bot.models_text(-100)
+        userbot.MODELS = ["deepseek-v4-flash"]
+        userbot.model_overrides = {}
+        text = userbot.models_text(-100)
         self.assertEqual(text.count("(текущая)"), 1)
         self.assertIn("deepseek-v4-flash", text)
 
     def test_override_appended(self):
-        bot.MODELS = ["base-model"]
-        bot.model_overrides = {-100: "custom-model"}
-        text = bot.models_text(-100)
+        userbot.MODELS = ["base-model"]
+        userbot.model_overrides = {-100: "custom-model"}
+        text = userbot.models_text(-100)
         self.assertEqual(text.count("(текущая)"), 1)
         self.assertIn("custom-model (текущая)", text)
         self.assertIn("• base-model\n", text)
@@ -691,40 +842,46 @@ class ExecuteToolTest(BotTestCase):
     def setUp(self):
         super().setUp()
         self.fake_client = FakeClient()
-        self._orig_client = bot.client
-        bot.client = self.fake_client
-        self.addCleanup(setattr, bot, "client", self._orig_client)
+        self._orig_client = userbot.client
+        userbot.client = self.fake_client
+        self.addCleanup(setattr, userbot, "client", self._orig_client)
 
     def test_evaluate(self):
-        result = asyncio.run(bot.execute_tool("evaluate", {"expression": "2+2"}, -100))
+        result = asyncio.run(
+            userbot.execute_tool("evaluate", {"expression": "2+2"}, -100)
+        )
         self.assertEqual(result, "4")
 
     def test_unknown_tool(self):
-        result = asyncio.run(bot.execute_tool("nope", {}, -100))
+        result = asyncio.run(userbot.execute_tool("nope", {}, -100))
         self.assertEqual(result, "Неизвестная функция: nope")
 
     def test_send_message_to_guards(self):
-        empty = asyncio.run(bot.execute_tool("send_message_to", {}, -100))
+        empty = asyncio.run(userbot.execute_tool("send_message_to", {}, -100))
         self.assertEqual(empty, "Нужны chat и text.")
         ok = asyncio.run(
-            bot.execute_tool("send_message_to", {"chat": "@me", "text": "hello"}, -100)
+            userbot.execute_tool(
+                "send_message_to", {"chat": "@me", "text": "hello"}, -100
+            )
         )
         self.assertEqual(ok, "Сообщение отправлено.")
         self.assertEqual(self.fake_client.sent, [("@me", "hello")])
 
     def test_edit_message_guard_and_call(self):
         empty = asyncio.run(
-            bot.execute_tool("edit_message", {"message_id": 1, "text": ""}, -100)
+            userbot.execute_tool("edit_message", {"message_id": 1, "text": ""}, -100)
         )
         self.assertEqual(empty, "Пустой текст.")
         ok = asyncio.run(
-            bot.execute_tool("edit_message", {"message_id": 5, "text": "new"}, -100)
+            userbot.execute_tool("edit_message", {"message_id": 5, "text": "new"}, -100)
         )
         self.assertEqual(ok, "Сообщение отредактировано.")
         self.assertEqual(self.fake_client.edited, [(-100, 5, "new")])
 
     def test_get_chat_history_formatting_and_clamp(self):
-        result = asyncio.run(bot.execute_tool("get_chat_history", {"limit": 150}, -100))
+        result = asyncio.run(
+            userbot.execute_tool("get_chat_history", {"limit": 150}, -100)
+        )
         self.assertEqual(self.fake_client.history_limits[-1], 100)
         lines = result.splitlines()
         self.assertEqual(len(lines), 100)
@@ -733,16 +890,16 @@ class ExecuteToolTest(BotTestCase):
 
     def test_get_message_by_id_found_and_missing(self):
         found = asyncio.run(
-            bot.execute_tool("get_message_by_id", {"message_id": 42}, -100)
+            userbot.execute_tool("get_message_by_id", {"message_id": 42}, -100)
         )
         self.assertEqual(found, "found")
         missing = asyncio.run(
-            bot.execute_tool("get_message_by_id", {"message_id": 43}, -100)
+            userbot.execute_tool("get_message_by_id", {"message_id": 43}, -100)
         )
         self.assertEqual(missing, "Сообщение не найдено.")
 
     def test_get_chat_info_json(self):
-        result = asyncio.run(bot.execute_tool("get_chat_info", {}, -100))
+        result = asyncio.run(userbot.execute_tool("get_chat_info", {}, -100))
         data = json.loads(result)
         self.assertEqual(data["id"], 7)
         self.assertEqual(data["username"], "uchat")
@@ -750,27 +907,157 @@ class ExecuteToolTest(BotTestCase):
 
     def test_get_user_info(self):
         result = asyncio.run(
-            bot.execute_tool("get_user_info", {"handle": "@somebody"}, -100)
+            userbot.execute_tool("get_user_info", {"handle": "@somebody"}, -100)
         )
         data = json.loads(result)
         self.assertEqual(data["name"], "A B")
         self.assertEqual(data["id"], 7)
 
     def test_get_user_info_empty_handle(self):
-        result = asyncio.run(bot.execute_tool("get_user_info", {"handle": ""}, -100))
+        result = asyncio.run(
+            userbot.execute_tool("get_user_info", {"handle": ""}, -100)
+        )
         self.assertEqual(result, "Пустой handle.")
 
     def test_list_chats_labels(self):
-        result = asyncio.run(bot.execute_tool("list_chats", {"limit": 3}, -100))
+        result = asyncio.run(userbot.execute_tool("list_chats", {"limit": 3}, -100))
         lines = result.splitlines()
         self.assertEqual(len(lines), 3)
         self.assertTrue(lines[0].startswith("1: name1 (@user1)"))
 
     def test_get_profile_json(self):
-        result = asyncio.run(bot.execute_tool("get_profile", {}, -100))
+        result = asyncio.run(userbot.execute_tool("get_profile", {}, -100))
         data = json.loads(result)
         self.assertEqual(data["id"], 1)
         self.assertEqual(data["username"], "meuser")
+
+
+class BotCommandsTest(BotTestCase):
+    CASES: ClassVar[list] = [
+        ("/help", ("help", None)),
+        ("/start", ("help", None)),
+        ("/помощь", ("help", None)),
+        ("/справка", ("help", None)),
+        ("/model gpt-x", ("model", "gpt-x")),
+        ("/модель gpt-x", ("model", "gpt-x")),
+        ("/model", ("model", None)),
+        ("/models", ("models", None)),
+        ("/модели", ("models", None)),
+        ("/clear", ("clear", None)),
+        ("/очистить", ("clear", None)),
+        ("/history", ("history", None)),
+        ("/история", ("history", None)),
+        ("/ping", ("ping", None)),
+        ("/пинг", ("ping", None)),
+        ("/auto on", ("autorespond", True)),
+        ("/авто выкл", ("autorespond", False)),
+        ("/auto off", ("autorespond", False)),
+        ("/auto", ("auto_status", None)),
+        ("/help@DanyBOTAPI_bot", ("help", None)),
+        ("  /PING  ", ("ping", None)),
+    ]
+
+    NONE_CASES: ClassVar[list] = [
+        "help",
+        "/unknown",
+        "/",
+        "/ignore",
+        "/unignore",
+        ".db ping",
+    ]
+
+    def test_bot_commands(self):
+        for text, expected in self.CASES:
+            self.assertEqual(bot.handle_bot_commands(text), expected)
+
+    def test_bot_commands_none(self):
+        for text in self.NONE_CASES:
+            self.assertIsNone(bot.handle_bot_commands(text))
+
+
+class SystemForModeTest(BotTestCase):
+    def test_userbot_uses_system_prompt(self):
+        self.assertIn("юзербот", userbot.system_for(-100, "userbot"))
+
+    def test_bot_uses_bot_prompt(self):
+        self.assertIn("бот", userbot.system_for(-100, "bot"))
+
+    def test_default_mode_is_userbot(self):
+        self.assertEqual(userbot.system_for(-100), userbot.system_for(-100, "userbot"))
+
+    def test_tools_bot_excludes_userbot_only(self):
+        names = {t["function"]["name"] for t in userbot.TOOLS_BOT}
+        for forbidden in (
+            "get_chat_history",
+            "list_chats",
+            "send_message_to",
+            "get_chat_history_in",
+            "edit_message",
+            "get_message_by_id",
+        ):
+            self.assertNotIn(forbidden, names)
+        for required in ("evaluate", "get_chat_info", "get_user_info", "get_profile"):
+            self.assertIn(required, names)
+
+    def test_tools_userbot_has_all(self):
+        names = {t["function"]["name"] for t in userbot.TOOLS}
+        for required in (
+            "get_chat_history",
+            "list_chats",
+            "send_message_to",
+            "get_chat_history_in",
+            "evaluate",
+            "get_chat_info",
+            "get_user_info",
+            "edit_message",
+            "get_message_by_id",
+            "get_profile",
+        ):
+            self.assertIn(required, names)
+
+
+class EnvBoolTest(BotTestCase):
+    def test_default_when_unset(self):
+        os.environ.pop("DANYBOT_TEST_BOOL", None)
+        self.assertTrue(userbot._env_bool("DANYBOT_TEST_BOOL", True))
+        self.assertFalse(userbot._env_bool("DANYBOT_TEST_BOOL", False))
+
+    def test_false_values(self):
+        for val in ("0", "false", "no", "False", "NO", " 0 "):
+            with mock.patch.dict(os.environ, {"DANYBOT_TEST_BOOL": val}):
+                self.assertFalse(userbot._env_bool("DANYBOT_TEST_BOOL", True))
+
+    def test_true_values(self):
+        for val in ("1", "true", "yes", "on", "TRUE", " Yes "):
+            with mock.patch.dict(os.environ, {"DANYBOT_TEST_BOOL": val}):
+                self.assertTrue(userbot._env_bool("DANYBOT_TEST_BOOL", False))
+
+
+class ExecuteToolClientOverrideTest(BotTestCase):
+    CHAT_ID = -100
+
+    def test_override_client_used(self):
+        class OverrideClient:
+            def __init__(self):
+                self.calls = []
+
+            async def get_me(self):
+                self.calls.append("get_me")
+                return SimpleNamespace(
+                    id=9,
+                    first_name="B",
+                    last_name="Bot",
+                    username="botuser",
+                )
+
+        override = OverrideClient()
+        result = asyncio.run(
+            userbot.execute_tool("get_profile", {}, self.CHAT_ID, override)
+        )
+        data = json.loads(result)
+        self.assertEqual(data["id"], 9)
+        self.assertEqual(data["username"], "botuser")
+        self.assertEqual(override.calls, ["get_me"])
 
 
 class StreamToolsTest(BotTestCase):
@@ -784,15 +1071,15 @@ class StreamToolsTest(BotTestCase):
             self.tool_calls_made.append((name, args, chat_id))
             return "TOOLOK"
 
-        self._orig_execute = bot.execute_tool
-        self._orig_ai = bot.ai
-        bot.execute_tool = fake_execute
-        self.addCleanup(setattr, bot, "execute_tool", self._orig_execute)
-        self.addCleanup(setattr, bot, "ai", self._orig_ai)
+        self._orig_execute = userbot.execute_tool
+        self._orig_ai = userbot.ai
+        userbot.execute_tool = fake_execute
+        self.addCleanup(setattr, userbot, "execute_tool", self._orig_execute)
+        self.addCleanup(setattr, userbot, "ai", self._orig_ai)
 
     def install_ai(self, rounds):
         fake_ai = FakeAI(rounds)
-        bot.ai = fake_ai
+        userbot.ai = fake_ai
         return fake_ai
 
     @staticmethod
@@ -810,7 +1097,7 @@ class StreamToolsTest(BotTestCase):
         )
         deltas = []
         answer = asyncio.run(
-            bot.stream_with_tools(
+            userbot.stream_with_tools(
                 [{"role": "user", "content": "q"}],
                 "deepseek-v4-flash",
                 self.CHAT_ID,
@@ -824,7 +1111,7 @@ class StreamToolsTest(BotTestCase):
         kwargs = fake_ai.chat.completions.calls[0]
         self.assertEqual(kwargs["model"], "deepseek-v4-flash")
         self.assertTrue(kwargs["stream"])
-        self.assertEqual(kwargs["tools"], bot.TOOLS)
+        self.assertEqual(kwargs["tools"], userbot.TOOLS)
         self.assertEqual(kwargs["messages"][0]["role"], "user")
 
     def test_reasoning_content_collected(self):
@@ -838,7 +1125,7 @@ class StreamToolsTest(BotTestCase):
         )
         reasons = []
         answer = asyncio.run(
-            bot.stream_with_tools(
+            userbot.stream_with_tools(
                 [],
                 "m",
                 self.CHAT_ID,
@@ -866,7 +1153,7 @@ class StreamToolsTest(BotTestCase):
             ]
         )
         answer = asyncio.run(
-            bot.stream_with_tools(
+            userbot.stream_with_tools(
                 [{"role": "user", "content": "посчитай"}],
                 "m",
                 self.CHAT_ID,
@@ -888,14 +1175,51 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(second_messages[2]["content"], "TOOLOK")
         self.assertEqual(second_messages[2]["tool_call_id"], "call1")
 
+    def test_tool_callback_receives_call_and_result(self):
+        self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(tool_calls=[make_tc(tc_id="call1", name="evaluate")])
+                    ),
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[make_tc(arguments='{"expression": "2+3"}')]
+                        )
+                    ),
+                ],
+                [make_chunk(make_delta(content="Итог: 5"))],
+            ]
+        )
+        tools_seen = []
+
+        async def on_tool(name, arguments, result):
+            tools_seen.append((name, arguments, result))
+
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "посчитай"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+                on_tool,
+            )
+        )
+        self.assertEqual(answer, "Итог: 5")
+        self.assertEqual(
+            tools_seen,
+            [("evaluate", '{"expression": "2+3"}', "TOOLOK")],
+        )
+
     def test_tool_round_limit_reached(self):
         endless = [
             make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
         ]
         self.install_ai([endless, endless])
-        with mock.patch.object(bot, "MAX_TOOL_ROUNDS", 2):
+        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 2):
             answer = asyncio.run(
-                bot.stream_with_tools(
+                userbot.stream_with_tools(
                     [],
                     "m",
                     self.CHAT_ID,
@@ -924,21 +1248,21 @@ class FloodRetryTest(BotTestCase):
 
     def test_safe_reply_success_after_floods(self):
         event, attempts = self.make_event(["flood", "flood", "ok"])
-        sent = asyncio.run(bot.safe_reply(event, "текст"))
+        sent = asyncio.run(userbot.safe_reply(event, "текст"))
         if sent is None or sent.id != 777:
             self.fail("safe_reply должен вернуть сообщение с id 777")
         self.assertEqual(attempts["n"], 3)
-        self.assertIn(777, bot.recent_reply_ids)
+        self.assertIn(777, userbot.recent_reply_ids)
 
     def test_safe_reply_bounded_attempts(self):
         event, attempts = self.make_event(["flood"])
-        sent = asyncio.run(bot.safe_reply(event, "текст"))
+        sent = asyncio.run(userbot.safe_reply(event, "текст"))
         self.assertIsNone(sent)
-        self.assertEqual(attempts["n"], bot.REPLY_ATTEMPTS)
+        self.assertEqual(attempts["n"], userbot.REPLY_ATTEMPTS)
 
     def test_safe_reply_rpc_fail_fast(self):
         event, attempts = self.make_event(["rpc"])
-        sent = asyncio.run(bot.safe_reply(event, "текст"))
+        sent = asyncio.run(userbot.safe_reply(event, "текст"))
         self.assertIsNone(sent)
         self.assertEqual(attempts["n"], 1)
 
@@ -947,20 +1271,20 @@ class EditRetryTest(BotTestCase):
     def setUp(self):
         super().setUp()
         self.flaky = FlakyEditClient()
-        self._orig_client = bot.client
-        bot.client = self.flaky
-        self.addCleanup(setattr, bot, "client", self._orig_client)
+        self._orig_client = userbot.client
+        userbot.client = self.flaky
+        self.addCleanup(setattr, userbot, "client", self._orig_client)
 
     def test_edit_text_recovers_after_floods(self):
-        ok = asyncio.run(bot.edit_text(-100, 5, "новый текст"))
+        ok = asyncio.run(userbot.edit_text(-100, 5, "новый текст"))
         self.assertTrue(ok)
         self.assertEqual(self.flaky.attempts, 3)
 
     def test_edit_text_bounded(self):
         self.flaky.always_flood = True
-        ok = asyncio.run(bot.edit_text(-100, 5, "новый текст"))
+        ok = asyncio.run(userbot.edit_text(-100, 5, "новый текст"))
         self.assertFalse(ok)
-        self.assertEqual(self.flaky.attempts, bot.REPLY_ATTEMPTS)
+        self.assertEqual(self.flaky.attempts, userbot.REPLY_ATTEMPTS)
 
 
 class FlakyEditClient(FakeClient):
@@ -1044,7 +1368,7 @@ def build_linters():
             cmd += [
                 "--disable=all",
                 "--enable=F,E,W",
-                "--disable=W0603,W0212,W0613",
+                "--disable=W0603,W0212,W0613,W0621",
                 "--max-line-length=120",
                 *PY_FILES,
             ]
@@ -1066,7 +1390,7 @@ def build_linters():
                 "--profile",
                 "black",
                 "-p",
-                "bot,proxies",
+                "main,bot,userbot,proxies",
                 *PY_FILES,
             ]
         elif name == "radon":
@@ -1107,7 +1431,7 @@ def run_coverage():
         [
             *base,
             "run",
-            "--source=bot,proxies",
+            "--source=bot,userbot,proxies",
             "-m",
             "unittest",
             "discover",

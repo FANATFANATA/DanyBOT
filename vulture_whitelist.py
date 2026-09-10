@@ -1,3 +1,8 @@
 handler
 get_proxy
 auth_key
+ENABLE_BOT
+ENABLE_USERBOT
+refresh_models
+start_bot
+start_userbot

@@ -4,13 +4,13 @@ import json
 import logging
 import os
 import re
+import struct
 from pathlib import Path
 from typing import Any, cast
 
 import httpx
 from telethon import TelegramClient
-from telethon.errors import InvalidChecksumError, RPCError
-from telethon.errors.common import ReadCancelledError
+from telethon.errors import RPCError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 
@@ -30,10 +30,15 @@ VALIDATION_ERRORS = (
     OSError,
     TimeoutError,
     BufferError,
-    ValueError,
+    EOFError,
+    ArithmeticError,
+    AttributeError,
+    IndexError,
+    KeyError,
+    RuntimeError,
     TypeError,
-    InvalidChecksumError,
-    ReadCancelledError,
+    ValueError,
+    struct.error,
 )
 
 SOURCES = [
@@ -181,7 +186,13 @@ async def validate_one_mtproto(proxy_dict, timeout=12):
         await asyncio.wait_for(tmp.connect(), timeout=timeout)
         await asyncio.wait_for(tmp(GetConfigRequest()), timeout=timeout)
         return True
-    except VALIDATION_ERRORS:
+    except VALIDATION_ERRORS as exc:
+        logger.debug(
+            "Прокси %s:%s не прошёл проверку: %s",
+            proxy_dict.get("addr"),
+            proxy_dict.get("port"),
+            type(exc).__name__,
+        )
         return False
     finally:
         with contextlib.suppress(Exception):
@@ -197,17 +208,20 @@ async def validate_one(proto_name, host, port, timeout=12):
     return await validate_one_mtproto(proxy_dict, timeout=timeout)
 
 
-async def validate_many(proxies, limit=10, concurrency=20):
+async def validate_many(items, limit=10, concurrency=20):
     working = []
     sem = asyncio.Semaphore(concurrency)
 
     async def run(item):
         async with sem:
-            if await validate_one(*item):
-                return item
+            try:
+                if await validate_one(*item):
+                    return item
+            except VALIDATION_ERRORS as exc:
+                logger.debug("Валидация упала на %s:%s: %s", item[1], item[2], exc)
             return None
 
-    tasks = [asyncio.create_task(run(p)) for p in proxies]
+    tasks = [asyncio.create_task(run(p)) for p in items]
     try:
         for coro in asyncio.as_completed(tasks):
             res = await cast(Any, coro)
@@ -278,7 +292,20 @@ def mark_bad_proxy(item):
     logger.info("Удалил из кэша нерабочий прокси: %s:%s", host, port)
 
 
+def proxies_enabled():
+    return os.getenv("PROXY_ENABLED", "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "",
+    )
+
+
 async def get_proxy_candidates(limit=40):
+    if not proxies_enabled():
+        logger.info("Прокси отключены настройкой PROXY_ENABLED")
+        return []
+
     candidates = []
     host = os.getenv("PROXY_HOST", "").strip()
     port = os.getenv("PROXY_PORT", "").strip()

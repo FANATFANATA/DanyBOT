@@ -3,8 +3,10 @@
 *.session-journal
 __pycache__/
 .venv/
-state.json
-history.json
+state_userbot.json
+history_userbot.json
+state_bot.json
+history_bot.json
 working_proxies.json
 proxy_cache.txt
 tdata2session.py
