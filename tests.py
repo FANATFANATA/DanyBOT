@@ -932,6 +932,130 @@ class ExecuteToolTest(BotTestCase):
         self.assertEqual(data["username"], "meuser")
 
 
+class NewToolsTest(BotTestCase):
+    CHAT_ID = -100
+
+    def test_get_time(self):
+        result = asyncio.run(userbot.execute_tool("get_time", {}, self.CHAT_ID))
+        data = json.loads(result)
+        self.assertIn("utc", data)
+        self.assertIn("local", data)
+        self.assertIn("weekday", data)
+
+    def test_random_value_range(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "random_value", {"minimum": 5, "maximum": 5}, self.CHAT_ID
+            )
+        )
+        self.assertEqual(result, "5")
+
+    def test_random_value_choices(self):
+        result = asyncio.run(
+            userbot.execute_tool("random_value", {"choices": ["only"]}, self.CHAT_ID)
+        )
+        self.assertEqual(result, "only")
+
+    def test_hash_text(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "hash_text", {"text": "abc", "algorithm": "sha256"}, self.CHAT_ID
+            )
+        )
+        self.assertTrue(result.startswith("sha256: "))
+        self.assertEqual(
+            result,
+            "sha256: ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        )
+
+    def test_hash_text_bad_algorithm(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "hash_text", {"text": "abc", "algorithm": "nope"}, self.CHAT_ID
+            )
+        )
+        self.assertTrue(result.startswith("Неподдерживаемый алгоритм"))
+
+    def test_base64_roundtrip(self):
+        encoded = asyncio.run(
+            userbot.execute_tool(
+                "base64_codec", {"text": "hello", "mode": "encode"}, self.CHAT_ID
+            )
+        )
+        self.assertEqual(encoded, "aGVsbG8=")
+        decoded = asyncio.run(
+            userbot.execute_tool(
+                "base64_codec", {"text": encoded, "mode": "decode"}, self.CHAT_ID
+            )
+        )
+        self.assertEqual(decoded, "hello")
+
+    def test_base64_bad_mode(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "base64_codec", {"text": "x", "mode": "bad"}, self.CHAT_ID
+            )
+        )
+        self.assertIn("encode или decode", result)
+
+    def test_text_stats(self):
+        result = asyncio.run(
+            userbot.execute_tool("text_stats", {"text": "hi there\nbye"}, self.CHAT_ID)
+        )
+        data = json.loads(result)
+        self.assertEqual(data["chars"], 12)
+        self.assertEqual(data["words"], 3)
+        self.assertEqual(data["lines"], 2)
+
+    def test_list_source_files(self):
+        result = asyncio.run(
+            userbot.execute_tool("list_source_files", {}, self.CHAT_ID)
+        )
+        self.assertIn("userbot.py", result)
+        self.assertIn("bot.py", result)
+
+    def test_read_source_file(self):
+        result = asyncio.run(
+            userbot.execute_tool("read_source_file", {"path": "bot.py"}, self.CHAT_ID)
+        )
+        self.assertIn("bot_client", result)
+
+    def test_read_source_file_traversal_blocked(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "read_source_file", {"path": "../secret.txt"}, self.CHAT_ID
+            )
+        )
+        self.assertIn("Доступ только", result)
+
+    def test_write_source_file_rejects_non_py(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "write_source_file", {"path": "evil.txt", "content": "x"}, self.CHAT_ID
+            )
+        )
+        self.assertIn("только .py", result)
+
+    def test_get_bot_stats(self):
+        result = asyncio.run(userbot.execute_tool("get_bot_stats", {}, self.CHAT_ID))
+        data = json.loads(result)
+        self.assertIn("uptime_seconds", data)
+        self.assertIn("python", data)
+        self.assertIn("modes", data)
+
+    def test_run_shell_echo(self):
+        result = asyncio.run(
+            userbot.execute_tool("run_shell", {"command": "echo hello"}, self.CHAT_ID)
+        )
+        self.assertIn("hello", result)
+
+    def test_run_shell_empty(self):
+        result = asyncio.run(
+            userbot.execute_tool("run_shell", {"command": ""}, self.CHAT_ID)
+        )
+        self.assertEqual(result, "Пустая команда.")
+
+
 class BotCommandsTest(BotTestCase):
     CASES: ClassVar[list] = [
         ("/help", ("help", None)),
@@ -992,11 +1116,39 @@ class SystemForModeTest(BotTestCase):
             "list_chats",
             "send_message_to",
             "get_chat_history_in",
-            "edit_message",
             "get_message_by_id",
         ):
             self.assertNotIn(forbidden, names)
         for required in ("evaluate", "get_chat_info", "get_user_info", "get_profile"):
+            self.assertIn(required, names)
+
+    def test_tools_bot_has_extended_set(self):
+        names = {t["function"]["name"] for t in userbot.TOOLS_BOT}
+        for required in (
+            "run_shell",
+            "web_search",
+            "fetch_url",
+            "pin_message",
+            "unpin_message",
+            "get_pinned_messages",
+            "react_to_message",
+            "get_last_messages",
+            "search_messages",
+            "send_message",
+            "delete_message",
+            "edit_message",
+            "forward_message",
+            "create_poll",
+            "get_time",
+            "random_value",
+            "hash_text",
+            "base64_codec",
+            "text_stats",
+            "list_source_files",
+            "read_source_file",
+            "write_source_file",
+            "get_bot_stats",
+        ):
             self.assertIn(required, names)
 
     def test_tools_userbot_has_all(self):

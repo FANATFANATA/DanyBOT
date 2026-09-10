@@ -1,22 +1,37 @@
 import ast
 import asyncio
+import base64
 import contextlib
+import datetime
+import hashlib
+import html
 import json
 import logging
 import math
 import os
+import random
 import re
 import struct
 import time
+import urllib.parse
 from collections import deque
 from pathlib import Path
 from typing import Any, cast
 
+import httpx
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAIError
 from telethon import TelegramClient, events
 from telethon.errors import AuthKeyError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import (
+    InputMediaPoll,
+    InputMessagesFilterPinned,
+    Poll,
+    PollAnswer,
+    ReactionEmoji,
+)
 
 import proxies
 
@@ -146,6 +161,7 @@ chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
 recent_reply_ids: set[int] = set()
 last_chat_activity: dict[int, float] = {}
+START_TIME = time.monotonic()
 
 
 def make_session(name: str):
@@ -437,6 +453,313 @@ TOOLS_BOT = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Выполнить команду в shell и вернуть stdout/stderr",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Найти информацию в интернете по запросу",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Скачать содержимое URL и вернуть текст",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 20000},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_message",
+            "description": "Закрепить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "notify": {"type": "boolean"},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unpin_message",
+            "description": "Открепить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {"message_id": {"type": "integer"}},
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pinned_messages",
+            "description": "Получить закреплённые сообщения текущего чата",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "react_to_message",
+            "description": "Поставить реакцию на сообщение в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "emoji": {"type": "string"},
+                },
+                "required": ["message_id", "emoji"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_last_messages",
+            "description": "Последние сообщения текущего чата с указанием лимита (до 500)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                },
+                "required": ["limit"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_messages",
+            "description": "Поиск сообщений по тексту в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Отправить сообщение в текущий чат",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_message",
+            "description": "Удалить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {"message_id": {"type": "integer"}},
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_message",
+            "description": "Отредактировать сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["message_id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forward_message",
+            "description": "Переслать сообщение из текущего чата в указанный чат",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "target": {"type": "string"},
+                },
+                "required": ["message_id", "target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_poll",
+            "description": "Создать опрос в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Текущие дата и время (UTC и локальное)",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "random_value",
+            "description": "Случайное число или выбор из вариантов",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "minimum": {"type": "integer"},
+                    "maximum": {"type": "integer"},
+                    "choices": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "hash_text",
+            "description": "Хеш строки (md5, sha1, sha256)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "algorithm": {"type": "string"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "base64_codec",
+            "description": "Base64 кодирование или декодирование текста",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["encode", "decode"]},
+                },
+                "required": ["text", "mode"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "text_stats",
+            "description": "Статистика текста: символы, слова, строки",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_source_files",
+            "description": "Список файлов исходного кода бота",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_source_file",
+            "description": "Прочитать файл исходного кода бота",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_source_file",
+            "description": "Перезаписать файл исходного кода бота (самоулучшение)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_bot_stats",
+            "description": "Статистика бота: аптайм, контекст, модель",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 
@@ -662,6 +985,367 @@ async def execute_tool(name: str, arguments: dict, chat_id, client=None):
                 "id": getattr(me, "id", None),
                 "name": full,
                 "username": getattr(me, "username", None),
+            },
+            ensure_ascii=False,
+        )
+    if name == "run_shell":
+        command = str(arguments.get("command", "")).strip()
+        if not command:
+            return "Пустая команда."
+        try:
+            timeout = int(arguments.get("timeout", 30))
+        except (TypeError, ValueError):
+            timeout = 30
+        timeout = max(1, min(timeout, 120))
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            return f"Таймаут {timeout}s: команда прервана."
+        out = stdout.decode("utf-8", errors="replace")
+        err = stderr.decode("utf-8", errors="replace")
+        result = f"rc={proc.returncode}\nstdout:\n{out}"
+        if err:
+            result += f"\nstderr:\n{err}"
+        return result[:4000]
+    if name == "web_search":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return "Пустой запрос."
+        try:
+            limit = int(arguments.get("limit", 5))
+        except (TypeError, ValueError):
+            limit = 5
+        limit = max(1, min(limit, 10))
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as hc:
+                resp = await hc.get(
+                    "https://duckduckgo.com/html/",
+                    params={"q": query},
+                    headers={"User-Agent": "Mozilla/5.0"},
+                )
+                resp.raise_for_status()
+                text = resp.text
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            return f"Ошибка поиска: {exc}"
+        results = []
+        pattern = re.compile(
+            r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+            re.DOTALL,
+        )
+        for href, title in pattern.findall(text):
+            title_clean = re.sub(r"<[^>]+>", "", title).strip()
+            title_clean = html.unescape(title_clean)
+            if "uddg=" in href:
+                parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+                href = parsed.get("uddg", [href])[0]
+            results.append(f"{title_clean}\n{href}")
+            if len(results) >= limit:
+                break
+        if not results:
+            return "Ничего не найдено."
+        return "\n\n".join(results)
+    if name == "fetch_url":
+        url = str(arguments.get("url", "")).strip()
+        if not url:
+            return "Пустой URL."
+        if not url.startswith(("http://", "https://")):
+            return "URL должен начинаться с http:// или https://"
+        try:
+            max_chars = int(arguments.get("max_chars", 5000))
+        except (TypeError, ValueError):
+            max_chars = 5000
+        max_chars = max(100, min(max_chars, 20000))
+        try:
+            async with httpx.AsyncClient(timeout=25, follow_redirects=True) as hc:
+                resp = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+                resp.raise_for_status()
+                raw = resp.text
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            return f"Ошибка загрузки: {exc}"
+        cleaned = re.sub(
+            r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE
+        )
+        cleaned = re.sub(
+            r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE
+        )
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = html.unescape(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned[:max_chars]
+    if name == "pin_message":
+        try:
+            message_id = int(arguments.get("message_id", 0))
+        except (TypeError, ValueError):
+            return "Некорректный message_id."
+        notify = bool(arguments.get("notify", False))
+        try:
+            await client.pin_message(chat_id, message_id, notify=notify)
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка закрепления: {exc}"
+        return "Сообщение закреплено."
+    if name == "unpin_message":
+        try:
+            message_id = int(arguments.get("message_id", 0))
+        except (TypeError, ValueError):
+            return "Некорректный message_id."
+        try:
+            await client.unpin_message(chat_id, message_id)
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка открепления: {exc}"
+        return "Сообщение откреплено."
+    if name == "get_pinned_messages":
+        try:
+            msgs = cast(
+                Any,
+                await client.get_messages(
+                    chat_id, limit=20, filter=InputMessagesFilterPinned()
+                ),
+            )
+        except (RPCError, OSError, ValueError) as exc:
+            return f"Ошибка получения закрепов: {exc}"
+        if not msgs:
+            return "Закреплённых сообщений нет."
+        lines = []
+        for m in msgs:
+            sender = getattr(m, "sender_id", None)
+            text = m.message or ""
+            lines.append(f"[{m.id}] {sender}: {text}")
+        return "\n".join(lines)
+    if name == "react_to_message":
+        try:
+            message_id = int(arguments.get("message_id", 0))
+        except (TypeError, ValueError):
+            return "Некорректный message_id."
+        emoji = str(arguments.get("emoji", "")).strip()
+        if not emoji:
+            return "Пустая реакция."
+        try:
+            await client(
+                SendReactionRequest(
+                    peer=chat_id,
+                    msg_id=message_id,
+                    reaction=[ReactionEmoji(emoticon=emoji)],
+                )
+            )
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка реакции: {exc}"
+        return f"Реакция {emoji} поставлена."
+    if name == "get_last_messages":
+        try:
+            limit = int(arguments.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        limit = max(1, min(limit, 500))
+        try:
+            msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
+        except (RPCError, OSError, ValueError) as exc:
+            return f"Ошибка получения сообщений: {exc}"
+        if not msgs:
+            return "Сообщений нет."
+        lines = []
+        for m in reversed(list(msgs)):
+            sender = getattr(m, "sender_id", None)
+            text = m.message or ""
+            lines.append(f"[{m.id}] {sender}: {text}")
+        return "\n".join(lines)
+    if name == "search_messages":
+        query = str(arguments.get("query", "")).strip()
+        if not query:
+            return "Пустой запрос."
+        try:
+            limit = int(arguments.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(limit, 100))
+        try:
+            msgs = cast(
+                Any, await client.get_messages(chat_id, limit=limit, search=query)
+            )
+        except (RPCError, OSError, ValueError) as exc:
+            return f"Ошибка поиска: {exc}"
+        if not msgs:
+            return "Сообщений не найдено."
+        lines = []
+        for m in reversed(list(msgs)):
+            sender = getattr(m, "sender_id", None)
+            text = m.message or ""
+            lines.append(f"[{m.id}] {sender}: {text}")
+        return "\n".join(lines)
+    if name == "send_message":
+        text = str(arguments.get("text", "")).strip()
+        if not text:
+            return "Пустой текст."
+        try:
+            await client.send_message(chat_id, text)
+        except (RPCError, OSError, ValueError) as exc:
+            return f"Ошибка отправки: {exc}"
+        return "Сообщение отправлено."
+    if name == "delete_message":
+        try:
+            message_id = int(arguments.get("message_id", 0))
+        except (TypeError, ValueError):
+            return "Некорректный message_id."
+        try:
+            await client.delete_messages(chat_id, [message_id])
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка удаления: {exc}"
+        return "Сообщение удалено."
+    if name == "forward_message":
+        try:
+            message_id = int(arguments.get("message_id", 0))
+        except (TypeError, ValueError):
+            return "Некорректный message_id."
+        fwd_target = str(arguments.get("target", "")).strip()
+        if not fwd_target:
+            return "Пустой target."
+        try:
+            await client.forward_messages(fwd_target, message_id, chat_id)
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка пересылки: {exc}"
+        return "Сообщение переслано."
+    if name == "create_poll":
+        question = str(arguments.get("question", "")).strip()
+        options = arguments.get("options", [])
+        if not question:
+            return "Пустой вопрос."
+        if not isinstance(options, list) or len(options) < 2:
+            return "Нужно минимум 2 варианта."
+        clean_options = [str(o).strip() for o in options if str(o).strip()]
+        if len(clean_options) < 2:
+            return "Нужно минимум 2 непустых варианта."
+        poll = Poll(
+            id=0,
+            hash=0,
+            question=cast(Any, question),
+            answers=cast(
+                Any,
+                [
+                    PollAnswer(text=cast(Any, o), option=bytes([i]))
+                    for i, o in enumerate(clean_options)
+                ],
+            ),
+        )
+        try:
+            await client.send_file(chat_id, InputMediaPoll(poll=poll))
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            return f"Ошибка создания опроса: {exc}"
+        return "Опрос создан."
+    if name == "get_time":
+        now = datetime.datetime.now(datetime.timezone.utc)
+        return json.dumps(
+            {
+                "utc": now.isoformat(),
+                "local": datetime.datetime.now(datetime.timezone.utc)
+                .astimezone()
+                .isoformat(),
+                "weekday": now.strftime("%A"),
+            },
+            ensure_ascii=False,
+        )
+    if name == "random_value":
+        try:
+            minimum = int(arguments.get("minimum", 0))
+        except (TypeError, ValueError):
+            minimum = 0
+        try:
+            maximum = int(arguments.get("maximum", 100))
+        except (TypeError, ValueError):
+            maximum = 100
+        choices = arguments.get("choices")
+        if isinstance(choices, list) and choices:
+            return str(random.SystemRandom().choice(choices))
+        if minimum > maximum:
+            minimum, maximum = maximum, minimum
+        return str(random.SystemRandom().randint(minimum, maximum))
+    if name == "hash_text":
+        text = str(arguments.get("text", ""))
+        algorithm = str(arguments.get("algorithm", "sha256")).strip().lower()
+        if algorithm not in hashlib.algorithms_available:
+            return f"Неподдерживаемый алгоритм: {algorithm}"
+        digest = hashlib.new(algorithm, text.encode("utf-8")).hexdigest()
+        return f"{algorithm}: {digest}"
+    if name == "base64_codec":
+        text = str(arguments.get("text", ""))
+        mode = str(arguments.get("mode", "")).strip().lower()
+        if mode == "encode":
+            return base64.b64encode(text.encode("utf-8")).decode("ascii")
+        if mode == "decode":
+            try:
+                return base64.b64decode(text.encode("ascii")).decode(
+                    "utf-8", errors="replace"
+                )
+            except (ValueError, TypeError) as exc:
+                return f"Ошибка декодирования: {exc}"
+        return "mode должен быть encode или decode."
+    if name == "text_stats":
+        text = str(arguments.get("text", ""))
+        return json.dumps(
+            {
+                "chars": len(text),
+                "chars_no_spaces": len(re.sub(r"\s", "", text)),
+                "words": len(text.split()),
+                "lines": len(text.splitlines()) or 1,
+            },
+            ensure_ascii=False,
+        )
+    if name == "list_source_files":
+        base = Path(__file__).parent
+        files = sorted(
+            p.name
+            for p in base.iterdir()
+            if p.is_file() and p.suffix in (".py", ".txt", ".md", ".yml", ".yaml")
+        )
+        return "\n".join(files) if files else "Файлы не найдены."
+    if name == "read_source_file":
+        rel = str(arguments.get("path", "")).strip()
+        if not rel:
+            return "Пустой path."
+        base = Path(__file__).parent.resolve()
+        target = (base / rel).resolve()
+        if base not in target.parents and target != base:
+            return "Доступ только к файлам бота."
+        if not target.is_file():
+            return "Файл не найден."
+        try:
+            return target.read_text(encoding="utf-8", errors="replace")[:20000]
+        except OSError as exc:
+            return f"Ошибка чтения: {exc}"
+    if name == "write_source_file":
+        rel = str(arguments.get("path", "")).strip()
+        content = str(arguments.get("content", ""))
+        if not rel:
+            return "Пустой path."
+        if not rel.endswith(".py"):
+            return "Разрешено изменять только .py файлы."
+        base = Path(__file__).parent.resolve()
+        target = (base / rel).resolve()
+        if base not in target.parents and target != base:
+            return "Доступ только к файлам бота."
+        try:
+            target.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            return f"Ошибка записи: {exc}"
+        return f"Файл {rel} записан ({len(content)} символов)."
+    if name == "get_bot_stats":
+        import sys as _sys
+
+        uptime = time.monotonic() - START_TIME
+        return json.dumps(
+            {
+                "uptime_seconds": round(uptime, 1),
+                "python": _sys.version.split()[0],
+                "context_messages": len(chat_history.get(chat_id, deque())),
+                "model": model_for(chat_id),
+                "modes": {"userbot": ENABLE_USERBOT, "bot": ENABLE_BOT},
             },
             ensure_ascii=False,
         )
