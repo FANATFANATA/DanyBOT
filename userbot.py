@@ -62,7 +62,7 @@ API_HASH = os.getenv("API_HASH", "") or "b18441a1ff607e10a989891a5462e627"
 SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
 DANYAPI_URL = os.getenv("DANYAPI_URL", "http://127.0.0.1:8008/v1")
-DANYAPI_MODEL = os.getenv("DANYAPI_MODEL", "deepseek-v4-flash")
+DANYAPI_MODEL = os.getenv("DANYAPI_MODEL", "deepseek-v4.1-flash")
 DANYAPI_KEY = os.getenv("DANYAPI_KEY", "danyapi")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
