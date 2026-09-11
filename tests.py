@@ -838,6 +838,31 @@ class ModelsTextTest(BotTestCase):
         self.assertIn("• base-model\n", text)
 
 
+class RenderResponseTest(BotTestCase):
+    def test_all_sections_present(self):
+        text = userbot.render_response(
+            "prefix\n\n",
+            ["думаю", " ", "дальше"],
+            ["web_search", "web_search", "fetch_url"],
+            "ответ текста",
+        )
+        self.assertIn("💭 «<i>думаю дальше</i>» 💭", text)
+        self.assertIn("🔧", text)
+        self.assertIn("<code>web_search</code> <code>fetch_url</code>", text)
+        self.assertIn("💬 «<b>ответ текста</b>» 💬", text)
+        self.assertEqual(text.count("web_search"), 1)
+
+    def test_escapes_html(self):
+        text = userbot.render_response("", ["a<b"], ["x&y"], "c<d>e")
+        self.assertIn("a&lt;b", text)
+        self.assertIn("x&amp;y", text)
+        self.assertIn("<b>c&lt;d&gt;e</b>", text)
+
+    def test_no_sections_when_empty(self):
+        text = userbot.render_response("prefix:\n\n", [], [], "")
+        self.assertEqual(text, "prefix:\n\n")
+
+
 class ExecuteToolTest(BotTestCase):
     def setUp(self):
         super().setUp()

@@ -268,6 +268,7 @@ def get_history_for(chat_id) -> deque:
 TOOLS = tools_module.TOOLS
 TOOLS_BOT = tools_module.TOOLS
 safe_eval = tools_module.safe_eval
+render_response = tools_module.render_response
 
 
 def _bot_stats(chat_id):
@@ -756,17 +757,7 @@ async def handler(event: events.NewMessage.Event):
         tool_parts: list[str] = []
 
         def render():
-            blocks = []
-            if reasoning_parts:
-                body = html.escape("".join(reasoning_parts).strip())
-                blocks.append(f"💭 «<i>{body}</i>» 💭")
-            if tool_parts:
-                body = " ".join(f"<code>{html.escape(t)}</code>" for t in tool_parts)
-                blocks.append(f"🔧 [ {body} ] 🔧")
-            if full_answer:
-                body = html.escape(full_answer)
-                blocks.append(f"💬 «<b>{body}</b>» 💬")
-            return prefix + "\n\n".join(blocks)
+            return render_response(prefix, reasoning_parts, tool_parts, full_answer)
 
         async def on_delta(part):
             nonlocal full_answer, last_edit

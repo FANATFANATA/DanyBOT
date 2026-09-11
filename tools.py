@@ -103,6 +103,23 @@ def safe_eval(expression: str) -> str:
         return f"Ошибка вычисления: {exc}"
 
 
+def render_response(prefix, reasoning_parts, tool_parts, full_answer):
+    blocks = []
+    reasoning = "".join(reasoning_parts).strip()
+    if reasoning:
+        blocks.append(f"💭 «<i>{html.escape(reasoning)}</i>» 💭")
+    if tool_parts:
+        seen = []
+        for tool in tool_parts:
+            if tool not in seen:
+                seen.append(tool)
+        body = " ".join(f"<code>{html.escape(tool)}</code>" for tool in seen)
+        blocks.append(f"🔧 [ {body} ] 🔧")
+    if full_answer:
+        blocks.append(f"💬 «<b>{html.escape(full_answer)}</b>» 💬")
+    return prefix + "\n\n".join(blocks)
+
+
 TOOLS = [
     {
         "type": "function",
