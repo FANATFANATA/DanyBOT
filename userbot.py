@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import struct
+import sys
 import time
 from collections import deque
 from pathlib import Path
@@ -32,8 +33,6 @@ _env_str = core._env_str
 _env_int = core._env_int
 _env_float = core._env_float
 _env_bool = core._env_bool
-AUTO_ON_WORDS = core.AUTO_ON_WORDS
-AUTO_OFF_WORDS = core.AUTO_OFF_WORDS
 handle_commands = core.handle_commands
 
 
@@ -202,18 +201,15 @@ def get_history_for(chat_id) -> deque:
 
 
 TOOLS = tools_module.TOOLS
-TOOLS_BOT = tools_module.TOOLS
 safe_eval = tools_module.safe_eval
 render_response = tools_module.render_response
 
 
 def _bot_stats(chat_id):
-    import sys as _sys
-
     uptime = time.monotonic() - START_TIME
     return {
         "uptime_seconds": round(uptime, 1),
-        "python": _sys.version.split()[0],
+        "python": sys.version.split()[0],
         "context_messages": len(chat_history.get(chat_id, deque())),
         "model": model_for(chat_id),
         "modes": {"userbot": ENABLE_USERBOT, "bot": ENABLE_BOT},
@@ -463,70 +459,29 @@ async def handler(event: events.NewMessage.Event):
         return
 
     if command:
-        cmd = command[0]
-        if cmd == "clear":
-            async with ctx_lock:
-                limit = DM_HISTORY_LIMIT if is_private else GROUP_HISTORY_LIMIT
-                chat_history[chat_id] = deque(maxlen=limit)
-            save_history()
-            await safe_reply(event, "Контекст очищен. / Context cleared.")
-            return
-        if cmd == "model":
-            val = command[1]
-            async with ctx_lock:
-                if val:
-                    model_overrides[chat_id] = val
-                    text_out = f"Модель установлена / Model set: {val}"
-                else:
-                    text_out = f"Текущая модель / Current model: {model_for(chat_id)}"
-            save_state()
+        resp = core.handle_command_state(
+            command,
+            chat_id,
+            is_private,
+            chat_history,
+            model_overrides,
+            auto_respond,
+            ignored_chats,
+            ignored_users,
+            DM_HISTORY_LIMIT,
+            GROUP_HISTORY_LIMIT,
+            AUTO_RESPOND_GLOBAL,
+            DANYAPI_MODEL,
+            MODELS,
+            HELP_TEXT,
+        )
+        if resp is not None:
+            text_out, save_s, save_h = resp
+            if save_s:
+                save_state()
+            if save_h:
+                save_history()
             await safe_reply(event, text_out)
-            return
-        if cmd == "autorespond":
-            val = command[1]
-            async with ctx_lock:
-                if val:
-                    auto_respond.add(chat_id)
-                    text_out = "Авто-ответ ВКЛ. / Auto-reply ON."
-                else:
-                    auto_respond.discard(chat_id)
-                    text_out = "Авто-ответ ВЫКЛ. / Auto-reply OFF."
-            save_state()
-            await safe_reply(event, text_out)
-            return
-        if cmd == "history":
-            async with ctx_lock:
-                hist = chat_history.get(chat_id, deque())
-                n = len(hist)
-                chars = sum(len(m["content"]) for m in hist)
-            await safe_reply(
-                event,
-                f"Сообщений в контексте / Messages in context: {n}, "
-                f"символов / chars: {chars}",
-            )
-            return
-        if cmd == "help":
-            await safe_reply(event, HELP_TEXT)
-            return
-        if cmd == "models":
-            await safe_reply(event, models_text(chat_id))
-            return
-        if cmd == "ping":
-            await safe_reply(
-                event,
-                f"Онлайн / Online. Модель / Model: {model_for(chat_id)}\n"
-                f"Контекст / Context: "
-                f"{len(chat_history.get(chat_id, deque()))} сообщений / messages",
-            )
-            return
-        if cmd == "ignore":
-            async with ctx_lock:
-                ignored_chats.add(chat_id)
-            save_state()
-            await safe_reply(
-                event,
-                "Чат заглушен / Chat muted. Размут / Unmute: .db unignore",
-            )
             return
 
     if is_private and text.strip() != "…":
@@ -555,31 +510,21 @@ async def handler(event: events.NewMessage.Event):
     if not effective_trigger:
         return
 
-    if COOLDOWN > 0 and not is_self:
-        last = last_chat_activity.get(chat_id, 0)
-        if (now - last) < COOLDOWN:
-            logger.info("Кулдаун для чата %s, пропускаю", chat_id)
-            return
-
-    last_chat_activity[chat_id] = time.monotonic()
-    if len(last_chat_activity) > 10000:
-        cutoff = time.monotonic() - 3600
-        for k in list(last_chat_activity):
-            if last_chat_activity[k] < cutoff:
-                del last_chat_activity[k]
+    if (
+        COOLDOWN > 0
+        and not is_self
+        and core.check_cooldown(chat_id, now, COOLDOWN, last_chat_activity)
+    ):
+        logger.info("Кулдаун для чата %s, пропускаю", chat_id)
+        return
+    if is_self:
+        core.check_cooldown(chat_id, now, COOLDOWN, last_chat_activity)
 
     logger.info("Запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
     prompt = TRIGGER_RE.sub("", text, count=1).strip()
 
-    replied_text = None
-    try:
-        if message.is_reply:
-            reply_msg = await message.get_reply_message()
-            if reply_msg and reply_msg.message:
-                replied_text = reply_msg.message.strip()
-    except (RPCError, OSError, ValueError):
-        replied_text = None
+    replied_text = await core.fetch_replied_text(message)
 
     if replied_text:
         if prompt:
@@ -604,9 +549,11 @@ async def handler(event: events.NewMessage.Event):
     else:
         label = await get_sender_label(event)
         user_content = f"{label}: {prompt}" if label else prompt
+        await core.append_group_history(
+            chat_id, user_content, chat_history, GROUP_HISTORY_LIMIT, ctx_lock
+        )
         async with ctx_lock:
             hist = get_history_for(chat_id)
-            hist.append({"role": "user", "content": user_content})
             sysp = system_for(chat_id)
             model = model_for(chat_id)
             messages = [{"role": "system", "content": sysp}, *list(hist)]

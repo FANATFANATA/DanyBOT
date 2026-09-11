@@ -14,7 +14,7 @@ from telethon.errors import RPCError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 
-from core import _env_int
+from core import _env_bool, _env_int
 
 logger = logging.getLogger("danybot.proxy")
 
@@ -300,12 +300,10 @@ def mark_bad_proxy(item):
 
 
 def proxies_enabled():
-    return os.getenv("PROXY_ENABLED", "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-        "",
-    )
+    raw = os.getenv("PROXY_ENABLED")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "")
 
 
 async def get_proxy_candidates(limit=40):
@@ -321,7 +319,7 @@ async def get_proxy_candidates(limit=40):
     if host and port.isdigit():
         candidates.append({"proxy_type": proto, "addr": host, "port": int(port)})
 
-    if os.getenv("PROXY_AUTO", "1").strip() not in ("0", "false", "no", ""):
+    if _env_bool("PROXY_AUTO", True):
         items = await get_working_proxies(limit=limit, prefer_protocol=proto)
         for item in items:
             d = proxy_to_telethon(item)

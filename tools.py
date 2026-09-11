@@ -103,6 +103,47 @@ def safe_eval(expression: str) -> str:
         return f"Ошибка вычисления: {exc}"
 
 
+def _int_arg(arguments, key, default, lo, hi):
+    try:
+        value = int(arguments.get(key, default))
+    except (TypeError, ValueError):
+        value = default
+    return max(lo, min(value, hi))
+
+
+def _msg_id(arguments):
+    try:
+        return int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _str_arg(arguments, key, default=""):
+    return str(arguments.get(key, default)).strip()
+
+
+def _format_messages(msgs, limit):
+    lines = []
+    for m in reversed(list(msgs)):
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _get_messages(client, chat, limit, error_msg, empty_msg, query=None):
+    try:
+        if query is None:
+            msgs = cast(Any, await client.get_messages(chat, limit=limit))
+        else:
+            msgs = cast(Any, await client.get_messages(chat, limit=limit, search=query))
+    except (RPCError, OSError, ValueError) as exc:
+        return f"{error_msg}{exc}"
+    if not msgs:
+        return empty_msg
+    return _format_messages(msgs, limit)
+
+
 def render_response(prefix, reasoning_parts, tool_parts, full_answer):
     blocks = []
     reasoning = "".join(reasoning_parts).strip()
@@ -462,31 +503,14 @@ TOOLS = [
 
 
 async def _tool_get_chat_history(arguments, chat_id, client, stats):
-    try:
-        limit = int(arguments.get("limit", 20))
-    except (TypeError, ValueError):
-        limit = 20
-    limit = max(1, min(limit, 100))
-    try:
-        msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
-    except (RPCError, OSError, ValueError) as exc:
-        return f"Ошибка получения истории: {exc}"
-    if not msgs:
-        return "История пуста."
-    lines = []
-    for m in reversed(list(msgs)):
-        sender = getattr(m, "sender_id", None)
-        text = m.message or ""
-        lines.append(f"[{m.id}] {sender}: {text}")
-    return "\n".join(lines)
+    limit = _int_arg(arguments, "limit", 20, 1, 100)
+    return await _get_messages(
+        client, chat_id, limit, "Ошибка получения истории: ", "История пуста."
+    )
 
 
 async def _tool_list_chats(arguments, chat_id, client, stats):
-    try:
-        limit = int(arguments.get("limit", 30))
-    except (TypeError, ValueError):
-        limit = 30
-    limit = max(1, min(limit, 100))
+    limit = _int_arg(arguments, "limit", 30, 1, 100)
     try:
         dialogs = await client.get_dialogs(limit=limit)
     except (RPCError, OSError, ValueError) as exc:
@@ -504,8 +528,8 @@ async def _tool_list_chats(arguments, chat_id, client, stats):
 
 
 async def _tool_send_message_to(arguments, chat_id, client, stats):
-    chat = str(arguments.get("chat", "")).strip()
-    text = str(arguments.get("text", "")).strip()
+    chat = _str_arg(arguments, "chat")
+    text = _str_arg(arguments, "text")
     if not chat or not text:
         return "Нужны chat и text."
     try:
@@ -516,30 +540,17 @@ async def _tool_send_message_to(arguments, chat_id, client, stats):
 
 
 async def _tool_get_chat_history_in(arguments, chat_id, client, stats):
-    chat = str(arguments.get("chat", "")).strip()
+    chat = _str_arg(arguments, "chat")
     if not chat:
         return "Пустой chat."
-    try:
-        limit = int(arguments.get("limit", 20))
-    except (TypeError, ValueError):
-        limit = 20
-    limit = max(1, min(limit, 100))
-    try:
-        msgs = cast(Any, await client.get_messages(chat, limit=limit))
-    except (RPCError, OSError, ValueError) as exc:
-        return f"Ошибка получения истории: {exc}"
-    if not msgs:
-        return "История пуста."
-    lines = []
-    for m in reversed(list(msgs)):
-        sender = getattr(m, "sender_id", None)
-        text = m.message or ""
-        lines.append(f"[{m.id}] {sender}: {text}")
-    return "\n".join(lines)
+    limit = _int_arg(arguments, "limit", 20, 1, 100)
+    return await _get_messages(
+        client, chat, limit, "Ошибка получения истории: ", "История пуста."
+    )
 
 
 async def _tool_evaluate(arguments, chat_id, client, stats):
-    return safe_eval(str(arguments.get("expression", "")))
+    return safe_eval(_str_arg(arguments, "expression"))
 
 
 async def _tool_get_chat_info(arguments, chat_id, client, stats):
@@ -559,7 +570,7 @@ async def _tool_get_chat_info(arguments, chat_id, client, stats):
 
 
 async def _tool_get_user_info(arguments, chat_id, client, stats):
-    handle = str(arguments.get("handle", "")).strip()
+    handle = _str_arg(arguments, "handle")
     if not handle:
         return "Пустой handle."
     try:
@@ -580,12 +591,11 @@ async def _tool_get_user_info(arguments, chat_id, client, stats):
 
 
 async def _tool_edit_message(arguments, chat_id, client, stats):
-    text = str(arguments.get("text", "")).strip()
+    text = _str_arg(arguments, "text")
     if not text:
         return "Пустой текст."
     try:
-        message_id = int(arguments.get("message_id", 0))
-        await client.edit_message(chat_id, message_id, text)
+        await client.edit_message(chat_id, _msg_id(arguments), text)
     except (RPCError, OSError, ValueError, TypeError) as exc:
         return f"Ошибка редактирования: {exc}"
     return "Сообщение отредактировано."
@@ -593,8 +603,7 @@ async def _tool_edit_message(arguments, chat_id, client, stats):
 
 async def _tool_get_message_by_id(arguments, chat_id, client, stats):
     try:
-        message_id = int(arguments.get("message_id", 0))
-        msgs = cast(Any, await client.get_messages(chat_id, ids=[message_id]))
+        msgs = cast(Any, await client.get_messages(chat_id, ids=[_msg_id(arguments)]))
     except (RPCError, OSError, ValueError, TypeError) as exc:
         return f"Ошибка получения сообщения: {exc}"
     if not msgs:
@@ -621,14 +630,10 @@ async def _tool_get_profile(arguments, chat_id, client, stats):
 
 
 async def _tool_run_shell(arguments, chat_id, client, stats):
-    command = str(arguments.get("command", "")).strip()
+    command = _str_arg(arguments, "command")
     if not command:
         return "Пустая команда."
-    try:
-        timeout = int(arguments.get("timeout", 30))
-    except (TypeError, ValueError):
-        timeout = 30
-    timeout = max(1, min(timeout, 120))
+    timeout = _int_arg(arguments, "timeout", 30, 1, 120)
     proc = await asyncio.create_subprocess_shell(
         command,
         stdout=asyncio.subprocess.PIPE,
@@ -651,14 +656,10 @@ async def _tool_run_shell(arguments, chat_id, client, stats):
 
 
 async def _tool_web_search(arguments, chat_id, client, stats):
-    query = str(arguments.get("query", "")).strip()
+    query = _str_arg(arguments, "query")
     if not query:
         return "Пустой запрос."
-    try:
-        limit = int(arguments.get("limit", 5))
-    except (TypeError, ValueError):
-        limit = 5
-    limit = max(1, min(limit, 10))
+    limit = _int_arg(arguments, "limit", 5, 1, 10)
     try:
         async with httpx.AsyncClient(timeout=20, follow_redirects=True) as hc:
             resp = await hc.get(
@@ -690,16 +691,12 @@ async def _tool_web_search(arguments, chat_id, client, stats):
 
 
 async def _tool_fetch_url(arguments, chat_id, client, stats):
-    url = str(arguments.get("url", "")).strip()
+    url = _str_arg(arguments, "url")
     if not url:
         return "Пустой URL."
     if not url.startswith(("http://", "https://")):
         return "URL должен начинаться с http:// или https://"
-    try:
-        max_chars = int(arguments.get("max_chars", 5000))
-    except (TypeError, ValueError):
-        max_chars = 5000
-    max_chars = max(100, min(max_chars, 20000))
+    max_chars = _int_arg(arguments, "max_chars", 5000, 100, 20000)
     try:
         async with httpx.AsyncClient(timeout=25, follow_redirects=True) as hc:
             resp = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -720,9 +717,8 @@ async def _tool_fetch_url(arguments, chat_id, client, stats):
 
 
 async def _tool_pin_message(arguments, chat_id, client, stats):
-    try:
-        message_id = int(arguments.get("message_id", 0))
-    except (TypeError, ValueError):
+    message_id = _msg_id(arguments)
+    if message_id is None:
         return "Некорректный message_id."
     notify = bool(arguments.get("notify", False))
     try:
@@ -733,9 +729,8 @@ async def _tool_pin_message(arguments, chat_id, client, stats):
 
 
 async def _tool_unpin_message(arguments, chat_id, client, stats):
-    try:
-        message_id = int(arguments.get("message_id", 0))
-    except (TypeError, ValueError):
+    message_id = _msg_id(arguments)
+    if message_id is None:
         return "Некорректный message_id."
     try:
         await client.unpin_message(chat_id, message_id)
@@ -765,11 +760,10 @@ async def _tool_get_pinned_messages(arguments, chat_id, client, stats):
 
 
 async def _tool_react_to_message(arguments, chat_id, client, stats):
-    try:
-        message_id = int(arguments.get("message_id", 0))
-    except (TypeError, ValueError):
+    message_id = _msg_id(arguments)
+    if message_id is None:
         return "Некорректный message_id."
-    emoji = str(arguments.get("emoji", "")).strip()
+    emoji = _str_arg(arguments, "emoji")
     if not emoji:
         return "Пустая реакция."
     try:
@@ -786,50 +780,29 @@ async def _tool_react_to_message(arguments, chat_id, client, stats):
 
 
 async def _tool_get_last_messages(arguments, chat_id, client, stats):
-    try:
-        limit = int(arguments.get("limit", 50))
-    except (TypeError, ValueError):
-        limit = 50
-    limit = max(1, min(limit, 500))
-    try:
-        msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
-    except (RPCError, OSError, ValueError) as exc:
-        return f"Ошибка получения сообщений: {exc}"
-    if not msgs:
-        return "Сообщений нет."
-    lines = []
-    for m in reversed(list(msgs)):
-        sender = getattr(m, "sender_id", None)
-        text = m.message or ""
-        lines.append(f"[{m.id}] {sender}: {text}")
-    return "\n".join(lines)
+    limit = _int_arg(arguments, "limit", 50, 1, 500)
+    return await _get_messages(
+        client, chat_id, limit, "Ошибка получения сообщений: ", "Сообщений нет."
+    )
 
 
 async def _tool_search_messages(arguments, chat_id, client, stats):
-    query = str(arguments.get("query", "")).strip()
+    query = _str_arg(arguments, "query")
     if not query:
         return "Пустой запрос."
-    try:
-        limit = int(arguments.get("limit", 20))
-    except (TypeError, ValueError):
-        limit = 20
-    limit = max(1, min(limit, 100))
-    try:
-        msgs = cast(Any, await client.get_messages(chat_id, limit=limit, search=query))
-    except (RPCError, OSError, ValueError) as exc:
-        return f"Ошибка поиска: {exc}"
-    if not msgs:
-        return "Сообщений не найдено."
-    lines = []
-    for m in reversed(list(msgs)):
-        sender = getattr(m, "sender_id", None)
-        text = m.message or ""
-        lines.append(f"[{m.id}] {sender}: {text}")
-    return "\n".join(lines)
+    limit = _int_arg(arguments, "limit", 20, 1, 100)
+    return await _get_messages(
+        client,
+        chat_id,
+        limit,
+        "Ошибка поиска: ",
+        "Сообщений не найдено.",
+        query=query,
+    )
 
 
 async def _tool_send_message(arguments, chat_id, client, stats):
-    text = str(arguments.get("text", "")).strip()
+    text = _str_arg(arguments, "text")
     if not text:
         return "Пустой текст."
     try:
@@ -840,9 +813,8 @@ async def _tool_send_message(arguments, chat_id, client, stats):
 
 
 async def _tool_delete_message(arguments, chat_id, client, stats):
-    try:
-        message_id = int(arguments.get("message_id", 0))
-    except (TypeError, ValueError):
+    message_id = _msg_id(arguments)
+    if message_id is None:
         return "Некорректный message_id."
     try:
         await client.delete_messages(chat_id, [message_id])
@@ -852,11 +824,10 @@ async def _tool_delete_message(arguments, chat_id, client, stats):
 
 
 async def _tool_forward_message(arguments, chat_id, client, stats):
-    try:
-        message_id = int(arguments.get("message_id", 0))
-    except (TypeError, ValueError):
+    message_id = _msg_id(arguments)
+    if message_id is None:
         return "Некорректный message_id."
-    fwd_target = str(arguments.get("target", "")).strip()
+    fwd_target = _str_arg(arguments, "target")
     if not fwd_target:
         return "Пустой target."
     try:
@@ -867,7 +838,7 @@ async def _tool_forward_message(arguments, chat_id, client, stats):
 
 
 async def _tool_create_poll(arguments, chat_id, client, stats):
-    question = str(arguments.get("question", "")).strip()
+    question = _str_arg(arguments, "question")
     options = arguments.get("options", [])
     if not question:
         return "Пустой вопрос."

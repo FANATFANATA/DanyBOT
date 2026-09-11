@@ -1073,8 +1073,10 @@ class SystemForModeTest(BotTestCase):
     def test_default_mode_is_userbot(self):
         self.assertEqual(userbot.system_for(-100), userbot.system_for(-100, "userbot"))
 
-    def test_tools_bot_is_same_as_userbot(self):
-        self.assertEqual(userbot.TOOLS_BOT, userbot.TOOLS)
+    def test_tools_expose_tools_module(self):
+        import tools
+
+        self.assertIs(userbot.TOOLS, tools.TOOLS)
 
     def test_tools_has_all_required(self):
         names = {t["function"]["name"] for t in userbot.TOOLS}

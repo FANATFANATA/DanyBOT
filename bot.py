@@ -129,11 +129,6 @@ def save_history():
         logger.warning("Не удалось сохранить history_bot.json")
 
 
-def models_text(chat_id) -> str:
-    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-    return core.models_text(current, userbot.MODELS)
-
-
 async def safe_reply(event, text):
     return await core.safe_reply(event, text, userbot.REPLY_ATTEMPTS, recent_reply_ids)
 
@@ -191,72 +186,29 @@ async def handler(event: events.NewMessage.Event):
         return
 
     if command:
-        cmd = command[0]
-        if cmd == "clear":
-            async with ctx_lock:
-                limit = (
-                    userbot.DM_HISTORY_LIMIT
-                    if is_private
-                    else userbot.GROUP_HISTORY_LIMIT
-                )
-                chat_history[chat_id] = deque(maxlen=limit)
-            save_history()
-            await safe_reply(event, "Контекст очищен. / Context cleared.")
-            return
-        if cmd == "model":
-            val = command[1]
-            async with ctx_lock:
-                if val:
-                    model_overrides[chat_id] = val
-                    text_out = f"Модель установлена / Model set: {val}"
-                else:
-                    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-                    text_out = f"Текущая модель / Current model: {current}"
-            save_state()
+        resp = core.handle_command_state(
+            command,
+            chat_id,
+            is_private,
+            chat_history,
+            model_overrides,
+            auto_respond,
+            ignored_chats,
+            ignored_users,
+            userbot.DM_HISTORY_LIMIT,
+            userbot.GROUP_HISTORY_LIMIT,
+            userbot.AUTO_RESPOND_GLOBAL,
+            userbot.DANYAPI_MODEL,
+            userbot.MODELS,
+            BOT_HELP_TEXT,
+        )
+        if resp is not None:
+            text_out, save_s, save_h = resp
+            if save_s:
+                save_state()
+            if save_h:
+                save_history()
             await safe_reply(event, text_out)
-            return
-        if cmd == "autorespond":
-            val = command[1]
-            async with ctx_lock:
-                if val:
-                    auto_respond.add(chat_id)
-                    text_out = "Авто-ответ ВКЛ. / Auto-reply ON."
-                else:
-                    auto_respond.discard(chat_id)
-                    text_out = "Авто-ответ ВЫКЛ. / Auto-reply OFF."
-            save_state()
-            await safe_reply(event, text_out)
-            return
-        if cmd == "history":
-            async with ctx_lock:
-                hist = chat_history.get(chat_id, deque())
-                n = len(hist)
-                chars = sum(len(m["content"]) for m in hist)
-            await safe_reply(
-                event,
-                f"Сообщений в контексте / Messages in context: {n}, "
-                f"символов / chars: {chars}",
-            )
-            return
-        if cmd == "help":
-            await safe_reply(event, BOT_HELP_TEXT)
-            return
-        if cmd == "auto_status":
-            enabled = chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL
-            state = "ON" if enabled else "OFF"
-            await safe_reply(event, f"Авто-ответ / Auto-reply: {state}")
-            return
-        if cmd == "models":
-            await safe_reply(event, models_text(chat_id))
-            return
-        if cmd == "ping":
-            current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-            ctx_len = len(chat_history.get(chat_id, deque()))
-            await safe_reply(
-                event,
-                f"Онлайн / Online. Модель / Model: {current}\n"
-                f"Контекст / Context: {ctx_len} сообщений / messages",
-            )
             return
 
     if is_private and text.strip() != "…":
@@ -289,31 +241,21 @@ async def handler(event: events.NewMessage.Event):
     if not effective_trigger:
         return
 
-    if userbot.COOLDOWN > 0 and not is_self:
-        last = last_chat_activity.get(chat_id, 0)
-        if (now - last) < userbot.COOLDOWN:
-            logger.info("Кулдаун для чата %s, пропускаю", chat_id)
-            return
-
-    last_chat_activity[chat_id] = time.monotonic()
-    if len(last_chat_activity) > 10000:
-        cutoff = time.monotonic() - 3600
-        for k in list(last_chat_activity):
-            if last_chat_activity[k] < cutoff:
-                del last_chat_activity[k]
+    if (
+        userbot.COOLDOWN > 0
+        and not is_self
+        and core.check_cooldown(chat_id, now, userbot.COOLDOWN, last_chat_activity)
+    ):
+        logger.info("Кулдаун для чата %s, пропускаю", chat_id)
+        return
+    if is_self:
+        core.check_cooldown(chat_id, now, userbot.COOLDOWN, last_chat_activity)
 
     logger.info("Бот: запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
     prompt = _strip_mention(userbot.TRIGGER_RE.sub("", text, count=1).strip())
 
-    replied_text = None
-    try:
-        if message.is_reply:
-            reply_msg = await message.get_reply_message()
-            if reply_msg and reply_msg.message:
-                replied_text = reply_msg.message.strip()
-    except (RPCError, OSError, ValueError):
-        replied_text = None
+    replied_text = await core.fetch_replied_text(message)
 
     if replied_text:
         if prompt:
@@ -340,11 +282,17 @@ async def handler(event: events.NewMessage.Event):
     else:
         label = await userbot.get_sender_label(event)
         user_content = f"{label}: {prompt}" if label else prompt
+        await core.append_group_history(
+            chat_id,
+            user_content,
+            chat_history,
+            userbot.GROUP_HISTORY_LIMIT,
+            ctx_lock,
+        )
         async with ctx_lock:
             hist = chat_history.setdefault(
                 chat_id, deque(maxlen=userbot.GROUP_HISTORY_LIMIT)
             )
-            hist.append({"role": "user", "content": user_content})
             sysp = userbot.system_for(chat_id, mode="bot")
             model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
             messages = [{"role": "system", "content": sysp}, *list(hist)]

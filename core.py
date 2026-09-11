@@ -311,6 +311,124 @@ async def edit_text(client, chat_id, msg_id, text, attempts):
     return False
 
 
+async def fetch_replied_text(message):
+    try:
+        if message.is_reply:
+            reply_msg = await message.get_reply_message()
+            if reply_msg and reply_msg.message:
+                return reply_msg.message.strip()
+    except (RPCError, OSError, ValueError):
+        pass
+    return None
+
+
+def check_cooldown(
+    chat_id,
+    now,
+    cooldown,
+    last_chat_activity,
+    cleanup_threshold=10000,
+    cleanup_age=3600,
+):
+    if cooldown > 0:
+        last = last_chat_activity.get(chat_id, 0)
+        if (now - last) < cooldown:
+            return True
+    last_chat_activity[chat_id] = time.monotonic()
+    if len(last_chat_activity) > cleanup_threshold:
+        cutoff = time.monotonic() - cleanup_age
+        for k in list(last_chat_activity):
+            if last_chat_activity[k] < cutoff:
+                del last_chat_activity[k]
+    return False
+
+
+def handle_command_state(
+    command,
+    chat_id,
+    is_private,
+    chat_history,
+    model_overrides,
+    auto_respond,
+    ignored_chats,
+    ignored_users,
+    dm_limit,
+    group_limit,
+    auto_respond_global,
+    default_model,
+    models_list,
+    help_text,
+):
+    cmd = command[0]
+    if cmd == "clear":
+        limit = dm_limit if is_private else group_limit
+        chat_history[chat_id] = deque(maxlen=limit)
+        return ("Контекст очищен. / Context cleared.", False, True)
+    if cmd == "model":
+        val = command[1]
+        if val:
+            model_overrides[chat_id] = val
+            return (f"Модель установлена / Model set: {val}", True, False)
+        current = model_overrides.get(chat_id, default_model)
+        return (f"Текущая модель / Current model: {current}", False, False)
+    if cmd == "autorespond":
+        val = command[1]
+        if val:
+            auto_respond.add(chat_id)
+            return ("Авто-ответ ВКЛ. / Auto-reply ON.", True, False)
+        auto_respond.discard(chat_id)
+        return ("Авто-ответ ВЫКЛ. / Auto-reply OFF.", True, False)
+    if cmd == "auto_status":
+        enabled = chat_id in auto_respond or auto_respond_global
+        state = "ON" if enabled else "OFF"
+        return (f"Авто-ответ / Auto-reply: {state}", False, False)
+    if cmd == "history":
+        hist = chat_history.get(chat_id, deque())
+        n = len(hist)
+        chars = sum(len(m["content"]) for m in hist)
+        return (
+            (
+                f"Сообщений в контексте / Messages in context: {n}, "
+                f"символов / chars: {chars}"
+            ),
+            False,
+            False,
+        )
+    if cmd == "ping":
+        ctx_len = len(chat_history.get(chat_id, deque()))
+        current = model_overrides.get(chat_id, default_model)
+        return (
+            (
+                f"Онлайн / Online. Модель / Model: {current}\n"
+                f"Контекст / Context: {ctx_len} сообщений / messages"
+            ),
+            False,
+            False,
+        )
+    if cmd == "models":
+        current = model_overrides.get(chat_id, default_model)
+        return (models_text(current, models_list), False, False)
+    if cmd == "help":
+        return (help_text, False, False)
+    if cmd == "ignore":
+        ignored_chats.add(chat_id)
+        return (
+            "Чат заглушен / Chat muted. Размут / Unmute: .db unignore",
+            True,
+            False,
+        )
+    return None
+
+
+def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
+    async def _do():
+        async with ctx_lock:
+            hist = chat_history.setdefault(chat_id, deque(maxlen=group_limit))
+            hist.append({"role": "user", "content": content})
+
+    return _do()
+
+
 def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interval):
     state = {
         "full_answer": "",
@@ -325,26 +443,23 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
             prefix, state["reasoning_parts"], state["tool_parts"], state["full_answer"]
         )
 
-    async def on_delta(part):
-        state["full_answer"] += part
+    async def _maybe_edit():
         now = time.monotonic()
         if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
-            await edit_text_fn(chat_id, state["edit_id"], render())
             state["last_edit"] = now
+            await edit_text_fn(chat_id, state["edit_id"], render())
+
+    async def on_delta(part):
+        state["full_answer"] += part
+        await _maybe_edit()
 
     async def on_reasoning(part):
         state["reasoning_parts"].append(part)
-        now = time.monotonic()
-        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
-            await edit_text_fn(chat_id, state["edit_id"], render())
-            state["last_edit"] = now
+        await _maybe_edit()
 
     async def on_tool(name):
         state["tool_parts"].append(name)
-        now = time.monotonic()
-        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
-            await edit_text_fn(chat_id, state["edit_id"], render())
-            state["last_edit"] = now
+        await _maybe_edit()
 
     return state, render, on_delta, on_reasoning, on_tool
 
