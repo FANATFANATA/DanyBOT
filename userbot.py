@@ -75,6 +75,15 @@ SYSTEM_PROMPT_BOT = os.getenv(
     "Всегда отвечай на том языке, на котором написано последнее сообщение "
     "пользователя.",
 )
+TOOL_VERIFY_PROMPT = os.getenv(
+    "TOOL_VERIFY_PROMPT",
+    "Ты — система безопасности Telegram-бота. Тебе показывают вызов инструмента "
+    "с аргументами. Оцени, безопасно ли его выполнять: не приведёт ли он к удалению "
+    "или порче данных, утечке приватной информации, выполнению опасных shell-команд, "
+    "рассылке сообщений, действиям против владельца аккаунта. "
+    "Ответь строго одним словом: ALLOW или DENY.",
+)
+TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
 
 TRIGGER_ALIASES = (
     ".danybot",
@@ -290,6 +299,31 @@ async def execute_tool(name: str, arguments: dict, chat_id, client=None):
     return await tools_module.execute_tool(name, arguments, chat_id, client, _bot_stats)
 
 
+async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
+    payload = json.dumps({"tool": name, "arguments": arguments}, ensure_ascii=False)
+    try:
+        resp = await ai.chat.completions.create(
+            model=model,
+            messages=cast(
+                Any,
+                [
+                    {"role": "system", "content": TOOL_VERIFY_PROMPT},
+                    {"role": "user", "content": payload},
+                ],
+            ),
+            temperature=0,
+            max_tokens=8,
+            stream=False,
+        )
+    except (OpenAIError, OSError, ValueError, TypeError):
+        return False
+    try:
+        content = resp.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError):
+        content = ""
+    return "ALLOW" in content.upper()
+
+
 async def stream_with_tools(
     messages: list,
     model: str,
@@ -299,6 +333,7 @@ async def stream_with_tools(
     on_tool=None,
     client_override=None,
     tools=None,
+    verify_tools=False,
 ):
     working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
@@ -371,6 +406,20 @@ async def stream_with_tools(
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError):
                 args = {}
+            verify_model = TOOL_VERIFY_MODEL or model
+            if verify_tools and not await verify_tool_call(
+                slot["name"], args, verify_model
+            ):
+                if on_tool is not None:
+                    await on_tool(slot["name"])
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": slot["id"],
+                        "content": "Вызов отклонён проверкой безопасности.",
+                    }
+                )
+                continue
             if client_override is None:
                 result = await execute_tool(slot["name"], args, chat_id)
             else:
@@ -791,7 +840,13 @@ async def handler(event: events.NewMessage.Event):
                     recent_reply_ids.add(edit_id)
 
             result = await stream_with_tools(
-                messages, model, chat_id, on_delta, on_reasoning, on_tool
+                messages,
+                model,
+                chat_id,
+                on_delta,
+                on_reasoning,
+                on_tool,
+                verify_tools=True,
             )
 
         if result:

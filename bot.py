@@ -451,10 +451,10 @@ async def handler(event: events.NewMessage.Event):
             messages = [{"role": "system", "content": sysp}, *list(hist)]
 
     if is_self:
-        prefix = f"{html.escape(text)}\n\n{model}:\n\n"
+        prefix = f"{html.escape(text)}\n\n"
         edit_id = msg_id
     else:
-        prefix = f"{model}:\n\n"
+        prefix = ""
         edit_id = None
 
     try:
@@ -508,6 +508,7 @@ async def handler(event: events.NewMessage.Event):
                 on_tool,
                 client_override=bot_client,
                 tools=userbot.TOOLS,
+                verify_tools=True,
             )
 
         if result:
