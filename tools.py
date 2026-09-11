@@ -1,0 +1,947 @@
+import ast
+import asyncio
+import contextlib
+import datetime
+import html
+import json
+import math
+import re
+import urllib.parse
+from typing import Any, cast
+
+import httpx
+from telethon.errors import RPCError
+from telethon.tl.functions.messages import SendReactionRequest
+from telethon.tl.types import (
+    InputMediaPoll,
+    InputMessagesFilterPinned,
+    Poll,
+    PollAnswer,
+    ReactionEmoji,
+)
+
+SAFE_FUNCS = {
+    "abs": abs,
+    "round": round,
+    "min": min,
+    "max": max,
+    "pow": pow,
+    "sqrt": math.sqrt,
+    "floor": math.floor,
+    "ceil": math.ceil,
+    "sin": math.sin,
+    "cos": math.cos,
+    "tan": math.tan,
+    "log": math.log,
+    "log10": math.log10,
+}
+
+SAFE_CONSTS = {
+    "pi": math.pi,
+    "e": math.e,
+}
+
+
+def _eval_node(node):
+    if isinstance(node, ast.Expression):
+        return _eval_node(node.body)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float)):
+            return node.value
+        raise ValueError("Нечисловая константа")
+    if isinstance(node, ast.BinOp):
+        left = _eval_node(node.left)
+        right = _eval_node(node.right)
+        op = type(node.op)
+        if op is ast.Add:
+            return left + right
+        if op is ast.Sub:
+            return left - right
+        if op is ast.Mult:
+            return left * right
+        if op is ast.Div:
+            return left / right
+        if op is ast.FloorDiv:
+            return left // right
+        if op is ast.Mod:
+            return left % right
+        if op is ast.Pow:
+            return left**right
+        raise ValueError("Недопустимый оператор")
+    if isinstance(node, ast.UnaryOp):
+        operand = _eval_node(node.operand)
+        op = type(node.op)
+        if op is ast.UAdd:
+            return +operand
+        if op is ast.USub:
+            return -operand
+        raise ValueError("Недопустимый унарный оператор")
+    if isinstance(node, ast.Name):
+        if node.id in SAFE_CONSTS:
+            return SAFE_CONSTS[node.id]
+        raise ValueError("Недопустимое имя")
+    if isinstance(node, ast.Call):
+        if isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS:
+            args = [_eval_node(a) for a in node.args]
+            return SAFE_FUNCS[node.func.id](*args)
+        raise ValueError("Недопустимый вызов")
+    raise ValueError("Недопустимая конструкция")
+
+
+def safe_eval(expression: str) -> str:
+    try:
+        tree = ast.parse(expression.strip(), mode="eval")
+        return str(_eval_node(tree))
+    except (
+        SyntaxError,
+        ValueError,
+        ZeroDivisionError,
+        OverflowError,
+        TypeError,
+        KeyError,
+    ) as exc:
+        return f"Ошибка вычисления: {exc}"
+
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_history",
+            "description": "Получить последние сообщения текущего чата",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100,
+                    }
+                },
+                "required": ["limit"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_chats",
+            "description": "Получить список диалогов аккаунта (чаты, пользователи, каналы)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message_to",
+            "description": "Отправить сообщение в указанный чат или пользователю по id или username",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "string"},
+                    "text": {"type": "string"},
+                },
+                "required": ["chat", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_history_in",
+            "description": "Получить последние сообщения указанного чата или пользователя",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "chat": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["chat"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "evaluate",
+            "description": "Безопасно вычислить математическое выражение",
+            "parameters": {
+                "type": "object",
+                "properties": {"expression": {"type": "string"}},
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_chat_info",
+            "description": "Информация о текущем чате",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_user_info",
+            "description": "Информация о пользователе по username или id",
+            "parameters": {
+                "type": "object",
+                "properties": {"handle": {"type": "string"}},
+                "required": ["handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_message",
+            "description": "Отредактировать сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["message_id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_message_by_id",
+            "description": "Получить текст конкретного сообщения по id в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {"message_id": {"type": "integer"}},
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_profile",
+            "description": "Информация о своём аккаунте",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_shell",
+            "description": "Выполнить команду в shell и вернуть stdout/stderr",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                },
+                "required": ["command"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Найти информацию в интернете по запросу",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": "Скачать содержимое URL и вернуть текст",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 20000},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pin_message",
+            "description": "Закрепить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "notify": {"type": "boolean"},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "unpin_message",
+            "description": "Открепить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {"message_id": {"type": "integer"}},
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pinned_messages",
+            "description": "Получить закреплённые сообщения текущего чата",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "react_to_message",
+            "description": "Поставить реакцию на сообщение в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "emoji": {"type": "string"},
+                },
+                "required": ["message_id", "emoji"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_last_messages",
+            "description": "Последние сообщения текущего чата с указанием лимита (до 500)",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500},
+                },
+                "required": ["limit"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_messages",
+            "description": "Поиск сообщений по тексту в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "send_message",
+            "description": "Отправить сообщение в текущий чат",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_message",
+            "description": "Удалить сообщение в текущем чате по id",
+            "parameters": {
+                "type": "object",
+                "properties": {"message_id": {"type": "integer"}},
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forward_message",
+            "description": "Переслать сообщение из текущего чата в указанный чат",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "integer"},
+                    "target": {"type": "string"},
+                },
+                "required": ["message_id", "target"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "create_poll",
+            "description": "Создать опрос в текущем чате",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string"},
+                    "options": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["question", "options"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_time",
+            "description": "Текущие дата и время (UTC и локальное)",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "text_stats",
+            "description": "Статистика текста: символы, слова, строки",
+            "parameters": {
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_bot_stats",
+            "description": "Статистика бота: аптайм, контекст, модель",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+]
+
+
+async def _tool_get_chat_history(arguments, chat_id, client, stats):
+    try:
+        limit = int(arguments.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+    try:
+        msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения истории: {exc}"
+    if not msgs:
+        return "История пуста."
+    lines = []
+    for m in reversed(list(msgs)):
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _tool_list_chats(arguments, chat_id, client, stats):
+    try:
+        limit = int(arguments.get("limit", 30))
+    except (TypeError, ValueError):
+        limit = 30
+    limit = max(1, min(limit, 100))
+    try:
+        dialogs = await client.get_dialogs(limit=limit)
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения диалогов: {exc}"
+    lines = []
+    for d in dialogs:
+        eid = getattr(d.entity, "id", None)
+        username = getattr(d.entity, "username", None)
+        name = getattr(d, "name", "") or getattr(d, "title", "") or ""
+        label = name if name else str(eid)
+        if username:
+            label += f" (@{username})"
+        lines.append(f"{eid}: {label}")
+    return "\n".join(lines) if lines else "Диалоги не найдены."
+
+
+async def _tool_send_message_to(arguments, chat_id, client, stats):
+    chat = str(arguments.get("chat", "")).strip()
+    text = str(arguments.get("text", "")).strip()
+    if not chat or not text:
+        return "Нужны chat и text."
+    try:
+        await client.send_message(chat, text)
+        return "Сообщение отправлено."
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка отправки: {exc}"
+
+
+async def _tool_get_chat_history_in(arguments, chat_id, client, stats):
+    chat = str(arguments.get("chat", "")).strip()
+    if not chat:
+        return "Пустой chat."
+    try:
+        limit = int(arguments.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+    try:
+        msgs = cast(Any, await client.get_messages(chat, limit=limit))
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения истории: {exc}"
+    if not msgs:
+        return "История пуста."
+    lines = []
+    for m in reversed(list(msgs)):
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _tool_evaluate(arguments, chat_id, client, stats):
+    return safe_eval(str(arguments.get("expression", "")))
+
+
+async def _tool_get_chat_info(arguments, chat_id, client, stats):
+    try:
+        entity = await client.get_entity(chat_id)
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения чата: {exc}"
+    return json.dumps(
+        {
+            "id": getattr(entity, "id", None),
+            "title": getattr(entity, "title", None),
+            "username": getattr(entity, "username", None),
+            "members": getattr(entity, "participants_count", None),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_get_user_info(arguments, chat_id, client, stats):
+    handle = str(arguments.get("handle", "")).strip()
+    if not handle:
+        return "Пустой handle."
+    try:
+        entity = await client.get_entity(handle)
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения пользователя: {exc}"
+    first = getattr(entity, "first_name", "") or ""
+    last = getattr(entity, "last_name", "") or ""
+    full = " ".join(x for x in [first, last] if x).strip()
+    return json.dumps(
+        {
+            "id": getattr(entity, "id", None),
+            "name": full,
+            "username": getattr(entity, "username", None),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_edit_message(arguments, chat_id, client, stats):
+    text = str(arguments.get("text", "")).strip()
+    if not text:
+        return "Пустой текст."
+    try:
+        message_id = int(arguments.get("message_id", 0))
+        await client.edit_message(chat_id, message_id, text)
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка редактирования: {exc}"
+    return "Сообщение отредактировано."
+
+
+async def _tool_get_message_by_id(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+        msgs = cast(Any, await client.get_messages(chat_id, ids=[message_id]))
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка получения сообщения: {exc}"
+    if not msgs:
+        return "Сообщение не найдено."
+    return msgs[0].message or ""
+
+
+async def _tool_get_profile(arguments, chat_id, client, stats):
+    try:
+        me = await client.get_me()
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения профиля: {exc}"
+    first = getattr(me, "first_name", "") or ""
+    last = getattr(me, "last_name", "") or ""
+    full = " ".join(x for x in [first, last] if x).strip()
+    return json.dumps(
+        {
+            "id": getattr(me, "id", None),
+            "name": full,
+            "username": getattr(me, "username", None),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_run_shell(arguments, chat_id, client, stats):
+    command = str(arguments.get("command", "")).strip()
+    if not command:
+        return "Пустая команда."
+    try:
+        timeout = int(arguments.get("timeout", 30))
+    except (TypeError, ValueError):
+        timeout = 30
+    timeout = max(1, min(timeout, 120))
+    proc = await asyncio.create_subprocess_shell(
+        command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return f"Таймаут {timeout}s: команда прервана."
+    out = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    result = f"rc={proc.returncode}\nstdout:\n{out}"
+    if err:
+        result += f"\nstderr:\n{err}"
+    return result[:4000]
+
+
+async def _tool_web_search(arguments, chat_id, client, stats):
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "Пустой запрос."
+    try:
+        limit = int(arguments.get("limit", 5))
+    except (TypeError, ValueError):
+        limit = 5
+    limit = max(1, min(limit, 10))
+    try:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as hc:
+            resp = await hc.get(
+                "https://duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            resp.raise_for_status()
+            text = resp.text
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        return f"Ошибка поиска: {exc}"
+    results = []
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    for href, title in pattern.findall(text):
+        title_clean = re.sub(r"<[^>]+>", "", title).strip()
+        title_clean = html.unescape(title_clean)
+        if "uddg=" in href:
+            parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            href = parsed.get("uddg", [href])[0]
+        results.append(f"{title_clean}\n{href}")
+        if len(results) >= limit:
+            break
+    if not results:
+        return "Ничего не найдено."
+    return "\n\n".join(results)
+
+
+async def _tool_fetch_url(arguments, chat_id, client, stats):
+    url = str(arguments.get("url", "")).strip()
+    if not url:
+        return "Пустой URL."
+    if not url.startswith(("http://", "https://")):
+        return "URL должен начинаться с http:// или https://"
+    try:
+        max_chars = int(arguments.get("max_chars", 5000))
+    except (TypeError, ValueError):
+        max_chars = 5000
+    max_chars = max(100, min(max_chars, 20000))
+    try:
+        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as hc:
+            resp = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            resp.raise_for_status()
+            raw = resp.text
+    except (httpx.HTTPError, OSError, ValueError) as exc:
+        return f"Ошибка загрузки: {exc}"
+    cleaned = re.sub(
+        r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE
+    )
+    cleaned = re.sub(
+        r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE
+    )
+    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+    cleaned = html.unescape(cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned[:max_chars]
+
+
+async def _tool_pin_message(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return "Некорректный message_id."
+    notify = bool(arguments.get("notify", False))
+    try:
+        await client.pin_message(chat_id, message_id, notify=notify)
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка закрепления: {exc}"
+    return "Сообщение закреплено."
+
+
+async def _tool_unpin_message(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return "Некорректный message_id."
+    try:
+        await client.unpin_message(chat_id, message_id)
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка открепления: {exc}"
+    return "Сообщение откреплено."
+
+
+async def _tool_get_pinned_messages(arguments, chat_id, client, stats):
+    try:
+        msgs = cast(
+            Any,
+            await client.get_messages(
+                chat_id, limit=20, filter=InputMessagesFilterPinned()
+            ),
+        )
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения закрепов: {exc}"
+    if not msgs:
+        return "Закреплённых сообщений нет."
+    lines = []
+    for m in msgs:
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _tool_react_to_message(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return "Некорректный message_id."
+    emoji = str(arguments.get("emoji", "")).strip()
+    if not emoji:
+        return "Пустая реакция."
+    try:
+        await client(
+            SendReactionRequest(
+                peer=chat_id,
+                msg_id=message_id,
+                reaction=[ReactionEmoji(emoticon=emoji)],
+            )
+        )
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка реакции: {exc}"
+    return f"Реакция {emoji} поставлена."
+
+
+async def _tool_get_last_messages(arguments, chat_id, client, stats):
+    try:
+        limit = int(arguments.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 500))
+    try:
+        msgs = cast(Any, await client.get_messages(chat_id, limit=limit))
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка получения сообщений: {exc}"
+    if not msgs:
+        return "Сообщений нет."
+    lines = []
+    for m in reversed(list(msgs)):
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _tool_search_messages(arguments, chat_id, client, stats):
+    query = str(arguments.get("query", "")).strip()
+    if not query:
+        return "Пустой запрос."
+    try:
+        limit = int(arguments.get("limit", 20))
+    except (TypeError, ValueError):
+        limit = 20
+    limit = max(1, min(limit, 100))
+    try:
+        msgs = cast(Any, await client.get_messages(chat_id, limit=limit, search=query))
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка поиска: {exc}"
+    if not msgs:
+        return "Сообщений не найдено."
+    lines = []
+    for m in reversed(list(msgs)):
+        sender = getattr(m, "sender_id", None)
+        text = m.message or ""
+        lines.append(f"[{m.id}] {sender}: {text}")
+    return "\n".join(lines)
+
+
+async def _tool_send_message(arguments, chat_id, client, stats):
+    text = str(arguments.get("text", "")).strip()
+    if not text:
+        return "Пустой текст."
+    try:
+        await client.send_message(chat_id, text)
+    except (RPCError, OSError, ValueError) as exc:
+        return f"Ошибка отправки: {exc}"
+    return "Сообщение отправлено."
+
+
+async def _tool_delete_message(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return "Некорректный message_id."
+    try:
+        await client.delete_messages(chat_id, [message_id])
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка удаления: {exc}"
+    return "Сообщение удалено."
+
+
+async def _tool_forward_message(arguments, chat_id, client, stats):
+    try:
+        message_id = int(arguments.get("message_id", 0))
+    except (TypeError, ValueError):
+        return "Некорректный message_id."
+    fwd_target = str(arguments.get("target", "")).strip()
+    if not fwd_target:
+        return "Пустой target."
+    try:
+        await client.forward_messages(fwd_target, message_id, chat_id)
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка пересылки: {exc}"
+    return "Сообщение переслано."
+
+
+async def _tool_create_poll(arguments, chat_id, client, stats):
+    question = str(arguments.get("question", "")).strip()
+    options = arguments.get("options", [])
+    if not question:
+        return "Пустой вопрос."
+    if not isinstance(options, list) or len(options) < 2:
+        return "Нужно минимум 2 варианта."
+    clean_options = [str(o).strip() for o in options if str(o).strip()]
+    if len(clean_options) < 2:
+        return "Нужно минимум 2 непустых варианта."
+    poll = Poll(
+        id=0,
+        hash=0,
+        question=cast(Any, question),
+        answers=cast(
+            Any,
+            [
+                PollAnswer(text=cast(Any, o), option=bytes([i]))
+                for i, o in enumerate(clean_options)
+            ],
+        ),
+    )
+    try:
+        await client.send_file(chat_id, InputMediaPoll(poll=poll))
+    except (RPCError, OSError, ValueError, TypeError) as exc:
+        return f"Ошибка создания опроса: {exc}"
+    return "Опрос создан."
+
+
+async def _tool_get_time(arguments, chat_id, client, stats):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return json.dumps(
+        {
+            "utc": now.isoformat(),
+            "local": datetime.datetime.now(datetime.timezone.utc)
+            .astimezone()
+            .isoformat(),
+            "weekday": now.strftime("%A"),
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_text_stats(arguments, chat_id, client, stats):
+    text = str(arguments.get("text", ""))
+    return json.dumps(
+        {
+            "chars": len(text),
+            "chars_no_spaces": len(re.sub(r"\s", "", text)),
+            "words": len(text.split()),
+            "lines": len(text.splitlines()) or 1,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _tool_get_bot_stats(arguments, chat_id, client, stats):
+    data = stats(chat_id) if stats is not None else {}
+    return json.dumps(data, ensure_ascii=False)
+
+
+_HANDLERS = {
+    "get_chat_history": _tool_get_chat_history,
+    "list_chats": _tool_list_chats,
+    "send_message_to": _tool_send_message_to,
+    "get_chat_history_in": _tool_get_chat_history_in,
+    "evaluate": _tool_evaluate,
+    "get_chat_info": _tool_get_chat_info,
+    "get_user_info": _tool_get_user_info,
+    "edit_message": _tool_edit_message,
+    "get_message_by_id": _tool_get_message_by_id,
+    "get_profile": _tool_get_profile,
+    "run_shell": _tool_run_shell,
+    "web_search": _tool_web_search,
+    "fetch_url": _tool_fetch_url,
+    "pin_message": _tool_pin_message,
+    "unpin_message": _tool_unpin_message,
+    "get_pinned_messages": _tool_get_pinned_messages,
+    "react_to_message": _tool_react_to_message,
+    "get_last_messages": _tool_get_last_messages,
+    "search_messages": _tool_search_messages,
+    "send_message": _tool_send_message,
+    "delete_message": _tool_delete_message,
+    "forward_message": _tool_forward_message,
+    "create_poll": _tool_create_poll,
+    "get_time": _tool_get_time,
+    "text_stats": _tool_text_stats,
+    "get_bot_stats": _tool_get_bot_stats,
+}
+
+
+async def execute_tool(name, arguments, chat_id, client=None, stats=None):
+    handler = _HANDLERS.get(name)
+    if handler is None:
+        return f"Неизвестная функция: {name}"
+    return await handler(arguments, chat_id, client, stats)

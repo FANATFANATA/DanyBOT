@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import html
 import json
 import logging
 import re
@@ -233,7 +234,7 @@ async def safe_reply(event, text):
 async def edit_text(chat_id, msg_id, text):
     for _attempt in range(userbot.REPLY_ATTEMPTS):
         try:
-            await bot_client.edit_message(chat_id, msg_id, text)
+            await bot_client.edit_message(chat_id, msg_id, text, parse_mode="html")
             return True
         except FloodWaitError as e:
             await asyncio.sleep(min(e.seconds, 30))
@@ -450,7 +451,7 @@ async def handler(event: events.NewMessage.Event):
             messages = [{"role": "system", "content": sysp}, *list(hist)]
 
     if is_self:
-        prefix = f"{text}\n\n{model}:\n\n"
+        prefix = f"{html.escape(text)}\n\n{model}:\n\n"
         edit_id = msg_id
     else:
         prefix = f"{model}:\n\n"
@@ -463,13 +464,17 @@ async def handler(event: events.NewMessage.Event):
         tool_parts: list[str] = []
 
         def render():
-            out = prefix
+            blocks = []
             if reasoning_parts:
-                out += f"💭 {''.join(reasoning_parts)}\n\n"
+                body = html.escape("".join(reasoning_parts).strip())
+                blocks.append(f"💭 «<i>{body}</i>» 💭")
             if tool_parts:
-                out += "\n".join(tool_parts) + "\n\n"
-            out += full_answer
-            return out
+                body = " ".join(f"<code>{html.escape(t)}</code>" for t in tool_parts)
+                blocks.append(f"🔧 [ {body} ] 🔧")
+            if full_answer:
+                body = html.escape(full_answer)
+                blocks.append(f"💬 «<b>{body}</b>» 💬")
+            return prefix + "\n\n".join(blocks)
 
         async def on_delta(part):
             nonlocal full_answer, last_edit
@@ -487,9 +492,9 @@ async def handler(event: events.NewMessage.Event):
                 await edit_text(chat_id, edit_id, render())
                 last_edit = now_m
 
-        async def on_tool(name, arguments, result):
+        async def on_tool(name):
             nonlocal last_edit
-            tool_parts.append(f"🔧 {name}({arguments})\n↳ {result}")
+            tool_parts.append(name)
             now_m = time.monotonic()
             if edit_id is not None and (now_m - last_edit) >= userbot.EDIT_INTERVAL:
                 await edit_text(chat_id, edit_id, render())
@@ -510,7 +515,7 @@ async def handler(event: events.NewMessage.Event):
                 on_reasoning,
                 on_tool,
                 client_override=bot_client,
-                tools=userbot.TOOLS_BOT,
+                tools=userbot.TOOLS,
             )
 
         if result:
