@@ -24,7 +24,15 @@ import proxies
 import userbot
 
 PROJECT_DIR = Path(__file__).resolve().parent
-PY_FILES = ("main.py", "bot.py", "userbot.py", "proxies.py", "tools.py", "tests.py")
+PY_FILES = (
+    "main.py",
+    "bot.py",
+    "userbot.py",
+    "proxies.py",
+    "tools.py",
+    "core.py",
+    "tests.py",
+)
 WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
@@ -646,6 +654,22 @@ class ValidateOneMtprotoTest(BotTestCase):
         "addr": "h",
         "port": 1080,
     }
+
+    def setUp(self):
+        super().setUp()
+        self._orig_validate_id = proxies.VALIDATE_API_ID
+        self._orig_validate_hash = proxies.VALIDATE_API_HASH
+        proxies.VALIDATE_API_ID = 1
+        proxies.VALIDATE_API_HASH = "hash"
+        self.addCleanup(setattr, proxies, "VALIDATE_API_ID", self._orig_validate_id)
+        self.addCleanup(setattr, proxies, "VALIDATE_API_HASH", self._orig_validate_hash)
+
+    def test_missing_credentials_skip_validation(self):
+        proxies.VALIDATE_API_ID = 0
+        proxies.VALIDATE_API_HASH = ""
+        with mock.patch.object(proxies, "TelegramClient", self.build_working_client()):
+            ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        self.assertFalse(ok)
 
     @staticmethod
     def broken_client_factory(exc):
@@ -1468,7 +1492,7 @@ def build_linters():
                 "--profile",
                 "black",
                 "-p",
-                "main,bot,userbot,proxies",
+                "main,bot,userbot,proxies,core",
                 *PY_FILES,
             ]
         elif name == "radon":
@@ -1509,7 +1533,7 @@ def run_coverage():
         [
             *base,
             "run",
-            "--source=bot,userbot,proxies,tools",
+            "--source=bot,userbot,proxies,tools,core",
             "-m",
             "unittest",
             "discover",

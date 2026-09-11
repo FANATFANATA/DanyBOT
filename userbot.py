@@ -4,7 +4,6 @@ import html
 import json
 import logging
 import os
-import re
 import struct
 import time
 from collections import deque
@@ -14,9 +13,10 @@ from typing import Any, cast
 from dotenv import load_dotenv
 from openai import AsyncOpenAI, OpenAIError
 from telethon import TelegramClient, events
-from telethon.errors import AuthKeyError, FloodWaitError, RPCError
+from telethon.errors import AuthKeyError, RPCError
 from telethon.sessions import StringSession
 
+import core
 import proxies
 import tools as tools_module
 
@@ -28,37 +28,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("danybot")
 
-
-def _env_str(name: str, default: str) -> str:
-    value = os.getenv(name)
-    return value.strip() if value else default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = _env_str(name, "")
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+_env_str = core._env_str
+_env_int = core._env_int
+_env_float = core._env_float
+_env_bool = core._env_bool
+AUTO_ON_WORDS = core.AUTO_ON_WORDS
+AUTO_OFF_WORDS = core.AUTO_OFF_WORDS
+handle_commands = core.handle_commands
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = _env_str(name, "")
-    try:
-        return float(raw)
-    except ValueError:
-        return default
+def strip_role_tag(text: str) -> str:
+    return core.strip_role_tag(text, BOT_NAME)
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = _env_str(name, "")
-    if not raw:
-        return default
-    return raw.lower() not in ("0", "false", "no")
-
-
-API_ID = _env_int("API_ID", 2040)
-API_HASH = os.getenv("API_HASH", "") or "b18441a1ff607e10a989891a5462e627"
+API_ID = _env_int("API_ID", 0)
+API_HASH = os.getenv("API_HASH", "").strip()
 SESSION_NAME = os.getenv("SESSION_NAME", "session")
 
 DANYAPI_URL = os.getenv("DANYAPI_URL", "http://127.0.0.1:8008/v1")
@@ -85,37 +69,9 @@ TOOL_VERIFY_PROMPT = os.getenv(
 )
 TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
 
-TRIGGER_ALIASES = (
-    ".danybot",
-    ".danyapi",
-    ".dany",
-    ".db",
-    ".gpt",
-    ".ai",
-    ".bot",
-    ".бот",
-    ".д",
-    ".d",
-    ".б",
-    ".данибот",
-    ".даниапи",
-    ".дани",
-)
-AUTO_ALIASES = (".danyauto", ".da", ".auto", ".авто", ".даниавто")
-
-
-def _alias_pattern(aliases):
-    return r"(?:" + "|".join(re.escape(a) for a in aliases) + r")"
-
-
-def _build_trigger_re():
-    return re.compile(
-        r"(?<![a-zа-я0-9])" + _alias_pattern(TRIGGER_ALIASES) + r"(?![a-zа-я0-9])",
-        re.IGNORECASE,
-    )
-
-
-TRIGGER_RE = _build_trigger_re()
+TRIGGER_ALIASES = core.TRIGGER_ALIASES
+AUTO_ALIASES = core.AUTO_ALIASES
+TRIGGER_RE = core.TRIGGER_RE
 
 EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
 GROUP_HISTORY_LIMIT = max(2, _env_int("GROUP_HISTORY_LIMIT", 40))
@@ -168,95 +124,66 @@ def make_session(name: str):
     return name
 
 
-client = TelegramClient(
-    make_session(SESSION_NAME),
-    API_ID,
-    API_HASH,
-    connection_retries=2,
-    request_retries=1,
-    retry_delay=0,
-    timeout=10,
-)
+client = None
+
+
+def get_client():
+    global client
+    if client is None:
+        client = TelegramClient(
+            make_session(SESSION_NAME),
+            API_ID,
+            API_HASH,
+            connection_retries=2,
+            request_retries=1,
+            retry_delay=0,
+            timeout=10,
+        )
+    return client
+
+
 ai = AsyncOpenAI(base_url=DANYAPI_URL, api_key=DANYAPI_KEY)
 
 
 def load_state():
     global model_overrides, auto_respond, ignored_chats, ignored_users
-    if not STATE_FILE.exists():
+    state = core.load_state_file(STATE_FILE)
+    if state is None:
         return
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        model_overrides = {
-            int(k): v for k, v in data.get("model_overrides", {}).items()
-        }
-        auto_respond = {int(x) for x in data.get("auto_respond", [])}
-        ignored_chats = {int(x) for x in data.get("ignored_chats", [])}
-        ignored_users = {int(x) for x in data.get("ignored_users", [])}
-    except (
-        json.JSONDecodeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-    ) as exc:
-        logger.warning("Не удалось загрузить state_userbot.json: %s", exc)
+    model_overrides = state["model_overrides"]
+    auto_respond = state["auto_respond"]
+    ignored_chats = state["ignored_chats"]
+    ignored_users = state["ignored_users"]
 
 
 def save_state():
-    data = {
-        "model_overrides": {str(k): v for k, v in model_overrides.items()},
-        "auto_respond": sorted(auto_respond),
-        "ignored_chats": sorted(ignored_chats),
-        "ignored_users": sorted(ignored_users),
-    }
-    try:
-        STATE_FILE.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except (OSError, TypeError) as exc:
-        logger.warning("Не удалось сохранить state_userbot.json: %s", exc)
+    ok = core.save_state_file(
+        STATE_FILE,
+        {
+            "model_overrides": model_overrides,
+            "auto_respond": auto_respond,
+            "ignored_chats": ignored_chats,
+            "ignored_users": ignored_users,
+        },
+    )
+    if not ok:
+        logger.warning("Не удалось сохранить state_userbot.json")
 
 
 def load_history():
-    if not HISTORY_FILE.exists():
+    history = core.load_history_file(
+        HISTORY_FILE, DM_HISTORY_LIMIT, GROUP_HISTORY_LIMIT
+    )
+    if history is None:
         return
-    try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        for key, value in data.items():
-            try:
-                chat_id = int(key)
-            except (ValueError, TypeError):
-                continue
-            limit = DM_HISTORY_LIMIT if chat_id > 0 else GROUP_HISTORY_LIMIT
-            chat_history[chat_id] = deque(value, maxlen=limit)
-    except (
-        json.JSONDecodeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-    ) as exc:
-        logger.warning("Не удалось загрузить history_userbot.json: %s", exc)
+    global chat_history
+    chat_history = history
 
 
 def save_history():
-    data = {str(k): list(v) for k, v in chat_history.items()}
-    try:
-        HISTORY_FILE.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except (OSError, TypeError) as exc:
-        logger.warning("Не удалось сохранить history_userbot.json: %s", exc)
-
-
-def strip_role_tag(text: str) -> str:
-    low = text.strip().lower()
-    if low.startswith(f"{BOT_NAME.lower()}:"):
-        return text.split(":", 1)[1].strip()
-    m = re.match(r"^\[(user|assistant|system)\]\s*", text, re.IGNORECASE)
-    if m:
-        return text[m.end() :]
-    return text
+    ok = core.save_history_file(HISTORY_FILE, chat_history)
+    if not ok:
+        logger.warning("Не удалось сохранить history_userbot.json")
 
 
 def model_for(chat_id):
@@ -454,123 +381,16 @@ async def get_sender_label(event):
 
 
 async def safe_reply(event, text):
-    for _attempt in range(REPLY_ATTEMPTS):
-        try:
-            sent = await event.reply(text)
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 30))
-            continue
-        except (RPCError, OSError, ValueError, TypeError):
-            return None
-        if sent:
-            recent_reply_ids.add(sent.id)
-            if len(recent_reply_ids) > 5000:
-                recent_reply_ids.clear()
-        return sent
-    return None
+    return await core.safe_reply(event, text, REPLY_ATTEMPTS, recent_reply_ids)
 
 
 async def edit_text(chat_id, msg_id, text):
-    for _attempt in range(REPLY_ATTEMPTS):
-        try:
-            await client.edit_message(chat_id, msg_id, text, parse_mode="html")
-            return True
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 30))
-            continue
-        except (RPCError, OSError, ValueError, TypeError):
-            return False
-    return False
-
-
-SUB_ALIASES = {
-    "clear": (
-        "clear",
-        "сброс",
-        "сбросить",
-        "забыть",
-        "забудь",
-        "стоп",
-        "очистить",
-        "очистка",
-    ),
-    "model": ("model", "модель"),
-    "models": ("models", "модели"),
-    "history": ("history", "история", "контекст", "ctx"),
-    "help": ("help", "помощь", "хелп", "справка", "?"),
-    "ping": ("ping", "пинг", "check"),
-    "ignore": ("ignore", "игнор", "мут", "заглушить"),
-    "unignore": ("unignore", "анмут", "размут", "включить"),
-}
-
-AUTO_ON_WORDS = ("on", "вкл", "включить", "1", "true", "yes", "да")
-AUTO_OFF_WORDS = ("off", "выкл", "выключить", "0", "false", "no", "нет")
-
-
-def _strip_alias_prefix(low):
-    all_aliases = sorted(
-        list(TRIGGER_ALIASES) + list(AUTO_ALIASES), key=len, reverse=True
-    )
-    for a in all_aliases:
-        if low.startswith(a):
-            tail = low[len(a) :]
-            if tail and not tail[0].isspace():
-                continue
-            return tail.strip(), a
-    return None, None
-
-
-def handle_commands(text) -> tuple[str, Any] | None:
-    low = text.strip()
-    lowlower = low.lower()
-    if not low.startswith("."):
-        return None
-
-    rest, alias = _strip_alias_prefix(lowlower)
-    if alias is None or not rest:
-        return None
-
-    m = re.match(r"^(\S+)(?:\s+(.*))?$", rest, re.DOTALL)
-    if not m:
-        return None
-    sub = m.group(1)
-    arg = (m.group(2) or "").strip()
-
-    if alias in AUTO_ALIASES:
-        if sub in AUTO_ON_WORDS:
-            return ("autorespond", True)
-        if sub in AUTO_OFF_WORDS:
-            return ("autorespond", False)
-
-    if sub in SUB_ALIASES["clear"]:
-        return ("clear", None)
-    if sub in SUB_ALIASES["models"]:
-        return ("models", None)
-    if sub in SUB_ALIASES["model"]:
-        return ("model", arg or None)
-    if sub in SUB_ALIASES["history"]:
-        return ("history", None)
-    if sub in SUB_ALIASES["help"]:
-        return ("help", None)
-    if sub in SUB_ALIASES["ping"]:
-        return ("ping", None)
-    if sub in SUB_ALIASES["ignore"]:
-        return ("ignore", None)
-    if sub in SUB_ALIASES["unignore"]:
-        return ("unignore", None)
-
-    return None
+    return await core.edit_text(get_client(), chat_id, msg_id, text, REPLY_ATTEMPTS)
 
 
 def models_text(chat_id) -> str:
     current = model_for(chat_id)
-    parts = ["Доступные модели / Available models:"]
-    for m in MODELS:
-        marker = " (текущая) / current" if m == current else ""
-        parts.append(f"• {m}{marker}")
-    if current not in MODELS:
-        parts.append(f"• {current} (текущая) / current")
-    return "\n".join(parts)
+    return core.models_text(current, MODELS)
 
 
 async def refresh_models():
@@ -605,7 +425,6 @@ HELP_TEXT = (
 )
 
 
-@client.on(events.NewMessage(incoming=None))
 async def handler(event: events.NewMessage.Event):
     message = event.message
     if not message or not message.message:
@@ -794,50 +613,30 @@ async def handler(event: events.NewMessage.Event):
 
     if is_self:
         prefix = f"{html.escape(text)}\n\n{model}:\n\n"
-        edit_id = msg_id
+        self_edit_id = msg_id
     else:
         prefix = f"{model}:\n\n"
-        edit_id = None
+        self_edit_id = None
 
     try:
-        full_answer = ""
-        last_edit = 0.0
-        reasoning_parts: list[str] = []
-        tool_parts: list[str] = []
+        stream_state, render, on_delta, on_reasoning, on_tool = (
+            core.make_stream_callbacks(
+                prefix,
+                render_response,
+                edit_text,
+                chat_id,
+                EDIT_INTERVAL,
+            )
+        )
+        if self_edit_id is not None:
+            stream_state["edit_id"] = self_edit_id
 
-        def render():
-            return render_response(prefix, reasoning_parts, tool_parts, full_answer)
-
-        async def on_delta(part):
-            nonlocal full_answer, last_edit
-            full_answer += part
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async def on_reasoning(part):
-            nonlocal last_edit
-            reasoning_parts.append(part)
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async def on_tool(name):
-            nonlocal last_edit
-            tool_parts.append(name)
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async with cast(Any, client.action(chat_id, "typing")):
+        async with cast(Any, get_client().action(chat_id, "typing")):
             if not is_self:
                 placeholder = await event.reply("…")
                 if placeholder:
-                    edit_id = placeholder.id
-                    recent_reply_ids.add(edit_id)
+                    stream_state["edit_id"] = placeholder.id
+                    recent_reply_ids.add(placeholder.id)
 
             result = await stream_with_tools(
                 messages,
@@ -849,10 +648,9 @@ async def handler(event: events.NewMessage.Event):
                 verify_tools=True,
             )
 
-        if result:
-            full_answer = result
-        if edit_id is not None:
-            await edit_text(chat_id, edit_id, render())
+        full_answer = result or stream_state["full_answer"]
+        if stream_state["edit_id"] is not None:
+            await edit_text(chat_id, stream_state["edit_id"], render())
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
@@ -869,11 +667,18 @@ async def handler(event: events.NewMessage.Event):
 
 
 async def disconnect_quietly(timeout=10):
+    if client is None:
+        return
     with contextlib.suppress(Exception):
         await asyncio.wait_for(cast(Any, client.disconnect()), timeout=timeout)
 
 
 async def start_userbot():
+    if not API_ID or not API_HASH:
+        logger.error("ENABLE_USERBOT=1, но API_ID/API_HASH не заданы в .env")
+        return
+    cli = get_client()
+    cli.add_event_handler(handler, events.NewMessage(incoming=None))
     candidates = await proxies.get_proxy_candidates(limit=40)
     if not candidates:
         logger.warning("Нет прокси, пробую напрямую")
@@ -882,11 +687,11 @@ async def start_userbot():
     for idx, proxy in enumerate(candidates):
         if proxy:
             logger.info("Пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-            client.set_proxy(proxy)
+            cli.set_proxy(proxy)
         try:
-            start_coro = cast(Any, client.start())
+            start_coro = cast(Any, cli.start())
             await asyncio.wait_for(start_coro, timeout=25)
-            me = await client.get_me()
+            me = await cli.get_me()
             logger.info(
                 "Бот запущен как %s (@%s)",
                 getattr(me, "first_name", "?"),
@@ -917,4 +722,4 @@ async def start_userbot():
         logger.error("Не удалось подключиться ни через один прокси")
         return
 
-    await cast(Any, client.run_until_disconnected())
+    await cast(Any, cli.run_until_disconnected())

@@ -1,7 +1,6 @@
 import asyncio
 import contextlib
 import html
-import json
 import logging
 import re
 import time
@@ -10,14 +9,18 @@ from pathlib import Path
 from typing import Any, cast
 
 from telethon import TelegramClient, events
-from telethon.errors import AuthKeyError, FloodWaitError, RPCError
+from telethon.errors import AuthKeyError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl import functions, types
 
+import core
 import proxies
 import userbot
 
 logger = logging.getLogger("danybot.bot")
+
+BOT_COMMANDS = core.BOT_COMMANDS
+handle_bot_commands = core.handle_bot_commands
 
 STATE_FILE = Path(__file__).parent / "state_bot.json"
 HISTORY_FILE = Path(__file__).parent / "history_bot.json"
@@ -54,29 +57,6 @@ def _strip_mention(text):
     return text
 
 
-BOT_COMMANDS = {
-    "start": ("start", "help", "помощь", "хелп", "справка", "начать", "старт", "?"),
-    "clear": (
-        "clear",
-        "сброс",
-        "сбросить",
-        "забыть",
-        "забудь",
-        "стоп",
-        "очистить",
-        "очистка",
-    ),
-    "model": ("model", "модель"),
-    "models": ("models", "модели"),
-    "history": ("history", "история", "контекст", "ctx"),
-    "ping": ("ping", "пинг", "check", "чек"),
-    "auto": ("auto", "авто", "danyauto", "автоответ"),
-}
-
-_BOT_CMD_LOOKUP = {
-    alias: name for name, aliases in BOT_COMMANDS.items() for alias in aliases
-}
-
 BOT_HELP_TEXT = (
     "DanyBOT — команды / commands:\n"
     "/help /start — справка / help\n"
@@ -90,161 +70,80 @@ BOT_HELP_TEXT = (
 )
 
 
-def handle_bot_commands(text) -> tuple[str, Any] | None:
-    stripped = text.strip()
-    if not stripped.startswith("/"):
-        return None
-    body = stripped[1:]
-    if not body:
-        return None
-    parts = body.split(maxsplit=1)
-    head = parts[0]
-    arg = parts[1].strip() if len(parts) > 1 else ""
-    if "@" in head:
-        head = head.split("@", 1)[0]
-    cmd = _BOT_CMD_LOOKUP.get(head.lower())
-    if cmd is None:
-        return None
-    if cmd == "auto":
-        low = arg.lower()
-        if low in userbot.AUTO_ON_WORDS:
-            return ("autorespond", True)
-        if low in userbot.AUTO_OFF_WORDS:
-            return ("autorespond", False)
-        return ("auto_status", None)
-    if cmd == "model":
-        return ("model", arg or None)
-    if cmd == "models":
-        return ("models", None)
-    if cmd == "start":
-        return ("help", None)
-    return (cmd, None)
+bot_client = None
 
 
-bot_client = TelegramClient(
-    StringSession(),
-    userbot.API_ID,
-    userbot.API_HASH,
-    connection_retries=2,
-    request_retries=1,
-    retry_delay=0,
-    timeout=10,
-)
+def get_bot_client():
+    global bot_client
+    if bot_client is None:
+        bot_client = TelegramClient(
+            StringSession(),
+            userbot.API_ID,
+            userbot.API_HASH,
+            connection_retries=2,
+            request_retries=1,
+            retry_delay=0,
+            timeout=10,
+        )
+    return bot_client
 
 
 def load_state():
     global model_overrides, auto_respond, ignored_chats, ignored_users
-    if not STATE_FILE.exists():
+    state = core.load_state_file(STATE_FILE)
+    if state is None:
         return
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        model_overrides = {
-            int(k): v for k, v in data.get("model_overrides", {}).items()
-        }
-        auto_respond = {int(x) for x in data.get("auto_respond", [])}
-        ignored_chats = {int(x) for x in data.get("ignored_chats", [])}
-        ignored_users = {int(x) for x in data.get("ignored_users", [])}
-    except (
-        json.JSONDecodeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-    ) as exc:
-        logger.warning("Не удалось загрузить state_bot.json: %s", exc)
+    model_overrides = state["model_overrides"]
+    auto_respond = state["auto_respond"]
+    ignored_chats = state["ignored_chats"]
+    ignored_users = state["ignored_users"]
 
 
 def save_state():
-    data = {
-        "model_overrides": {str(k): v for k, v in model_overrides.items()},
-        "auto_respond": sorted(auto_respond),
-        "ignored_chats": sorted(ignored_chats),
-        "ignored_users": sorted(ignored_users),
-    }
-    try:
-        STATE_FILE.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except (OSError, TypeError) as exc:
-        logger.warning("Не удалось сохранить state_bot.json: %s", exc)
+    ok = core.save_state_file(
+        STATE_FILE,
+        {
+            "model_overrides": model_overrides,
+            "auto_respond": auto_respond,
+            "ignored_chats": ignored_chats,
+            "ignored_users": ignored_users,
+        },
+    )
+    if not ok:
+        logger.warning("Не удалось сохранить state_bot.json")
 
 
 def load_history():
-    if not HISTORY_FILE.exists():
+    history = core.load_history_file(
+        HISTORY_FILE, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
+    )
+    if history is None:
         return
-    try:
-        data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
-        for key, value in data.items():
-            try:
-                chat_id = int(key)
-            except (ValueError, TypeError):
-                continue
-            limit = (
-                userbot.DM_HISTORY_LIMIT if chat_id > 0 else userbot.GROUP_HISTORY_LIMIT
-            )
-            chat_history[chat_id] = deque(value, maxlen=limit)
-    except (
-        json.JSONDecodeError,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-    ) as exc:
-        logger.warning("Не удалось загрузить history_bot.json: %s", exc)
+    global chat_history
+    chat_history = history
 
 
 def save_history():
-    data = {str(k): list(v) for k, v in chat_history.items()}
-    try:
-        HISTORY_FILE.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
-        )
-    except (OSError, TypeError) as exc:
-        logger.warning("Не удалось сохранить history_bot.json: %s", exc)
+    ok = core.save_history_file(HISTORY_FILE, chat_history)
+    if not ok:
+        logger.warning("Не удалось сохранить history_bot.json")
 
 
 def models_text(chat_id) -> str:
     current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-    parts = ["Доступные модели / Available models:"]
-    for m in userbot.MODELS:
-        marker = " (текущая) / current" if m == current else ""
-        parts.append(f"• {m}{marker}")
-    if current not in userbot.MODELS:
-        parts.append(f"• {current} (текущая) / current")
-    return "\n".join(parts)
+    return core.models_text(current, userbot.MODELS)
 
 
 async def safe_reply(event, text):
-    for _attempt in range(userbot.REPLY_ATTEMPTS):
-        try:
-            sent = await event.reply(text)
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 30))
-            continue
-        except (RPCError, OSError, ValueError, TypeError):
-            return None
-        if sent:
-            recent_reply_ids.add(sent.id)
-            if len(recent_reply_ids) > 5000:
-                recent_reply_ids.clear()
-        return sent
-    return None
+    return await core.safe_reply(event, text, userbot.REPLY_ATTEMPTS, recent_reply_ids)
 
 
 async def edit_text(chat_id, msg_id, text):
-    for _attempt in range(userbot.REPLY_ATTEMPTS):
-        try:
-            await bot_client.edit_message(chat_id, msg_id, text, parse_mode="html")
-            return True
-        except FloodWaitError as e:
-            await asyncio.sleep(min(e.seconds, 30))
-            continue
-        except (RPCError, OSError, ValueError, TypeError):
-            return False
-    return False
+    return await core.edit_text(
+        get_bot_client(), chat_id, msg_id, text, userbot.REPLY_ATTEMPTS
+    )
 
 
-@bot_client.on(events.NewMessage(incoming=None))
 async def handler(event: events.NewMessage.Event):
     message = event.message
     if not message or not message.message:
@@ -452,52 +351,30 @@ async def handler(event: events.NewMessage.Event):
 
     if is_self:
         prefix = f"{html.escape(text)}\n\n"
-        edit_id = msg_id
+        self_edit_id = msg_id
     else:
         prefix = ""
-        edit_id = None
+        self_edit_id = None
 
     try:
-        full_answer = ""
-        last_edit = 0.0
-        reasoning_parts: list[str] = []
-        tool_parts: list[str] = []
-
-        def render():
-            return userbot.render_response(
-                prefix, reasoning_parts, tool_parts, full_answer
+        stream_state, render, on_delta, on_reasoning, on_tool = (
+            core.make_stream_callbacks(
+                prefix,
+                userbot.render_response,
+                edit_text,
+                chat_id,
+                userbot.EDIT_INTERVAL,
             )
+        )
+        if self_edit_id is not None:
+            stream_state["edit_id"] = self_edit_id
 
-        async def on_delta(part):
-            nonlocal full_answer, last_edit
-            full_answer += part
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= userbot.EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async def on_reasoning(part):
-            nonlocal last_edit
-            reasoning_parts.append(part)
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= userbot.EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async def on_tool(name):
-            nonlocal last_edit
-            tool_parts.append(name)
-            now_m = time.monotonic()
-            if edit_id is not None and (now_m - last_edit) >= userbot.EDIT_INTERVAL:
-                await edit_text(chat_id, edit_id, render())
-                last_edit = now_m
-
-        async with cast(Any, bot_client.action(chat_id, "typing")):
+        async with cast(Any, get_bot_client().action(chat_id, "typing")):
             if not is_self:
                 placeholder = await event.reply("…")
                 if placeholder:
-                    edit_id = placeholder.id
-                    recent_reply_ids.add(edit_id)
+                    stream_state["edit_id"] = placeholder.id
+                    recent_reply_ids.add(placeholder.id)
 
             result = await userbot.stream_with_tools(
                 messages,
@@ -506,15 +383,14 @@ async def handler(event: events.NewMessage.Event):
                 on_delta,
                 on_reasoning,
                 on_tool,
-                client_override=bot_client,
+                client_override=get_bot_client(),
                 tools=userbot.TOOLS,
                 verify_tools=True,
             )
 
-        if result:
-            full_answer = result
-        if edit_id is not None:
-            await edit_text(chat_id, edit_id, render())
+        full_answer = result or stream_state["full_answer"]
+        if stream_state["edit_id"] is not None:
+            await edit_text(chat_id, stream_state["edit_id"], render())
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
@@ -535,9 +411,15 @@ async def start_bot():
     if not userbot.BOT_TOKEN:
         logger.error("ENABLE_BOT=1, но BOT_TOKEN не задан")
         return
+    if not userbot.API_ID or not userbot.API_HASH:
+        logger.error("ENABLE_BOT=1, но API_ID/API_HASH не заданы в .env")
+        return
 
     load_state()
     load_history()
+
+    cli = get_bot_client()
+    cli.add_event_handler(handler, events.NewMessage(incoming=None))
 
     candidates = await proxies.get_proxy_candidates(limit=40)
     if not candidates:
@@ -547,16 +429,16 @@ async def start_bot():
     for idx, proxy in enumerate(candidates):
         if proxy:
             logger.info("Бот: пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-            bot_client.set_proxy(proxy)
+            cli.set_proxy(proxy)
         try:
-            start_coro = cast(Any, bot_client.start(bot_token=userbot.BOT_TOKEN))
+            start_coro = cast(Any, cli.start(bot_token=userbot.BOT_TOKEN))
             await asyncio.wait_for(start_coro, timeout=25)
-            me = await bot_client.get_me()
+            me = await cli.get_me()
             bot_username = getattr(me, "username", "") or ""
             bot_id = getattr(me, "id", 0) or 0
             logger.info("Бот запущен как @%s", bot_username or "?")
             try:
-                await bot_client(
+                await cli(
                     functions.bots.SetBotCommandsRequest(
                         scope=types.BotCommandScopeDefault(),
                         lang_code="",
@@ -613,16 +495,18 @@ async def start_bot():
                 type(exc).__name__,
             )
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(cast(Any, bot_client.disconnect()), timeout=10)
+                await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
             if proxy:
                 proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
     else:
         logger.error("Бот: не удалось подключиться ни через один прокси")
         return
 
-    await cast(Any, bot_client.run_until_disconnected())
+    await cast(Any, cli.run_until_disconnected())
 
 
 async def disconnect_quietly(timeout=10):
+    if bot_client is None:
+        return
     with contextlib.suppress(Exception):
         await asyncio.wait_for(cast(Any, bot_client.disconnect()), timeout=timeout)

@@ -1,0 +1,352 @@
+import asyncio
+import json
+import os
+import re
+import time
+from collections import deque
+from typing import Any
+
+from dotenv import load_dotenv
+from telethon.errors import FloodWaitError, RPCError
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    return value.strip() if value else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = _env_str(name, "")
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _env_str(name, "")
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = _env_str(name, "")
+    if not raw:
+        return default
+    return raw.lower() not in ("0", "false", "no")
+
+
+TRIGGER_ALIASES = (
+    ".danybot",
+    ".danyapi",
+    ".dany",
+    ".db",
+    ".gpt",
+    ".ai",
+    ".bot",
+    ".бот",
+    ".д",
+    ".d",
+    ".б",
+    ".данибот",
+    ".даниапи",
+    ".дани",
+)
+AUTO_ALIASES = (".danyauto", ".da", ".auto", ".авто", ".даниавто")
+
+AUTO_ON_WORDS = ("on", "вкл", "включить", "1", "true", "yes", "да")
+AUTO_OFF_WORDS = ("off", "выкл", "выключить", "0", "false", "no", "нет")
+
+
+def _alias_pattern(aliases):
+    return r"(?:" + "|".join(re.escape(a) for a in aliases) + r")"
+
+
+def _build_trigger_re():
+    return re.compile(
+        r"(?<![a-zа-я0-9])" + _alias_pattern(TRIGGER_ALIASES) + r"(?![a-zа-я0-9])",
+        re.IGNORECASE,
+    )
+
+
+TRIGGER_RE = _build_trigger_re()
+
+SUB_ALIASES = {
+    "clear": (
+        "clear",
+        "сброс",
+        "сбросить",
+        "забыть",
+        "забудь",
+        "стоп",
+        "очистить",
+        "очистка",
+    ),
+    "model": ("model", "модель"),
+    "models": ("models", "модели"),
+    "history": ("history", "история", "контекст", "ctx"),
+    "help": ("help", "помощь", "хелп", "справка", "?"),
+    "ping": ("ping", "пинг", "check"),
+    "ignore": ("ignore", "игнор", "мут", "заглушить"),
+    "unignore": ("unignore", "анмут", "размут", "включить"),
+}
+
+_SUB_LOOKUP = {
+    alias: name for name, aliases in SUB_ALIASES.items() for alias in aliases
+}
+
+
+def _strip_alias_prefix(low):
+    all_aliases = sorted(
+        list(TRIGGER_ALIASES) + list(AUTO_ALIASES), key=len, reverse=True
+    )
+    for a in all_aliases:
+        if low.startswith(a):
+            tail = low[len(a) :]
+            if tail and not tail[0].isspace():
+                continue
+            return tail.strip(), a
+    return None, None
+
+
+def handle_commands(text) -> tuple[str, Any] | None:
+    low = text.strip()
+    lowlower = low.lower()
+    if not low.startswith("."):
+        return None
+
+    rest, alias = _strip_alias_prefix(lowlower)
+    if alias is None or not rest:
+        return None
+
+    m = re.match(r"^(\S+)(?:\s+(.*))?$", rest, re.DOTALL)
+    if not m:
+        return None
+    sub = m.group(1)
+    arg = (m.group(2) or "").strip()
+
+    if alias in AUTO_ALIASES:
+        if sub in AUTO_ON_WORDS:
+            return ("autorespond", True)
+        if sub in AUTO_OFF_WORDS:
+            return ("autorespond", False)
+
+    cmd = _SUB_LOOKUP.get(sub)
+    if cmd is None:
+        return None
+    if cmd == "model":
+        return ("model", arg or None)
+    return (cmd, None)
+
+
+BOT_COMMANDS = {
+    "start": ("start", "help", "помощь", "хелп", "справка", "начать", "старт", "?"),
+    "clear": (
+        "clear",
+        "сброс",
+        "сбросить",
+        "забыть",
+        "забудь",
+        "стоп",
+        "очистить",
+        "очистка",
+    ),
+    "model": ("model", "модель"),
+    "models": ("models", "модели"),
+    "history": ("history", "история", "контекст", "ctx"),
+    "ping": ("ping", "пинг", "check", "чек"),
+    "auto": ("auto", "авто", "danyauto", "автоответ"),
+}
+
+_BOT_CMD_LOOKUP = {
+    alias: name for name, aliases in BOT_COMMANDS.items() for alias in aliases
+}
+
+
+def handle_bot_commands(text) -> tuple[str, Any] | None:
+    stripped = text.strip()
+    if not stripped.startswith("/"):
+        return None
+    body = stripped[1:]
+    if not body:
+        return None
+    parts = body.split(maxsplit=1)
+    head = parts[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    if "@" in head:
+        head = head.split("@", 1)[0]
+    cmd = _BOT_CMD_LOOKUP.get(head.lower())
+    if cmd is None:
+        return None
+    if cmd == "auto":
+        low = arg.lower()
+        if low in AUTO_ON_WORDS:
+            return ("autorespond", True)
+        if low in AUTO_OFF_WORDS:
+            return ("autorespond", False)
+        return ("auto_status", None)
+    if cmd == "model":
+        return ("model", arg or None)
+    if cmd == "models":
+        return ("models", None)
+    if cmd == "start":
+        return ("help", None)
+    return (cmd, None)
+
+
+def strip_role_tag(text: str, bot_name: str = "DanyBOT") -> str:
+    low = text.strip().lower()
+    if low.startswith(f"{bot_name.lower()}:"):
+        return text.split(":", 1)[1].strip()
+    m = re.match(r"^\[(user|assistant|system)\]\s*", text, re.IGNORECASE)
+    if m:
+        return text[m.end() :]
+    return text
+
+
+def models_text(current: str, models) -> str:
+    parts = ["Доступные модели / Available models:"]
+    for m in models:
+        marker = " (текущая) / current" if m == current else ""
+        parts.append(f"• {m}{marker}")
+    if current not in models:
+        parts.append(f"• {current} (текущая) / current")
+    return "\n".join(parts)
+
+
+def parse_state_data(data):
+    return {
+        "model_overrides": {
+            int(k): v for k, v in data.get("model_overrides", {}).items()
+        },
+        "auto_respond": {int(x) for x in data.get("auto_respond", [])},
+        "ignored_chats": {int(x) for x in data.get("ignored_chats", [])},
+        "ignored_users": {int(x) for x in data.get("ignored_users", [])},
+    }
+
+
+def load_state_file(path):
+    if not path.exists():
+        return None
+    try:
+        return parse_state_data(json.loads(path.read_text(encoding="utf-8")))
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
+def save_state_file(path, state):
+    data = {
+        "model_overrides": {str(k): v for k, v in state["model_overrides"].items()},
+        "auto_respond": sorted(state["auto_respond"]),
+        "ignored_chats": sorted(state["ignored_chats"]),
+        "ignored_users": sorted(state["ignored_users"]),
+    }
+    try:
+        path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def load_history_file(path, dm_limit, group_limit):
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    history = {}
+    for key, value in data.items():
+        try:
+            chat_id = int(key)
+        except (ValueError, TypeError):
+            continue
+        limit = dm_limit if chat_id > 0 else group_limit
+        history[chat_id] = deque(value, maxlen=limit)
+    return history
+
+
+def save_history_file(path, history):
+    data = {str(k): list(v) for k, v in history.items()}
+    try:
+        path.write_text(
+            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+async def safe_reply(event, text, attempts, recent_ids):
+    for _attempt in range(attempts):
+        try:
+            sent = await event.reply(text)
+        except FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 30))
+            continue
+        except (RPCError, OSError, ValueError, TypeError):
+            return None
+        if sent:
+            recent_ids.add(sent.id)
+            if len(recent_ids) > 5000:
+                recent_ids.clear()
+        return sent
+    return None
+
+
+async def edit_text(client, chat_id, msg_id, text, attempts):
+    for _attempt in range(attempts):
+        try:
+            await client.edit_message(chat_id, msg_id, text, parse_mode="html")
+            return True
+        except FloodWaitError as e:
+            await asyncio.sleep(min(e.seconds, 30))
+            continue
+        except (RPCError, OSError, ValueError, TypeError):
+            return False
+    return False
+
+
+def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interval):
+    state = {
+        "full_answer": "",
+        "last_edit": 0.0,
+        "reasoning_parts": [],
+        "tool_parts": [],
+        "edit_id": None,
+    }
+
+    def render():
+        return render_fn(
+            prefix, state["reasoning_parts"], state["tool_parts"], state["full_answer"]
+        )
+
+    async def on_delta(part):
+        state["full_answer"] += part
+        now = time.monotonic()
+        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
+            await edit_text_fn(chat_id, state["edit_id"], render())
+            state["last_edit"] = now
+
+    async def on_reasoning(part):
+        state["reasoning_parts"].append(part)
+        now = time.monotonic()
+        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
+            await edit_text_fn(chat_id, state["edit_id"], render())
+            state["last_edit"] = now
+
+    async def on_tool(name):
+        state["tool_parts"].append(name)
+        now = time.monotonic()
+        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
+            await edit_text_fn(chat_id, state["edit_id"], render())
+            state["last_edit"] = now
+
+    return state, render, on_delta, on_reasoning, on_tool
+
+
+load_dotenv()

@@ -14,6 +14,8 @@ from telethon.errors import RPCError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 
+from core import _env_int
+
 logger = logging.getLogger("danybot.proxy")
 
 CACHE_FILE = Path(__file__).parent / "working_proxies.json"
@@ -21,8 +23,8 @@ RAW_CACHE_FILE = Path(__file__).parent / "proxy_cache.txt"
 
 PROTOCOLS = {"socks5", "socks4", "http"}
 
-VALIDATE_API_ID = 2040
-VALIDATE_API_HASH = "b18441a1ff607e10a989891a5462e627"
+VALIDATE_API_ID = _env_int("VALIDATE_API_ID", 0)
+VALIDATE_API_HASH = os.getenv("VALIDATE_API_HASH", "").strip()
 
 VALIDATION_ERRORS = (
     RPCError,
@@ -173,6 +175,11 @@ def telethon_to_item(proxy_dict):
 
 
 async def validate_one_mtproto(proxy_dict, timeout=12):
+    if not VALIDATE_API_ID or not VALIDATE_API_HASH:
+        logger.warning(
+            "Пропускаю проверку прокси: не заданы VALIDATE_API_ID/VALIDATE_API_HASH"
+        )
+        return False
     tmp = TelegramClient(
         MemorySession(),
         VALIDATE_API_ID,
