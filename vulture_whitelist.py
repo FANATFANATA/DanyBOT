@@ -1,5 +1,6 @@
 handler
 get_proxy
+get_history_for
 auth_key
 ENABLE_BOT
 ENABLE_USERBOT

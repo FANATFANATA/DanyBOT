@@ -42,6 +42,11 @@ SAFE_CONSTS = {
 }
 
 
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _eval_node(node):
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
@@ -145,20 +150,34 @@ async def _get_messages(client, chat, limit, error_msg, empty_msg, query=None):
 
 
 def render_response(prefix, reasoning_parts, tool_parts, full_answer):
+    reasoning = _clip("".join(reasoning_parts), 3000)
+    answer = _clip(full_answer, 3000)
     blocks = []
-    reasoning = "".join(reasoning_parts).strip()
     if reasoning:
-        blocks.append(f"💭 «<i>{html.escape(reasoning)}</i>» 💭")
-    if tool_parts:
-        seen = []
-        for tool in tool_parts:
-            if tool not in seen:
-                seen.append(tool)
+        blocks.append(("reasoning", f"💭 «<i>{html.escape(reasoning)}</i>» 💭"))
+    seen = []
+    for tool in tool_parts:
+        if tool not in seen:
+            seen.append(tool)
+    if seen:
         body = " ".join(f"<code>{html.escape(tool)}</code>" for tool in seen)
-        blocks.append(f"🔧 [ {body} ] 🔧")
-    if full_answer:
-        blocks.append(f"💬 «<b>{html.escape(full_answer)}</b>» 💬")
-    return prefix + "\n\n".join(blocks)
+        blocks.append(("tools", f"🔧 [ {body} ] 🔧"))
+    if answer:
+        blocks.append(("answer", f"💬 «<b>{html.escape(answer)}</b>» 💬"))
+    parts = [text for _kind, text in blocks]
+    text = prefix + "\n\n".join(parts)
+    if len(text) > 4000:
+        for drop in (1, 0):
+            if drop < len(parts):
+                kept = [p for i, p in enumerate(parts) if i != drop]
+                candidate = prefix + "\n\n".join(kept)
+                if len(candidate) <= 4000:
+                    parts = kept
+                    text = candidate
+                    break
+    if len(text) > 4000:
+        text = text[:3997] + "…"
+    return text
 
 
 TOOLS = [
@@ -867,14 +886,12 @@ async def _tool_create_poll(arguments, chat_id, client, stats):
 
 
 async def _tool_get_time(arguments, chat_id, client, stats):
-    now = datetime.datetime.now(datetime.timezone.utc)
+    utc = datetime.datetime.now(datetime.timezone.utc)
     return json.dumps(
         {
-            "utc": now.isoformat(),
-            "local": datetime.datetime.now(datetime.timezone.utc)
-            .astimezone()
-            .isoformat(),
-            "weekday": now.strftime("%A"),
+            "utc": utc.isoformat(),
+            "local": utc.astimezone().isoformat(),
+            "weekday": utc.strftime("%A"),
         },
         ensure_ascii=False,
     )

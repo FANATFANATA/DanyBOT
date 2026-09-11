@@ -121,11 +121,9 @@ def handle_commands(text) -> tuple[str, Any] | None:
     if alias is None or not rest:
         return None
 
-    m = re.match(r"^(\S+)(?:\s+(.*))?$", rest, re.DOTALL)
-    if not m:
-        return None
-    sub = m.group(1)
-    arg = (m.group(2) or "").strip()
+    parts = rest.split(maxsplit=1)
+    sub = parts[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
 
     if alias in AUTO_ALIASES:
         if sub in AUTO_ON_WORDS:
@@ -281,7 +279,75 @@ def save_history_file(path, history):
         return False
 
 
+_MODE_KEYS = (
+    "model_overrides",
+    "auto_respond",
+    "ignored_chats",
+    "ignored_users",
+    "chat_history",
+    "ctx_lock",
+    "recent_reply_ids",
+    "last_chat_activity",
+    "seen_msg_keys",
+)
+
+
+class ModeStore:
+    _ns: dict[str, Any]
+
+    def __init__(self, ns):
+        self._ns = ns
+
+    def __getattr__(self, name):
+        if name in _MODE_KEYS:
+            return self._ns[name]
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in _MODE_KEYS:
+            self._ns[name] = value
+        else:
+            object.__setattr__(self, name, value)
+
+
+def load_state_into(store, state_file):
+    state = load_state_file(state_file)
+    if state is None:
+        return
+    store.model_overrides = state["model_overrides"]
+    store.auto_respond = state["auto_respond"]
+    store.ignored_chats = state["ignored_chats"]
+    store.ignored_users = state["ignored_users"]
+
+
+def save_state_from(store, state_file, logger):
+    if not save_state_file(
+        state_file,
+        {
+            "model_overrides": store.model_overrides,
+            "auto_respond": store.auto_respond,
+            "ignored_chats": store.ignored_chats,
+            "ignored_users": store.ignored_users,
+        },
+    ):
+        logger.warning("Не удалось сохранить %s", state_file.name)
+
+
+def load_history_into(store, history_file, dm_limit, group_limit):
+    history = load_history_file(history_file, dm_limit, group_limit)
+    if history is None:
+        return
+    store.chat_history = history
+
+
+def save_history_from(store, history_file, logger):
+    if not save_history_file(history_file, store.chat_history):
+        logger.warning("Не удалось сохранить %s", history_file.name)
+
+
 async def safe_reply(event, text, attempts, recent_ids):
+    if not text or not text.strip():
+        text = "…"
     for _attempt in range(attempts):
         try:
             sent = await event.reply(text)
@@ -358,7 +424,7 @@ def handle_command_state(
     default_model,
     models_list,
     help_text,
-):
+) -> tuple[str, bool, bool] | None:
     cmd = command[0]
     if cmd == "clear":
         limit = dm_limit if is_private else group_limit
@@ -462,6 +528,98 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
         await _maybe_edit()
 
     return state, render, on_delta, on_reasoning, on_tool
+
+
+async def append_message_context(
+    store,
+    chat_id,
+    msg_id,
+    is_private,
+    text,
+    is_self,
+    triggered,
+    strip_trigger_fn,
+    strip_role_fn,
+    sender_label_fn,
+    dm_limit,
+    group_limit,
+    save_history_fn,
+):
+    if not is_private or text.strip() == "…":
+        return
+    key = (chat_id, msg_id)
+    if key in store.seen_msg_keys:
+        return
+    store.seen_msg_keys.add(key)
+    if len(store.seen_msg_keys) > 20000:
+        store.seen_msg_keys.clear()
+    stripped = strip_trigger_fn(text, triggered) or text.strip()
+    if is_self:
+        role = "user" if triggered else "assistant"
+        content = strip_role_fn(stripped)
+    else:
+        role = "user"
+        label = await sender_label_fn()
+        content = f"{label}: {stripped}" if label else stripped
+    limit = dm_limit if chat_id > 0 else group_limit
+    async with store.ctx_lock:
+        hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
+        hist.append({"role": role, "content": content})
+        save_history_fn()
+
+
+async def prepare_messages(store, chat_id, dm_limit, group_limit, system_fn):
+    limit = dm_limit if chat_id > 0 else group_limit
+    async with store.ctx_lock:
+        hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
+        sysp = system_fn(chat_id)
+        return hist, [{"role": "system", "content": sysp}, *list(hist)]
+
+
+async def stream_answer(
+    store,
+    event,
+    chat_id,
+    is_self,
+    messages,
+    model,
+    prefix,
+    self_edit_id,
+    render_fn,
+    edit_fn,
+    reply_fn,
+    action,
+    stream_fn,
+    tool_client,
+    tools,
+    edit_interval,
+):
+    state, render, on_delta, on_reasoning, on_tool = make_stream_callbacks(
+        prefix, render_fn, edit_fn, chat_id, edit_interval
+    )
+    if self_edit_id is not None:
+        state["edit_id"] = self_edit_id
+    async with action:
+        if not is_self:
+            placeholder = await reply_fn(event, "…")
+            if placeholder:
+                state["edit_id"] = placeholder.id
+                store.recent_reply_ids.add(placeholder.id)
+        result = await stream_fn(
+            messages,
+            model,
+            chat_id,
+            on_delta,
+            on_reasoning,
+            on_tool,
+            client_override=tool_client,
+            tools=tools,
+            verify_tools=True,
+        )
+    full_answer = result or state["full_answer"]
+    if state["edit_id"] is not None:
+        await edit_fn(chat_id, state["edit_id"], render())
+    return full_answer
 
 
 load_dotenv()

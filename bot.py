@@ -33,7 +33,10 @@ ignored_users: set[int] = set()
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
 recent_reply_ids: set[int] = set()
+seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
+
+STORE: core.ModeStore = core.ModeStore(globals())
 
 bot_username = ""
 bot_id = 0
@@ -89,44 +92,21 @@ def get_bot_client():
 
 
 def load_state():
-    global model_overrides, auto_respond, ignored_chats, ignored_users
-    state = core.load_state_file(STATE_FILE)
-    if state is None:
-        return
-    model_overrides = state["model_overrides"]
-    auto_respond = state["auto_respond"]
-    ignored_chats = state["ignored_chats"]
-    ignored_users = state["ignored_users"]
+    core.load_state_into(STORE, STATE_FILE)
 
 
 def save_state():
-    ok = core.save_state_file(
-        STATE_FILE,
-        {
-            "model_overrides": model_overrides,
-            "auto_respond": auto_respond,
-            "ignored_chats": ignored_chats,
-            "ignored_users": ignored_users,
-        },
-    )
-    if not ok:
-        logger.warning("Не удалось сохранить state_bot.json")
+    core.save_state_from(STORE, STATE_FILE, logger)
 
 
 def load_history():
-    history = core.load_history_file(
-        HISTORY_FILE, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
+    core.load_history_into(
+        STORE, HISTORY_FILE, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
     )
-    if history is None:
-        return
-    global chat_history
-    chat_history = history
 
 
 def save_history():
-    ok = core.save_history_file(HISTORY_FILE, chat_history)
-    if not ok:
-        logger.warning("Не удалось сохранить history_bot.json")
+    core.save_history_from(STORE, HISTORY_FILE, logger)
 
 
 async def safe_reply(event, text):
@@ -139,7 +119,7 @@ async def edit_text(chat_id, msg_id, text):
     )
 
 
-async def handler(event: events.NewMessage.Event):
+async def handler(event: Any):
     message = event.message
     if not message or not message.message:
         return
@@ -211,25 +191,23 @@ async def handler(event: events.NewMessage.Event):
             await safe_reply(event, text_out)
             return
 
-    if is_private and text.strip() != "…":
-        clean_text = (
-            userbot.TRIGGER_RE.sub("", text, count=1).strip()
-            if triggered
-            else text.strip()
-        )
-        if is_self:
-            role = "user" if triggered else "assistant"
-            content = userbot.strip_role_tag(clean_text or text.strip())
-        else:
-            role = "user"
-            label = await userbot.get_sender_label(event)
-            content = f"{label}: {clean_text or text.strip()}"
-        async with ctx_lock:
-            hist = chat_history.setdefault(
-                chat_id, deque(maxlen=userbot.DM_HISTORY_LIMIT)
-            )
-            hist.append({"role": role, "content": content})
-            save_history()
+    await core.append_message_context(
+        STORE,
+        chat_id,
+        msg_id,
+        is_private,
+        text,
+        is_self,
+        triggered,
+        lambda t, tr: (
+            userbot.TRIGGER_RE.sub("", t, count=1).strip() if tr else t.strip()
+        ),
+        userbot.strip_role_tag,
+        lambda: userbot.get_sender_label(event),
+        userbot.DM_HISTORY_LIMIT,
+        userbot.GROUP_HISTORY_LIMIT,
+        save_history,
+    )
 
     if triggered or mentioned or reply_to_bot or (is_private and not is_self):
         effective_trigger = True
@@ -271,14 +249,15 @@ async def handler(event: events.NewMessage.Event):
     if len(prompt) > userbot.MAX_REQUEST_LEN:
         prompt = prompt[: userbot.MAX_REQUEST_LEN]
 
+    model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     if is_private:
-        async with ctx_lock:
-            hist = chat_history.setdefault(
-                chat_id, deque(maxlen=userbot.DM_HISTORY_LIMIT)
-            )
-            sysp = userbot.system_for(chat_id, mode="bot")
-            model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-            messages = [{"role": "system", "content": sysp}, *list(hist)]
+        hist, messages = await core.prepare_messages(
+            STORE,
+            chat_id,
+            userbot.DM_HISTORY_LIMIT,
+            userbot.GROUP_HISTORY_LIMIT,
+            lambda cid: userbot.system_for(cid, mode="bot"),
+        )
     else:
         label = await userbot.get_sender_label(event)
         user_content = f"{label}: {prompt}" if label else prompt
@@ -289,13 +268,13 @@ async def handler(event: events.NewMessage.Event):
             userbot.GROUP_HISTORY_LIMIT,
             ctx_lock,
         )
-        async with ctx_lock:
-            hist = chat_history.setdefault(
-                chat_id, deque(maxlen=userbot.GROUP_HISTORY_LIMIT)
-            )
-            sysp = userbot.system_for(chat_id, mode="bot")
-            model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
-            messages = [{"role": "system", "content": sysp}, *list(hist)]
+        hist, messages = await core.prepare_messages(
+            STORE,
+            chat_id,
+            userbot.DM_HISTORY_LIMIT,
+            userbot.GROUP_HISTORY_LIMIT,
+            lambda cid: userbot.system_for(cid, mode="bot"),
+        )
 
     if is_self:
         prefix = f"{html.escape(text)}\n\n"
@@ -305,40 +284,24 @@ async def handler(event: events.NewMessage.Event):
         self_edit_id = None
 
     try:
-        stream_state, render, on_delta, on_reasoning, on_tool = (
-            core.make_stream_callbacks(
-                prefix,
-                userbot.render_response,
-                edit_text,
-                chat_id,
-                userbot.EDIT_INTERVAL,
-            )
+        full_answer = await core.stream_answer(
+            STORE,
+            event,
+            chat_id,
+            is_self,
+            messages,
+            model,
+            prefix,
+            self_edit_id,
+            userbot.render_response,
+            edit_text,
+            safe_reply,
+            cast(Any, get_bot_client().action(chat_id, "typing")),
+            userbot.stream_with_tools,
+            get_bot_client(),
+            userbot.TOOLS,
+            userbot.EDIT_INTERVAL,
         )
-        if self_edit_id is not None:
-            stream_state["edit_id"] = self_edit_id
-
-        async with cast(Any, get_bot_client().action(chat_id, "typing")):
-            if not is_self:
-                placeholder = await event.reply("…")
-                if placeholder:
-                    stream_state["edit_id"] = placeholder.id
-                    recent_reply_ids.add(placeholder.id)
-
-            result = await userbot.stream_with_tools(
-                messages,
-                model,
-                chat_id,
-                on_delta,
-                on_reasoning,
-                on_tool,
-                client_override=get_bot_client(),
-                tools=userbot.TOOLS,
-                verify_tools=True,
-            )
-
-        full_answer = result or stream_state["full_answer"]
-        if stream_state["edit_id"] is not None:
-            await edit_text(chat_id, stream_state["edit_id"], render())
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
