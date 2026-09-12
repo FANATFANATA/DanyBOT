@@ -87,6 +87,21 @@ ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
 ENABLE_BOT = _env_bool("ENABLE_BOT", False)
 BOT_TOKEN = _env_str("BOT_TOKEN", "")
 
+
+def _env_pos_int(name):
+    raw = _env_str(name, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+SUBAGENT_ENABLED = _env_bool("SUBAGENT_ENABLED", True)
+SUBAGENT_MODEL = _env_str("SUBAGENT_MODEL", "")
+SUBAGENT_MAX_ROUNDS = _env_pos_int("SUBAGENT_MAX_ROUNDS")
+SUBAGENT_CONCURRENCY = _env_pos_int("SUBAGENT_CONCURRENCY")
+
 REPLY_ATTEMPTS = 3
 
 

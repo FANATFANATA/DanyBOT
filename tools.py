@@ -518,6 +518,51 @@ TOOLS = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_subagent",
+            "description": (
+                "Запустить одного или нескольких универсальных субагентов. "
+                "Субагенты работают автономно и параллельно, каждый со своим "
+                "набором инструментов. Вернуть результаты всех задач."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "Одна задача для субагента",
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Список задач для параллельного запуска",
+                    },
+                    "system": {
+                        "type": "string",
+                        "description": "Системная инструкция субагента",
+                    },
+                    "model": {"type": "string"},
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Разрешённые инструменты (по умолчанию все)",
+                    },
+                    "concurrency": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 16,
+                    },
+                    "max_rounds": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
+                },
+            },
+        },
+    },
 ]
 
 
@@ -915,6 +960,30 @@ async def _tool_get_bot_stats(arguments, chat_id, client, stats):
     return json.dumps(data, ensure_ascii=False)
 
 
+async def _tool_run_subagent(arguments, chat_id, client, stats):
+    import subagents
+
+    if not subagents.is_configured():
+        return "Субагенты недоступны."
+    tasks = arguments.get("tasks")
+    if not tasks:
+        single = _str_arg(arguments, "task")
+        tasks = [single] if single else []
+    if not tasks:
+        return "Нужна задача: task или tasks."
+    results = await subagents.run_subagents(
+        tasks,
+        concurrency=arguments.get("concurrency"),
+        system=_str_arg(arguments, "system") or None,
+        model=_str_arg(arguments, "model") or None,
+        tool_names=arguments.get("tools"),
+        chat_id=chat_id,
+        client=client,
+        max_rounds=arguments.get("max_rounds"),
+    )
+    return json.dumps(results, ensure_ascii=False)[:8000]
+
+
 _HANDLERS = {
     "get_chat_history": _tool_get_chat_history,
     "list_chats": _tool_list_chats,
@@ -942,6 +1011,7 @@ _HANDLERS = {
     "get_time": _tool_get_time,
     "text_stats": _tool_text_stats,
     "get_bot_stats": _tool_get_bot_stats,
+    "run_subagent": _tool_run_subagent,
 }
 
 

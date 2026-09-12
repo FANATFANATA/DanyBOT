@@ -7,3 +7,11 @@ ENABLE_USERBOT
 refresh_models
 start_bot
 start_userbot
+SUBAGENT_CONCURRENCY
+SUBAGENT_ENABLED
+SUBAGENT_MAX_ROUNDS
+SUBAGENT_MODEL
+is_configured
+run_subagent
+run_subagents
+configure

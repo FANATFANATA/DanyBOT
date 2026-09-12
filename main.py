@@ -4,6 +4,7 @@ import logging
 import signal
 
 import bot
+import subagents
 import userbot
 
 logging.basicConfig(
@@ -17,6 +18,17 @@ async def run():
     userbot.load_state()
     userbot.load_history()
     await userbot.refresh_models()
+
+    subagents.configure(
+        ai=userbot.ai,
+        model=userbot.SUBAGENT_MODEL or userbot.DANYAPI_MODEL,
+        verifier=userbot.verify_tool_call,
+        stats=userbot._bot_stats,
+        max_rounds=userbot.SUBAGENT_MAX_ROUNDS,
+        max_tokens=userbot.MAX_TOKENS,
+        concurrency=userbot.SUBAGENT_CONCURRENCY,
+        enabled=userbot.SUBAGENT_ENABLED,
+    )
 
     tasks = []
     if userbot.ENABLE_USERBOT:

@@ -31,6 +31,7 @@ PY_FILES = (
     "proxies.py",
     "tools.py",
     "core.py",
+    "subagents.py",
     "tests.py",
 )
 WHITELIST_FILE = "vulture_whitelist.py"
@@ -1094,6 +1095,7 @@ class SystemForModeTest(BotTestCase):
             "run_shell",
             "web_search",
             "fetch_url",
+            "run_subagent",
             "pin_message",
             "unpin_message",
             "get_pinned_messages",
