@@ -67,6 +67,25 @@ TOOL_VERIFY_PROMPT = os.getenv(
     "Ответь строго одним словом: ALLOW или DENY.",
 )
 TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
+RUN_SHELL_MODEL = _env_str("RUN_SHELL_MODEL", "")
+RUN_SHELL_VERIFY_PROMPT = os.getenv(
+    "RUN_SHELL_VERIFY_PROMPT",
+    "Ты — система безопасности Telegram-бота. Тебе показывают вызов инструмента "
+    "run_shell с shell-командой. Сначала рассуждай по шагам: что именно выполнит "
+    "команда, какие файлы/данные затронет, есть ли удаление, перезапись, эксфильтрация "
+    "секретов, обращение к сети, повышение прав, действия против владельца аккаунта. "
+    "Затем на последней строке ответь строго одним словом: ALLOW или DENY.",
+)
+SANITIZE_ENABLED = _env_bool("SANITIZE_ENABLED", True)
+SANITIZE_MODEL = _env_str("SANITIZE_MODEL", "")
+SANITIZE_PROMPT = os.getenv(
+    "SANITIZE_PROMPT",
+    "Ты — фильтр секретов. Тебе дают вывод shell-команды. Сначала рассуждай по шагам, "
+    "затем верни ТОЛЬКО очищенный текст: удали или замени на [REDACTED] приватные "
+    "данные — значения из .env и любых конфигов, токены, API-ключи, пароли, хеши, "
+    "cookie, приватные ключи, строки сессий, URL с credentials. Остальной текст "
+    "сохрани дословно. Не добавляй пояснений, верни только очищенный вывод.",
+)
 
 TRIGGER_ALIASES = core.TRIGGER_ALIASES
 AUTO_ALIASES = core.AUTO_ALIASES
@@ -217,20 +236,39 @@ async def execute_tool(name: str, arguments: dict, chat_id, client=None):
     return await tools_module.execute_tool(name, arguments, chat_id, client, _bot_stats)
 
 
+def _last_decision(text: str) -> str:
+    upper = text.upper()
+    allow = upper.rfind("ALLOW")
+    deny = upper.rfind("DENY")
+    if deny == -1 and allow == -1:
+        return ""
+    if deny > allow:
+        return "DENY"
+    return "ALLOW"
+
+
 async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
     payload = json.dumps({"tool": name, "arguments": arguments}, ensure_ascii=False)
+    if name == "run_shell":
+        prompt = RUN_SHELL_VERIFY_PROMPT
+        use_model = RUN_SHELL_MODEL or model
+        max_tokens = 1024
+    else:
+        prompt = TOOL_VERIFY_PROMPT
+        use_model = model
+        max_tokens = 8
     try:
         resp = await ai.chat.completions.create(
-            model=model,
+            model=use_model,
             messages=cast(
                 Any,
                 [
-                    {"role": "system", "content": TOOL_VERIFY_PROMPT},
+                    {"role": "system", "content": prompt},
                     {"role": "user", "content": payload},
                 ],
             ),
             temperature=0,
-            max_tokens=8,
+            max_tokens=max_tokens,
             stream=False,
         )
     except (OpenAIError, OSError, ValueError, TypeError):
@@ -239,7 +277,37 @@ async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
         content = resp.choices[0].message.content or ""
     except (AttributeError, IndexError, TypeError):
         content = ""
-    return "ALLOW" in content.upper()
+    return _last_decision(content) == "ALLOW"
+
+
+async def sanitize_tool_output(output: str, model: str) -> str:
+    if not SANITIZE_ENABLED or not output:
+        return output
+    use_model = SANITIZE_MODEL or model
+    try:
+        resp = await ai.chat.completions.create(
+            model=use_model,
+            messages=cast(
+                Any,
+                [
+                    {"role": "system", "content": SANITIZE_PROMPT},
+                    {"role": "user", "content": output},
+                ],
+            ),
+            temperature=0,
+            max_tokens=MAX_TOKENS,
+            stream=False,
+        )
+    except (OpenAIError, OSError, ValueError, TypeError):
+        return "[вывод скрыт: ошибка санитайзера]"
+    try:
+        content = resp.choices[0].message.content or ""
+    except (AttributeError, IndexError, TypeError):
+        content = ""
+    content = content.strip()
+    if not content:
+        return "[вывод скрыт: пустой ответ санитайзера]"
+    return content
 
 
 async def stream_with_tools(
@@ -344,6 +412,8 @@ async def stream_with_tools(
                 result = await execute_tool(
                     slot["name"], args, chat_id, client_override
                 )
+            if slot["name"] == "run_shell":
+                result = await sanitize_tool_output(result, model)
             if on_tool is not None:
                 await on_tool(slot["name"])
             working.append(

@@ -15,3 +15,9 @@ is_configured
 run_subagent
 run_subagents
 configure
+RUN_SHELL_MODEL
+RUN_SHELL_VERIFY_PROMPT
+SANITIZE_ENABLED
+SANITIZE_MODEL
+SANITIZE_PROMPT
+sanitize_tool_output
