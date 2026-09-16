@@ -719,20 +719,37 @@ async def _tool_run_shell(arguments, chat_id, client, stats):
     return result[:4000]
 
 
+_asyncio_gather = asyncio.gather
+
+_httpx_singleton = None
+
+
+def _get_httpx_client():
+    global _httpx_singleton
+    if _httpx_singleton is None or _httpx_singleton.is_closed:
+        _httpx_singleton = httpx.AsyncClient(
+            timeout=30,
+            follow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0"},
+            limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
+        )
+    return _httpx_singleton
+
+
 async def _tool_web_search(arguments, chat_id, client, stats):
     query = _str_arg(arguments, "query")
     if not query:
         return "Пустой запрос."
     limit = _int_arg(arguments, "limit", 5, 1, 10)
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as hc:
-            resp = await hc.get(
-                "https://duckduckgo.com/html/",
-                params={"q": query},
-                headers={"User-Agent": "Mozilla/5.0"},
-            )
-            resp.raise_for_status()
-            text = resp.text
+        hc = _get_httpx_client()
+        resp = await hc.get(
+            "https://duckduckgo.com/html/",
+            params={"q": query},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        text = resp.text
     except (httpx.HTTPError, OSError, ValueError) as exc:
         return f"Ошибка поиска: {exc}"
     results = []
@@ -762,10 +779,10 @@ async def _tool_fetch_url(arguments, chat_id, client, stats):
         return "URL должен начинаться с http:// или https://"
     max_chars = _int_arg(arguments, "max_chars", 5000, 100, 20000)
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as hc:
-            resp = await hc.get(url, headers={"User-Agent": "Mozilla/5.0"})
-            resp.raise_for_status()
-            raw = resp.text
+        hc = _get_httpx_client()
+        resp = await hc.get(url, timeout=25)
+        resp.raise_for_status()
+        raw = resp.text
     except (httpx.HTTPError, OSError, ValueError) as exc:
         return f"Ошибка загрузки: {exc}"
     cleaned = re.sub(
