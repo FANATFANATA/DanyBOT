@@ -305,7 +305,7 @@ async def handler(event: Any):
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
-            save_history()
+        save_history()
 
         if len(recent_reply_ids) > 5000:
             recent_reply_ids.clear()

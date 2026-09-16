@@ -565,7 +565,7 @@ async def append_message_context(
     async with store.ctx_lock:
         hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
         hist.append({"role": role, "content": content})
-        save_history_fn()
+    save_history_fn()
 
 
 async def prepare_messages(store, chat_id, dm_limit, group_limit, system_fn):
