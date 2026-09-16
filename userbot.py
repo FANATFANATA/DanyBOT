@@ -4,6 +4,7 @@ import html
 import json
 import logging
 import os
+import re
 import struct
 import sys
 import time
@@ -237,14 +238,14 @@ async def execute_tool(name: str, arguments: dict, chat_id, client=None):
 
 
 def _last_decision(text: str) -> str:
-    upper = text.upper()
-    allow = upper.rfind("ALLOW")
-    deny = upper.rfind("DENY")
-    if deny == -1 and allow == -1:
-        return ""
-    if deny > allow:
-        return "DENY"
-    return "ALLOW"
+    for line in reversed(text.splitlines()):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matches = re.findall(r"\b(ALLOW|DENY)\b", stripped.upper())
+        if matches:
+            return matches[-1]
+    return ""
 
 
 async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
@@ -274,10 +275,29 @@ async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
     except (OpenAIError, OSError, ValueError, TypeError):
         return False
     try:
-        content = resp.choices[0].message.content or ""
+        message = resp.choices[0].message
     except (AttributeError, IndexError, TypeError):
-        content = ""
-    return _last_decision(content) == "ALLOW"
+        return False
+
+    raw_content = getattr(message, "content", None)
+    raw_reasoning = getattr(message, "reasoning_content", None)
+    if isinstance(raw_content, list):
+        content = "".join(str(x) for x in raw_content).strip()
+    else:
+        content = (raw_content or "").strip()
+    reasoning = (raw_reasoning or "").strip()
+    if reasoning:
+        content = f"{reasoning}\n{content}".strip()
+    decision = _last_decision(content)
+    if decision != "ALLOW":
+        logger.info(
+            "Верификация %s: %s | ответ модели: %r",
+            name,
+            decision or "нет решения",
+            content[:300],
+        )
+        return False
+    return True
 
 
 async def sanitize_tool_output(output: str, model: str) -> str:
@@ -301,9 +321,18 @@ async def sanitize_tool_output(output: str, model: str) -> str:
     except (OpenAIError, OSError, ValueError, TypeError):
         return "[вывод скрыт: ошибка санитайзера]"
     try:
-        content = resp.choices[0].message.content or ""
+        message = resp.choices[0].message
     except (AttributeError, IndexError, TypeError):
-        content = ""
+        return "[вывод скрыт: пустой ответ санитайзера]"
+    raw_content = getattr(message, "content", None)
+    raw_reasoning = getattr(message, "reasoning_content", None)
+    if isinstance(raw_content, list):
+        content = "".join(str(x) for x in raw_content).strip()
+    else:
+        content = (raw_content or "").strip()
+    reasoning = (raw_reasoning or "").strip()
+    if reasoning:
+        content = f"{reasoning}\n{content}".strip()
     content = content.strip()
     if not content:
         return "[вывод скрыт: пустой ответ санитайзера]"

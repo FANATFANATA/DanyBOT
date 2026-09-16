@@ -1336,6 +1336,155 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(answer, "Достигнут лимит циклов инструментов.")
 
 
+class LastDecisionTest(BotTestCase):
+    def test_empty_text(self):
+        self.assertEqual(userbot._last_decision(""), "")
+        self.assertEqual(userbot._last_decision("   \n  "), "")
+
+    def test_no_keywords(self):
+        self.assertEqual(userbot._last_decision("просто текст"), "")
+        self.assertEqual(userbot._last_decision("думаю и рассуждаю"), "")
+
+    def test_case_insensitive(self):
+        self.assertEqual(userbot._last_decision("allow"), "ALLOW")
+        self.assertEqual(userbot._last_decision("deny"), "DENY")
+
+    def test_verdict_on_last_line(self):
+        self.assertEqual(userbot._last_decision("рассуждение\nALLOW"), "ALLOW")
+        self.assertEqual(userbot._last_decision("Шаг 1\nШаг 2\nDENY"), "DENY")
+
+    def test_last_line_wins_over_earlier(self):
+        self.assertEqual(userbot._last_decision("DENY\nALLOW"), "ALLOW")
+        self.assertEqual(userbot._last_decision("ALLOW\nDENY"), "DENY")
+
+    def test_verdict_inline_colon(self):
+        self.assertEqual(userbot._last_decision("Вердикт: ALLOW"), "ALLOW")
+        self.assertEqual(userbot._last_decision("Ответ: DENY"), "DENY")
+
+    def test_whitespace_lines_skipped(self):
+        self.assertEqual(userbot._last_decision("ALLOW\n\n  \n"), "ALLOW")
+
+    def test_word_within_word_not_matched(self):
+        self.assertEqual(userbot._last_decision("allowed"), "")
+        self.assertEqual(userbot._last_decision("denyable"), "")
+
+
+class NonStreamMessage:
+    def __init__(self, content=None, reasoning_content=None):
+        self.content = content
+        self.reasoning_content = reasoning_content
+
+
+class NonStreamResponse:
+    def __init__(self, message):
+        self.choices = [SimpleNamespace(message=message)]
+
+
+class NonStreamCompletions:
+    def __init__(self, response):
+        self._response = response
+        self.calls = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self._response, BaseException):
+            raise self._response
+        return self._response
+
+
+class NonStreamAI:
+    def __init__(self, response):
+        self.chat = SimpleNamespace(completions=NonStreamCompletions(response))
+
+
+class VerifyToolCallTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig_ai = userbot.ai
+        self.addCleanup(setattr, userbot, "ai", self._orig_ai)
+
+    def install_ai(self, response):
+        fake_ai = NonStreamAI(response)
+        userbot.ai = fake_ai
+        return fake_ai
+
+    def test_allows_on_content_allow(self):
+        fake_ai = self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW")))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "ls"}, "m"))
+        self.assertTrue(ok)
+        self.assertEqual(fake_ai.chat.completions.calls[0]["model"], "m")
+        self.assertFalse(fake_ai.chat.completions.calls[0]["stream"])
+
+    def test_rejects_deny(self):
+        self.install_ai(NonStreamResponse(NonStreamMessage(content="DENY")))
+        ok = asyncio.run(
+            userbot.verify_tool_call("run_shell", {"command": "rm -rf /"}, "m")
+        )
+        self.assertFalse(ok)
+
+    def test_allows_reasoning_content_only(self):
+        self.install_ai(
+            NonStreamResponse(
+                NonStreamMessage(
+                    content="", reasoning_content="команда безопасна\nALLOW"
+                )
+            )
+        )
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "ls"}, "m"))
+        self.assertTrue(ok)
+
+    def test_rejects_reasoning_content_deny(self):
+        self.install_ai(
+            NonStreamResponse(
+                NonStreamMessage(content="", reasoning_content="опасно\nDENY")
+            )
+        )
+        ok = asyncio.run(
+            userbot.verify_tool_call("run_shell", {"command": "rm -rf /"}, "m")
+        )
+        self.assertFalse(ok)
+
+    def test_rejects_last_line_deny_after_allow(self):
+        self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW\nDENY")))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertFalse(ok)
+
+    def test_rejects_empty_response(self):
+        self.install_ai(NonStreamResponse(NonStreamMessage(content=None)))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertFalse(ok)
+
+    def test_rejects_empty_reasoning_only(self):
+        self.install_ai(
+            NonStreamResponse(
+                NonStreamMessage(content="", reasoning_content="никакого решения")
+            )
+        )
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertFalse(ok)
+
+    def test_handles_list_content(self):
+        self.install_ai(NonStreamResponse(NonStreamMessage(content=["AL", "LOW"])))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertTrue(ok)
+
+    def test_api_error_returns_false(self):
+        self.install_ai(ValueError("boom"))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertFalse(ok)
+
+    def test_missing_choices_returns_false(self):
+        self.install_ai(SimpleNamespace(choices=[]))
+        ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
+        self.assertFalse(ok)
+
+    def test_small_max_tokens_for_other_tools(self):
+        fake_ai = self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW")))
+        ok = asyncio.run(userbot.verify_tool_call("fetch_url", {}, "m"))
+        self.assertTrue(ok)
+        self.assertEqual(fake_ai.chat.completions.calls[0]["max_tokens"], 8)
+
+
 class FloodRetryTest(BotTestCase):
     def make_event(self, script):
         attempts = {"n": 0}
