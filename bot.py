@@ -42,10 +42,18 @@ bot_username = ""
 bot_id = 0
 
 
+_MENTION_RX = None
+_MENTION_USER = ""
+
+
 def _mention_re():
+    global _MENTION_RX, _MENTION_USER
     if not bot_username:
         return None
-    return re.compile(r"@" + re.escape(bot_username) + r"\b", re.IGNORECASE)
+    if _MENTION_USER != bot_username:
+        _MENTION_USER = bot_username
+        _MENTION_RX = re.compile(r"@" + re.escape(bot_username) + r"\b", re.IGNORECASE)
+    return _MENTION_RX
 
 
 def _is_mentioned(text):
@@ -109,6 +117,9 @@ def save_history():
     core.save_history_from(STORE, HISTORY_FILE, logger)
 
 
+HISTORY_SAVER = core.AsyncSaver(save_history, delay=0.5, logger=logger)
+
+
 async def safe_reply(event, text):
     return await core.safe_reply(event, text, userbot.REPLY_ATTEMPTS, recent_reply_ids)
 
@@ -141,14 +152,17 @@ async def handler(event: Any):
     now = time.monotonic()
 
     reply_to_bot = False
+    replied_text = None
     if message.is_reply and not is_self:
         try:
             reply_msg = await message.get_reply_message()
-            if reply_msg is not None and (
-                getattr(reply_msg, "out", False)
-                or (bot_id and getattr(reply_msg, "sender_id", None) == bot_id)
-            ):
-                reply_to_bot = True
+            if reply_msg is not None:
+                if getattr(reply_msg, "out", False) or (
+                    bot_id and getattr(reply_msg, "sender_id", None) == bot_id
+                ):
+                    reply_to_bot = True
+                if reply_msg.message:
+                    replied_text = reply_msg.message.strip()
         except (RPCError, OSError, ValueError):
             reply_to_bot = False
 
@@ -206,7 +220,7 @@ async def handler(event: Any):
         lambda: userbot.get_sender_label(event),
         userbot.DM_HISTORY_LIMIT,
         userbot.GROUP_HISTORY_LIMIT,
-        save_history,
+        HISTORY_SAVER.mark_dirty,
     )
 
     if triggered or mentioned or reply_to_bot or (is_private and not is_self):
@@ -232,8 +246,6 @@ async def handler(event: Any):
     logger.info("Бот: запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
     prompt = _strip_mention(userbot.TRIGGER_RE.sub("", text, count=1).strip())
-
-    replied_text = await core.fetch_replied_text(message)
 
     if replied_text:
         if prompt:
@@ -305,7 +317,7 @@ async def handler(event: Any):
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
-        save_history()
+        HISTORY_SAVER.mark_dirty()
 
         if len(recent_reply_ids) > 5000:
             recent_reply_ids.clear()

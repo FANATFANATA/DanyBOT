@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import json
 import os
 import re
 import time
 from collections import deque
+from collections.abc import Callable
 from typing import Any
 
 from dotenv import load_dotenv
@@ -97,12 +99,13 @@ _SUB_LOOKUP = {
     alias: name for name, aliases in SUB_ALIASES.items() for alias in aliases
 }
 
+_ALL_ALIASES = tuple(
+    sorted(dict.fromkeys((*TRIGGER_ALIASES, *AUTO_ALIASES)), key=len, reverse=True)
+)
+
 
 def _strip_alias_prefix(low):
-    all_aliases = sorted(
-        list(TRIGGER_ALIASES) + list(AUTO_ALIASES), key=len, reverse=True
-    )
-    for a in all_aliases:
+    for a in _ALL_ALIASES:
         if low.startswith(a):
             tail = low[len(a) :]
             if tail and not tail[0].isspace():
@@ -243,7 +246,8 @@ def save_state_file(path, state):
     }
     try:
         path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
         )
         return True
     except (OSError, TypeError):
@@ -272,7 +276,8 @@ def save_history_file(path, history):
     data = {str(k): list(v) for k, v in history.items()}
     try:
         path.write_text(
-            json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
         )
         return True
     except (OSError, TypeError):
@@ -290,6 +295,48 @@ _MODE_KEYS = (
     "last_chat_activity",
     "seen_msg_keys",
 )
+
+
+class AsyncSaver:
+    _task: Any | None
+    _dirty: bool
+
+    def __init__(self, writer: Callable[[], None], delay=0.5, logger=None):
+        self._writer = writer
+        self._delay = delay
+        self._logger = logger
+        self._task = None
+        self._dirty = False
+
+    def mark_dirty(self):
+        self._dirty = True
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        while True:
+            try:
+                await asyncio.sleep(self._delay)
+            except asyncio.CancelledError:
+                return
+            self._dirty = False
+            try:
+                await asyncio.to_thread(self._writer)
+            except (OSError, ValueError, TypeError) as exc:
+                if self._logger:
+                    self._logger.warning("AsyncSaver write failed: %r", exc)
+            if not self._dirty:
+                return
+
+    async def flush(self):
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        if self._dirty:
+            self._dirty = False
+            await asyncio.to_thread(self._writer)
 
 
 class ModeStore:
@@ -497,7 +544,7 @@ def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
 
 def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interval):
     state = {
-        "full_answer": "",
+        "answer_parts": [],
         "last_edit": 0.0,
         "reasoning_parts": [],
         "tool_parts": [],
@@ -506,7 +553,10 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
 
     def render():
         return render_fn(
-            prefix, state["reasoning_parts"], state["tool_parts"], state["full_answer"]
+            prefix,
+            state["reasoning_parts"],
+            state["tool_parts"],
+            "".join(state["answer_parts"]),
         )
 
     async def _maybe_edit():
@@ -516,7 +566,7 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
             await edit_text_fn(chat_id, state["edit_id"], render())
 
     async def on_delta(part):
-        state["full_answer"] += part
+        state["answer_parts"].append(part)
         await _maybe_edit()
 
     async def on_reasoning(part):
@@ -616,7 +666,7 @@ async def stream_answer(
             tools=tools,
             verify_tools=True,
         )
-    full_answer = result or state["full_answer"]
+    full_answer = result or "".join(state["answer_parts"])
     if state["edit_id"] is not None:
         await edit_fn(chat_id, state["edit_id"], render())
     return full_answer

@@ -59,14 +59,20 @@ def is_configured() -> bool:
     return bool(_RUNTIME["enabled"] and _RUNTIME["ai"])
 
 
-def _select_tools(tool_names):
-    import tools as tools_module
+_TOOLS_AVAILABLE = None
 
-    available = [
-        item
-        for item in tools_module.TOOLS
-        if item["function"]["name"] != "run_subagent"
-    ]
+
+def _select_tools(tool_names):
+    global _TOOLS_AVAILABLE
+    if _TOOLS_AVAILABLE is None:
+        import tools as tools_module
+
+        _TOOLS_AVAILABLE = [
+            item
+            for item in tools_module.TOOLS
+            if item["function"]["name"] != "run_subagent"
+        ]
+    available = list(_TOOLS_AVAILABLE)
     if not tool_names:
         return available
     wanted = {str(name).strip() for name in tool_names if str(name).strip()}

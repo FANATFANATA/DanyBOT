@@ -18,3 +18,5 @@ toolrun.log
 .ruff_cache/
 .pytest_cache/
 subagent_cache.json
+collected.xml
+collecter.py

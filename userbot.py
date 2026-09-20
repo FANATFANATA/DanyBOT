@@ -204,6 +204,9 @@ def save_history():
     core.save_history_from(STORE, HISTORY_FILE, logger)
 
 
+HISTORY_SAVER = core.AsyncSaver(save_history, delay=0.5, logger=logger)
+
+
 def model_for(chat_id):
     return model_overrides.get(chat_id, DANYAPI_MODEL)
 
@@ -416,7 +419,9 @@ async def stream_with_tools(
                 ],
             }
         )
-        for _idx, slot in sorted(tool_calls.items()):
+        slots = [slot for _idx, slot in sorted(tool_calls.items())]
+
+        async def run_slot(slot):
             try:
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError):
@@ -425,16 +430,7 @@ async def stream_with_tools(
             if verify_tools and not await verify_tool_call(
                 slot["name"], args, verify_model
             ):
-                if on_tool is not None:
-                    await on_tool(slot["name"])
-                working.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": slot["id"],
-                        "content": "Вызов отклонён проверкой безопасности.",
-                    }
-                )
-                continue
+                return slot, None
             if client_override is None:
                 result = await execute_tool(slot["name"], args, chat_id)
             else:
@@ -443,8 +439,21 @@ async def stream_with_tools(
                 )
             if slot["name"] == "run_shell":
                 result = await sanitize_tool_output(result, model)
+            return slot, result
+
+        results = await asyncio.gather(*(run_slot(s) for s in slots))
+        for slot, result in results:
             if on_tool is not None:
                 await on_tool(slot["name"])
+            if result is None:
+                working.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": slot["id"],
+                        "content": "Вызов отклонён проверкой безопасности.",
+                    }
+                )
+                continue
             working.append(
                 {
                     "role": "tool",
@@ -591,7 +600,7 @@ async def handler(event: Any):
         lambda: get_sender_label(event),
         DM_HISTORY_LIMIT,
         GROUP_HISTORY_LIMIT,
-        save_history,
+        HISTORY_SAVER.mark_dirty,
     )
 
     if triggered:
@@ -686,7 +695,7 @@ async def handler(event: Any):
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
-        save_history()
+        HISTORY_SAVER.mark_dirty()
 
         if len(recent_reply_ids) > 5000:
             recent_reply_ids.clear()
@@ -699,6 +708,8 @@ async def handler(event: Any):
 
 
 async def disconnect_quietly(timeout=10):
+    with contextlib.suppress(Exception):
+        await HISTORY_SAVER.flush()
     if client is None:
         return
     with contextlib.suppress(Exception):

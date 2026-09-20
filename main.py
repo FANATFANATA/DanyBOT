@@ -14,6 +14,13 @@ logging.basicConfig(
 logger = logging.getLogger("danybot.main")
 
 
+async def _flush_savers():
+    with contextlib.suppress(Exception):
+        await userbot.HISTORY_SAVER.flush()
+    with contextlib.suppress(Exception):
+        await bot.HISTORY_SAVER.flush()
+
+
 async def run():
     userbot.load_state()
     userbot.load_history()
@@ -37,6 +44,7 @@ async def run():
         tasks.append(asyncio.create_task(bot.start_bot()))
     if not tasks:
         logger.error("Не включён ни один режим: ENABLE_USERBOT/ENABLE_BOT")
+        await _flush_savers()
         return
 
     stop = asyncio.Event()
@@ -69,6 +77,7 @@ async def run():
             await userbot.disconnect_quietly()
         with contextlib.suppress(Exception):
             await bot.disconnect_quietly()
+        await _flush_savers()
         for task in all_tasks:
             if not task.done():
                 task.cancel()

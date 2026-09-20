@@ -228,19 +228,37 @@ async def validate_many(items, limit=10, concurrency=20):
                 logger.debug("Валидация упала на %s:%s: %s", item[1], item[2], exc)
             return None
 
-    tasks = [asyncio.create_task(run(p)) for p in items]
+    tasks = set()
+    pending = iter(items)
     try:
-        for coro in asyncio.as_completed(tasks):
-            res = await cast(Any, coro)
-            if res:
-                working.append(res)
-                logger.info("Рабочий прокси: %s %s:%s", *res)
-                if len(working) >= limit:
+        while len(tasks) < concurrency:
+            try:
+                tasks.add(asyncio.create_task(run(next(pending))))
+            except StopIteration:
+                break
+        while tasks:
+            done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for finished in done:
+                res = cast(Any, finished.result())
+                if res:
+                    working.append(res)
+                    logger.info("Рабочий прокси: %s %s:%s", *res)
+                    if len(working) >= limit:
+                        for t in tasks:
+                            t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        tasks.clear()
+                        return working
+            for _ in done:
+                try:
+                    tasks.add(asyncio.create_task(run(next(pending))))
+                except StopIteration:
                     break
     finally:
         for t in tasks:
             t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
     return working
 
 
