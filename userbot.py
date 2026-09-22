@@ -541,6 +541,10 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
+    # В личке с ботами юзербот не реагирует вообще (ни на .алиасы, ни на
+    # авто-ответ), чтобы не отвечать другим ботам.
+    if is_private and getattr(await event.get_sender(), "bot", False):
+        return
     triggered = bool(TRIGGER_RE.search(text))
     now = time.monotonic()
 
