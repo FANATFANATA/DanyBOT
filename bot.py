@@ -147,7 +147,9 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    triggered = bool(userbot.TRIGGER_RE.search(text))
+    # Бот не реагирует на "."-алиасы юзербота — только /команды, упоминание,
+    # реплай и личка.
+    triggered = False
     mentioned = _is_mentioned(text)
     now = time.monotonic()
 
@@ -170,11 +172,6 @@ async def handler(event: Any):
         command = handle_bot_commands(text)
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         command = None
-    if command is None:
-        try:
-            command = userbot.handle_commands(text)
-        except (KeyError, IndexError, TypeError, AttributeError, ValueError):
-            command = None
 
     if command and command[0] in ("ignore", "unignore"):
         return
@@ -213,9 +210,7 @@ async def handler(event: Any):
         text,
         is_self,
         triggered,
-        lambda t, tr: (
-            userbot.TRIGGER_RE.sub("", t, count=1).strip() if tr else t.strip()
-        ),
+        lambda t, tr: t.strip(),
         userbot.strip_role_tag,
         lambda: userbot.get_sender_label(event),
         userbot.DM_HISTORY_LIMIT,
@@ -245,7 +240,7 @@ async def handler(event: Any):
 
     logger.info("Бот: запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
-    prompt = _strip_mention(userbot.TRIGGER_RE.sub("", text, count=1).strip())
+    prompt = _strip_mention(text.strip())
 
     if replied_text:
         if prompt:
