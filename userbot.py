@@ -471,8 +471,10 @@ async def stream_with_tools(
                 args = {}
             owner = unrestricted or is_unrestricted(chat_id)
             verify_model = TOOL_VERIFY_MODEL or model
-            if verify_tools and not owner and not await verify_tool_call(
-                slot["name"], args, verify_model
+            if (
+                verify_tools
+                and not owner
+                and not await verify_tool_call(slot["name"], args, verify_model)
             ):
                 return slot, None
             if client_override is None:
