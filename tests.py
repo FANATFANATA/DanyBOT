@@ -2441,7 +2441,7 @@ def build_linters():
         elif name == "mypy":
             cmd += ["--ignore-missing-imports", "--no-strict-optional", *PY_FILES]
         elif name == "pyright":
-            cmd += [*PY_FILES]
+            cmd += ["--pythonpath", sys.executable, *PY_FILES]
         elif name == "pylint":
             cmd += [
                 "--disable=all",
