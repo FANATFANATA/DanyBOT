@@ -1832,7 +1832,8 @@ class CoreHelpersTest(BotTestCase):
     def test_check_cooldown(self):
         activity = {}
         self.assertFalse(core.check_cooldown(1, 100.0, 10.0, activity))
-        self.assertTrue(core.check_cooldown(1, 105.0, 10.0, activity))
+        last = activity[1]
+        self.assertTrue(core.check_cooldown(1, last + 5.0, 10.0, activity))
 
     def test_check_cooldown_disabled(self):
         self.assertFalse(core.check_cooldown(1, 100.0, 0.0, {}))
