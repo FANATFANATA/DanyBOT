@@ -137,7 +137,7 @@ async def run_subagent(
     selected_tools = _select_tools(tool_names)
     use_model = model or _RUNTIME["model"]
     rounds_limit = max_rounds if max_rounds is not None else _RUNTIME["max_rounds"]
-    verifier = _RUNTIME["verifier"]
+    verifier = cast(Any, _RUNTIME["verifier"])
     logger.debug("Субагент %s: %s", subagent_name, str(task)[:120])
 
     messages = [
@@ -177,11 +177,13 @@ async def run_subagent(
             name = getattr(function, "name", "") or ""
             arguments = _loads(getattr(function, "arguments", ""))
             call_id = getattr(tc, "id", "") or ""
-            if verifier is not None and verify:
-                try:
-                    allowed = await verifier(name, arguments, use_model)
-                except (OSError, ValueError, TypeError):
-                    allowed = False
+            if verifier is not None:
+                allowed = True
+                if verify:
+                    try:
+                        allowed = await verifier(name, arguments, use_model)
+                    except (OSError, ValueError, TypeError):
+                        allowed = False
                 if not allowed:
                     messages.append(
                         {
