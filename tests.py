@@ -1797,6 +1797,8 @@ class CoreHelpersTest(BotTestCase):
         recent = set()
         sent = asyncio.run(core.safe_reply(event, "   ", 3, recent))
         self.assertEqual(event.replies, ["…"])
+        if sent is None:
+            self.fail("safe_reply returned None")
         self.assertEqual(sent.id, 77)
         self.assertIn(77, recent)
 
@@ -1970,7 +1972,8 @@ class CoreHelpersTest(BotTestCase):
             [],
             "h",
         )
-        assert resp is not None
+        if resp is None:
+            self.fail("resp is None")
         self.assertIn("Messages in context: 1", resp[0])
 
     def test_handle_command_state_ping(self):
@@ -1990,7 +1993,8 @@ class CoreHelpersTest(BotTestCase):
             [],
             "h",
         )
-        assert resp is not None
+        if resp is None:
+            self.fail("resp is None")
         self.assertIn("Model: m", resp[0])
 
     def test_handle_command_state_models_and_help(self):
@@ -2010,7 +2014,8 @@ class CoreHelpersTest(BotTestCase):
             ["m"],
             "h",
         )
-        assert resp is not None
+        if resp is None:
+            self.fail("resp is None")
         self.assertIn("m", resp[0])
         resp = core.handle_command_state(
             ("help", None),
@@ -2049,7 +2054,8 @@ class CoreHelpersTest(BotTestCase):
             "h",
         )
         self.assertIn(1, ignored)
-        assert resp is not None
+        if resp is None:
+            self.fail("resp is None")
         self.assertTrue(resp[1])
 
     def test_handle_command_state_unknown(self):
