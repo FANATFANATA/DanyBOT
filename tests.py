@@ -1412,7 +1412,9 @@ class VerifyToolCallTest(BotTestCase):
         fake_ai = self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW")))
         ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "ls"}, "m"))
         self.assertTrue(ok)
-        self.assertEqual(fake_ai.chat.completions.calls[0]["model"], "m")
+        self.assertEqual(
+            fake_ai.chat.completions.calls[0]["model"], userbot.RUN_SHELL_MODEL or "m"
+        )
         self.assertFalse(fake_ai.chat.completions.calls[0]["stream"])
 
     def test_rejects_deny(self):

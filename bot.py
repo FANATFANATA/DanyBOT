@@ -147,8 +147,7 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    # Бот не реагирует на "."-алиасы юзербота — только /команды, упоминание,
-    # реплай и личка.
+    userbot.register_sender(sender_id, chat_id)
     triggered = False
     mentioned = _is_mentioned(text)
     now = time.monotonic()
@@ -308,6 +307,7 @@ async def handler(event: Any):
             get_bot_client(),
             userbot.TOOLS,
             userbot.EDIT_INTERVAL,
+            sender_id,
         )
 
         async with ctx_lock:

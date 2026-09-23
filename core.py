@@ -643,7 +643,11 @@ async def stream_answer(
     tool_client,
     tools,
     edit_interval,
+    owner_id=None,
 ):
+    import userbot as userbot_module
+
+    unrestricted = owner_id is not None and owner_id in userbot_module.OWNER_IDS
     state, render, on_delta, on_reasoning, on_tool = make_stream_callbacks(
         prefix, render_fn, edit_fn, chat_id, edit_interval
     )
@@ -664,7 +668,9 @@ async def stream_answer(
             on_tool,
             client_override=tool_client,
             tools=tools,
-            verify_tools=True,
+            verify_tools=not unrestricted,
+            sanitize_tools=not unrestricted,
+            unrestricted=unrestricted,
         )
     full_answer = result or "".join(state["answer_parts"])
     if state["edit_id"] is not None:

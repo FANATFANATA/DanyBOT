@@ -122,6 +122,41 @@ SUBAGENT_MODEL = _env_str("SUBAGENT_MODEL", "")
 SUBAGENT_MAX_ROUNDS = _env_pos_int("SUBAGENT_MAX_ROUNDS")
 SUBAGENT_CONCURRENCY = _env_pos_int("SUBAGENT_CONCURRENCY")
 
+
+def _env_id_set(name):
+    raw = _env_str(name, "")
+    ids = set()
+    for part in raw.replace(";", ",").split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        try:
+            ids.add(int(chunk))
+        except ValueError:
+            continue
+    return ids
+
+
+OWNER_IDS = _env_id_set("OWNER_IDS")
+
+_restricted_chats: dict[int, tuple[bool, int | None]] = {}
+
+
+def register_sender(sender_id, chat_id):
+    if sender_id is None:
+        return False
+    unrestricted = sender_id in OWNER_IDS
+    if len(_restricted_chats) > 10000:
+        _restricted_chats.clear()
+    _restricted_chats[chat_id] = (unrestricted, sender_id)
+    return unrestricted
+
+
+def is_unrestricted(chat_id):
+    entry = _restricted_chats.get(chat_id)
+    return bool(entry and entry[0])
+
+
 REPLY_ATTEMPTS = 3
 
 
@@ -251,7 +286,11 @@ def _last_decision(text: str) -> str:
     return ""
 
 
-async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
+async def verify_tool_call(
+    name: str, arguments: dict, model: str, unrestricted: bool = False
+) -> bool:
+    if unrestricted:
+        return True
     payload = json.dumps({"tool": name, "arguments": arguments}, ensure_ascii=False)
     if name == "run_shell":
         prompt = RUN_SHELL_VERIFY_PROMPT
@@ -303,8 +342,10 @@ async def verify_tool_call(name: str, arguments: dict, model: str) -> bool:
     return True
 
 
-async def sanitize_tool_output(output: str, model: str) -> str:
-    if not SANITIZE_ENABLED or not output:
+async def sanitize_tool_output(
+    output: str, model: str, unrestricted: bool = False
+) -> str:
+    if unrestricted or not SANITIZE_ENABLED or not output:
         return output
     use_model = SANITIZE_MODEL or model
     try:
@@ -352,6 +393,8 @@ async def stream_with_tools(
     client_override=None,
     tools=None,
     verify_tools=False,
+    sanitize_tools=True,
+    unrestricted=False,
 ):
     working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
@@ -426,8 +469,9 @@ async def stream_with_tools(
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError):
                 args = {}
+            owner = unrestricted or is_unrestricted(chat_id)
             verify_model = TOOL_VERIFY_MODEL or model
-            if verify_tools and not await verify_tool_call(
+            if verify_tools and not owner and not await verify_tool_call(
                 slot["name"], args, verify_model
             ):
                 return slot, None
@@ -437,7 +481,7 @@ async def stream_with_tools(
                 result = await execute_tool(
                     slot["name"], args, chat_id, client_override
                 )
-            if slot["name"] == "run_shell":
+            if slot["name"] == "run_shell" and sanitize_tools and not owner:
                 result = await sanitize_tool_output(result, model)
             return slot, result
 
@@ -541,8 +585,7 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    # В личке с ботами юзербот не реагирует вообще (ни на .алиасы, ни на
-    # авто-ответ), чтобы не отвечать другим ботам.
+    register_sender(sender_id, chat_id)
     if is_private and getattr(await event.get_sender(), "bot", False):
         return
     triggered = bool(TRIGGER_RE.search(text))
@@ -695,6 +738,7 @@ async def handler(event: Any):
             None,
             None,
             EDIT_INTERVAL,
+            sender_id,
         )
 
         async with ctx_lock:

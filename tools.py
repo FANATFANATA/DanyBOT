@@ -979,6 +979,7 @@ async def _tool_get_bot_stats(arguments, chat_id, client, stats):
 
 async def _tool_run_subagent(arguments, chat_id, client, stats):
     import subagents
+    import userbot as userbot_module
 
     if not subagents.is_configured():
         return "Субагенты недоступны."
@@ -997,6 +998,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats):
         chat_id=chat_id,
         client=client,
         max_rounds=arguments.get("max_rounds"),
+        verify=not userbot_module.is_unrestricted(chat_id),
     )
     return json.dumps(results, ensure_ascii=False)[:8000]
 

@@ -114,6 +114,7 @@ async def run_subagent(
     client=None,
     max_rounds=None,
     subagent_name="universal",
+    verify=True,
 ):
     result = {
         "name": subagent_name,
@@ -176,7 +177,7 @@ async def run_subagent(
             name = getattr(function, "name", "") or ""
             arguments = _loads(getattr(function, "arguments", ""))
             call_id = getattr(tc, "id", "") or ""
-            if verifier is not None:
+            if verifier is not None and verify:
                 try:
                     allowed = await verifier(name, arguments, use_model)
                 except (OSError, ValueError, TypeError):
@@ -218,6 +219,7 @@ async def run_subagents(
     chat_id=None,
     client=None,
     max_rounds=None,
+    verify=True,
 ):
     if isinstance(tasks, str):
         tasks = [tasks]
@@ -245,6 +247,7 @@ async def run_subagents(
             client=client,
             max_rounds=spec.get("max_rounds", max_rounds),
             subagent_name=spec.get("name", "universal"),
+            verify=verify,
         )
 
     if limit is None:
