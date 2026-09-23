@@ -20,7 +20,10 @@ from telethon.errors import FloodWaitError, RPCError
 from telethon.sessions import StringSession
 
 import bot
+import core
 import proxies
+import subagents
+import tools as tools_module
 import userbot
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -1557,11 +1560,6 @@ class FlakyEditClient(FakeClient):
         return True
 
 
-import core
-import subagents
-import tools as tools_module
-
-
 class RichFakeClient(FakeClient):
     def __init__(self):
         super().__init__()
@@ -1837,15 +1835,6 @@ class CoreHelpersTest(BotTestCase):
     def test_check_cooldown_disabled(self):
         self.assertFalse(core.check_cooldown(1, 100.0, 0.0, {}))
 
-    def _state(self):
-        return (
-            {},
-            {},
-            set(),
-            set(),
-            set(),
-        )
-
     def test_handle_command_state_clear(self):
         hist = {1: deque([{"role": "user", "content": "x"}], maxlen=5)}
         resp = core.handle_command_state(
@@ -1981,6 +1970,7 @@ class CoreHelpersTest(BotTestCase):
             [],
             "h",
         )
+        assert resp is not None
         self.assertIn("Messages in context: 1", resp[0])
 
     def test_handle_command_state_ping(self):
@@ -2000,6 +1990,7 @@ class CoreHelpersTest(BotTestCase):
             [],
             "h",
         )
+        assert resp is not None
         self.assertIn("Model: m", resp[0])
 
     def test_handle_command_state_models_and_help(self):
@@ -2019,6 +2010,7 @@ class CoreHelpersTest(BotTestCase):
             ["m"],
             "h",
         )
+        assert resp is not None
         self.assertIn("m", resp[0])
         resp = core.handle_command_state(
             ("help", None),
@@ -2057,6 +2049,7 @@ class CoreHelpersTest(BotTestCase):
             "h",
         )
         self.assertIn(1, ignored)
+        assert resp is not None
         self.assertTrue(resp[1])
 
     def test_handle_command_state_unknown(self):
