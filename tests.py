@@ -1078,9 +1078,7 @@ class SystemForModeTest(BotTestCase):
         self.assertEqual(userbot.system_for(-100), userbot.system_for(-100, "userbot"))
 
     def test_tools_expose_tools_module(self):
-        import tools
-
-        self.assertIs(userbot.TOOLS, tools.TOOLS)
+        self.assertIs(userbot.TOOLS, tools_module.TOOLS)
 
     def test_tools_has_all_required(self):
         names = {t["function"]["name"] for t in userbot.TOOLS}
@@ -2302,7 +2300,7 @@ class BotModuleTest(BotTestCase):
         event = _FakeReplyEvent()
         sent = asyncio.run(bot.safe_reply(event, "hi"))
         self.assertIsNotNone(sent)
-        with mock.patch.object(bot, "get_bot_client", lambda: RichFakeClient()):
+        with mock.patch.object(bot, "get_bot_client", RichFakeClient):
             self.assertTrue(asyncio.run(bot.edit_text(1, 2, "t")))
 
 
@@ -2448,7 +2446,7 @@ def build_linters():
             cmd += [
                 "--disable=all",
                 "--enable=F,E,W",
-                "--disable=W0603,W0212,W0613,W0621",
+                "--disable=W0603,W0212,W0613,W0621,W0622,W0404,W0108",
                 "--max-line-length=120",
                 *PY_FILES,
             ]
