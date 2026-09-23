@@ -1662,39 +1662,79 @@ class ExtraToolsTest(BotTestCase):
 
     def test_send_message_empty_and_ok(self):
         self.assertEqual(self._run("send_message", {}), "Пустой текст.")
-        self.assertEqual(self._run("send_message", {"text": "hi"}), "Сообщение отправлено.")
+        self.assertEqual(
+            self._run("send_message", {"text": "hi"}), "Сообщение отправлено."
+        )
         self.assertEqual(self.fake_client.sent[-1], (self.CHAT_ID, "hi"))
 
     def test_delete_message_bad_and_ok(self):
-        self.assertEqual(self._run("delete_message", {"message_id": "x"}), "Некорректный message_id.")
-        self.assertEqual(self._run("delete_message", {"message_id": 9}), "Сообщение удалено.")
+        self.assertEqual(
+            self._run("delete_message", {"message_id": "x"}), "Некорректный message_id."
+        )
+        self.assertEqual(
+            self._run("delete_message", {"message_id": 9}), "Сообщение удалено."
+        )
         self.assertEqual(self.fake_client.deleted[-1], (self.CHAT_ID, [9]))
 
     def test_forward_message_bad_and_ok(self):
-        self.assertEqual(self._run("forward_message", {"message_id": "x", "target": "@t"}), "Некорректный message_id.")
-        self.assertEqual(self._run("forward_message", {"message_id": 1, "target": ""}), "Пустой target.")
-        self.assertEqual(self._run("forward_message", {"message_id": 1, "target": "@t"}), "Сообщение переслано.")
+        self.assertEqual(
+            self._run("forward_message", {"message_id": "x", "target": "@t"}),
+            "Некорректный message_id.",
+        )
+        self.assertEqual(
+            self._run("forward_message", {"message_id": 1, "target": ""}),
+            "Пустой target.",
+        )
+        self.assertEqual(
+            self._run("forward_message", {"message_id": 1, "target": "@t"}),
+            "Сообщение переслано.",
+        )
         self.assertEqual(self.fake_client.forwarded[-1], ("@t", 1, self.CHAT_ID))
 
     def test_create_poll_guards_and_ok(self):
         self.assertEqual(self._run("create_poll", {"question": ""}), "Пустой вопрос.")
-        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a"]}), "Нужно минимум 2 варианта.")
-        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a", " ", ""]}), "Нужно минимум 2 непустых варианта.")
-        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a", "b"]}), "Опрос создан.")
+        self.assertEqual(
+            self._run("create_poll", {"question": "q", "options": ["a"]}),
+            "Нужно минимум 2 варианта.",
+        )
+        self.assertEqual(
+            self._run("create_poll", {"question": "q", "options": ["a", " ", ""]}),
+            "Нужно минимум 2 непустых варианта.",
+        )
+        self.assertEqual(
+            self._run("create_poll", {"question": "q", "options": ["a", "b"]}),
+            "Опрос создан.",
+        )
         self.assertEqual(len(self.fake_client.files), 1)
 
     def test_pin_unpin_get_pinned(self):
-        self.assertEqual(self._run("pin_message", {"message_id": "x"}), "Некорректный message_id.")
-        self.assertEqual(self._run("pin_message", {"message_id": 3, "notify": True}), "Сообщение закреплено.")
+        self.assertEqual(
+            self._run("pin_message", {"message_id": "x"}), "Некорректный message_id."
+        )
+        self.assertEqual(
+            self._run("pin_message", {"message_id": 3, "notify": True}),
+            "Сообщение закреплено.",
+        )
         self.assertEqual(self.fake_client.pinned[-1], (self.CHAT_ID, 3, True))
-        self.assertEqual(self._run("unpin_message", {"message_id": 3}), "Сообщение откреплено.")
+        self.assertEqual(
+            self._run("unpin_message", {"message_id": 3}), "Сообщение откреплено."
+        )
         self.assertEqual(self.fake_client.unpinned[-1], (self.CHAT_ID, 3))
         self.assertEqual(self._run("get_pinned_messages", {}), "[5] 1: pinned")
 
     def test_react_to_message_guards_and_ok(self):
-        self.assertEqual(self._run("react_to_message", {"message_id": "x", "emoji": "x"}), "Некорректный message_id.")
-        self.assertEqual(self._run("react_to_message", {"message_id": 1, "emoji": ""}), "Пустая реакция.")
-        self.assertEqual(self._run("react_to_message", {"message_id": 1, "emoji": "ok"}), "Реакция ok поставлена.")
+        self.assertEqual(
+            self._run("react_to_message", {"message_id": "x", "emoji": "x"}),
+            "Некорректный message_id.",
+        )
+        self.assertEqual(
+            self._run("react_to_message", {"message_id": 1, "emoji": ""}),
+            "Пустая реакция.",
+        )
+        self.assertEqual(
+            self._run("react_to_message", {"message_id": 1, "emoji": "ok"}),
+            "Реакция ok поставлена.",
+        )
         self.assertEqual(len(self.fake_client.requests), 1)
 
     def test_last_and_search_messages(self):
@@ -1707,23 +1747,38 @@ class ExtraToolsTest(BotTestCase):
     def test_web_search_empty_and_ok(self):
         self.assertEqual(self._run("web_search", {"query": ""}), "Пустой запрос.")
         html = '<a class="result__a" href="https://ex.com">Title</a>'
-        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)):
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)
+        ):
             out = self._run("web_search", {"query": "x"})
         self.assertIn("Title", out)
         self.assertIn("https://ex.com", out)
 
     def test_web_search_no_results(self):
-        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html></html>")):
-            self.assertEqual(self._run("web_search", {"query": "x"}), "Ничего не найдено.")
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html></html>")
+        ):
+            self.assertEqual(
+                self._run("web_search", {"query": "x"}), "Ничего не найдено."
+            )
 
     def test_fetch_url_guards_and_ok(self):
         self.assertEqual(self._run("fetch_url", {}), "Пустой URL.")
-        self.assertEqual(self._run("fetch_url", {"url": "ftp://x"}), "URL должен начинаться с http:// или https://")
-        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html><body>Hi</body></html>")):
+        self.assertEqual(
+            self._run("fetch_url", {"url": "ftp://x"}),
+            "URL должен начинаться с http:// или https://",
+        )
+        with mock.patch.object(
+            tools_module,
+            "_get_httpx_client",
+            lambda: _FakeHttpx("<html><body>Hi</body></html>"),
+        ):
             self.assertEqual(self._run("fetch_url", {"url": "https://ex.com"}), "Hi")
 
     def test_run_subagent_guards(self):
-        self.assertEqual(self._run("run_subagent", {"task": "x"}), "Субагенты недоступны.")
+        self.assertEqual(
+            self._run("run_subagent", {"task": "x"}), "Субагенты недоступны."
+        )
 
 
 class CoreHelpersTest(BotTestCase):
@@ -1793,54 +1848,234 @@ class CoreHelpersTest(BotTestCase):
 
     def test_handle_command_state_clear(self):
         hist = {1: deque([{"role": "user", "content": "x"}], maxlen=5)}
-        resp = core.handle_command_state(("clear", None), 1, True, hist, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("clear", None),
+            1,
+            True,
+            hist,
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Контекст очищен. / Context cleared.", False, True))
         self.assertEqual(len(hist[1]), 0)
 
     def test_handle_command_state_model(self):
         overrides = {}
-        resp = core.handle_command_state(("model", "gpt"), 1, True, {}, overrides, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("model", "gpt"),
+            1,
+            True,
+            {},
+            overrides,
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Модель установлена / Model set: gpt", True, False))
         self.assertEqual(overrides[1], "gpt")
-        resp = core.handle_command_state(("model", None), 1, True, {}, overrides, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("model", None),
+            1,
+            True,
+            {},
+            overrides,
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Текущая модель / Current model: gpt", False, False))
 
     def test_handle_command_state_autorespond(self):
         auto = set()
-        resp = core.handle_command_state(("autorespond", True), 1, True, {}, {}, auto, set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("autorespond", True),
+            1,
+            True,
+            {},
+            {},
+            auto,
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Авто-ответ ВКЛ. / Auto-reply ON.", True, False))
         self.assertIn(1, auto)
-        resp = core.handle_command_state(("autorespond", False), 1, True, {}, {}, auto, set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("autorespond", False),
+            1,
+            True,
+            {},
+            {},
+            auto,
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Авто-ответ ВЫКЛ. / Auto-reply OFF.", True, False))
         self.assertNotIn(1, auto)
 
     def test_handle_command_state_auto_status(self):
-        resp = core.handle_command_state(("auto_status", None), 1, True, {}, {}, set(), set(), set(), 5, 5, True, "m", [], "h")
+        resp = core.handle_command_state(
+            ("auto_status", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            True,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("Авто-ответ / Auto-reply: ON", False, False))
 
     def test_handle_command_state_history(self):
         hist = {1: deque([{"role": "user", "content": "ab"}])}
-        resp = core.handle_command_state(("history", None), 1, True, hist, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("history", None),
+            1,
+            True,
+            hist,
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertIn("Messages in context: 1", resp[0])
 
     def test_handle_command_state_ping(self):
-        resp = core.handle_command_state(("ping", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("ping", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertIn("Model: m", resp[0])
 
     def test_handle_command_state_models_and_help(self):
-        resp = core.handle_command_state(("models", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", ["m"], "h")
+        resp = core.handle_command_state(
+            ("models", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            ["m"],
+            "h",
+        )
         self.assertIn("m", resp[0])
-        resp = core.handle_command_state(("help", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("help", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertEqual(resp, ("h", False, False))
 
     def test_handle_command_state_ignore(self):
         ignored = set()
-        resp = core.handle_command_state(("ignore", None), 1, True, {}, {}, set(), ignored, set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("ignore", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            ignored,
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertIn(1, ignored)
         self.assertTrue(resp[1])
 
     def test_handle_command_state_unknown(self):
-        resp = core.handle_command_state(("nope", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        resp = core.handle_command_state(
+            ("nope", None),
+            1,
+            True,
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+            5,
+            5,
+            False,
+            "m",
+            [],
+            "h",
+        )
         self.assertIsNone(resp)
 
     def test_append_group_history(self):
@@ -1851,7 +2086,9 @@ class CoreHelpersTest(BotTestCase):
     def test_prepare_messages(self):
         store = _StoreStub()
         store.chat_history[1] = deque([{"role": "user", "content": "x"}], maxlen=5)
-        hist, messages = asyncio.run(core.prepare_messages(store, 1, 5, 5, lambda cid: "sys"))
+        _hist, messages = asyncio.run(
+            core.prepare_messages(store, 1, 5, 5, lambda cid: "sys")
+        )
         self.assertEqual(messages[0], {"role": "system", "content": "sys"})
         self.assertEqual(messages[1]["content"], "x")
 
@@ -1864,7 +2101,9 @@ class CoreHelpersTest(BotTestCase):
         async def edit(chat_id, msg_id, text):
             seen.append(text)
 
-        state, render_fn, on_delta, on_reasoning, on_tool = core.make_stream_callbacks("p", render, edit, 1, 0.0)
+        state, _render_fn, on_delta, on_reasoning, on_tool = core.make_stream_callbacks(
+            "p", render, edit, 1, 0.0
+        )
         state["edit_id"] = 5
 
         async def run():
@@ -1891,14 +2130,30 @@ class CoreHelpersTest(BotTestCase):
         def render(prefix, reasoning, tools, answer):
             return prefix + answer
 
-        async def stream_fn(messages, model, chat_id, on_delta, on_reasoning, on_tool, **kwargs):
+        async def stream_fn(
+            messages, model, chat_id, on_delta, on_reasoning, on_tool, **kwargs
+        ):
             await on_delta("hi")
             return "hi"
 
         answer = asyncio.run(
             core.stream_answer(
-                store, None, 1, True, [], "m", "p:", 5, render, edit_fn, reply_fn,
-                _NullAsyncContext(), stream_fn, None, None, 0.0,
+                store,
+                None,
+                1,
+                True,
+                [],
+                "m",
+                "p:",
+                5,
+                render,
+                edit_fn,
+                reply_fn,
+                _NullAsyncContext(),
+                stream_fn,
+                None,
+                None,
+                0.0,
             )
         )
         self.assertEqual(answer, "hi")
@@ -1973,7 +2228,9 @@ class UserbotHelpersTest(BotTestCase):
         saved_ai = userbot.ai
         userbot.ai = NonStreamAI(NonStreamResponse(NonStreamMessage(content="clean")))
         self.addCleanup(setattr, userbot, "ai", saved_ai)
-        self.assertEqual(asyncio.run(userbot.sanitize_tool_output("secret", "m")), "clean")
+        self.assertEqual(
+            asyncio.run(userbot.sanitize_tool_output("secret", "m")), "clean"
+        )
 
     def test_sanitize_error_hides(self):
         class _Boom:
@@ -1990,7 +2247,9 @@ class UserbotHelpersTest(BotTestCase):
 
     def test_refresh_models(self):
         async def _list():
-            return SimpleNamespace(data=[SimpleNamespace(id="m1"), SimpleNamespace(id="m2")])
+            return SimpleNamespace(
+                data=[SimpleNamespace(id="m1"), SimpleNamespace(id="m2")]
+            )
 
         saved_ai = userbot.ai
         saved_models = list(userbot.MODELS)
@@ -2001,7 +2260,13 @@ class UserbotHelpersTest(BotTestCase):
         self.assertEqual(userbot.MODELS, ["m1", "m2"])
 
     def test_verify_unrestricted_short_circuit(self):
-        self.assertTrue(asyncio.run(userbot.verify_tool_call("run_shell", {"command": "rm -rf /"}, "m", True)))
+        self.assertTrue(
+            asyncio.run(
+                userbot.verify_tool_call(
+                    "run_shell", {"command": "rm -rf /"}, "m", True
+                )
+            )
+        )
 
 
 class BotModuleTest(BotTestCase):
@@ -2092,7 +2357,9 @@ class SubagentsTest(BotTestCase):
         self.assertEqual(msg["tool_calls"][0]["id"], "c1")
 
     def test_run_subagent_ok(self):
-        subagents.configure(ai=self._AI("answer"), model="m", verifier=None, enabled=True)
+        subagents.configure(
+            ai=self._AI("answer"), model="m", verifier=None, enabled=True
+        )
         result = asyncio.run(subagents.run_subagent("do it"))
         self.assertTrue(result["ok"])
         self.assertEqual(result["result"], "answer")
