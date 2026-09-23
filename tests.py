@@ -1557,6 +1557,562 @@ class FlakyEditClient(FakeClient):
         return True
 
 
+import core
+import subagents
+import tools as tools_module
+
+
+class RichFakeClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.pinned = []
+        self.unpinned = []
+        self.deleted = []
+        self.forwarded = []
+        self.files = []
+        self.requests = []
+
+    async def pin_message(self, chat, msg_id, notify=False):
+        self.pinned.append((chat, msg_id, notify))
+
+    async def unpin_message(self, chat, msg_id):
+        self.unpinned.append((chat, msg_id))
+
+    async def delete_messages(self, chat, ids):
+        self.deleted.append((chat, list(ids)))
+
+    async def forward_messages(self, target, msg_id, from_chat):
+        self.forwarded.append((target, msg_id, from_chat))
+
+    async def send_file(self, chat, file):
+        self.files.append((chat, file))
+
+    async def __call__(self, request):
+        self.requests.append(request)
+        return SimpleNamespace()
+
+    async def get_messages(self, chat, limit=20, ids=None, filter=None, search=None):
+        if filter is not None:
+            return [SimpleNamespace(id=5, sender_id=1, message="pinned")]
+        return await super().get_messages(chat, limit=limit, ids=ids)
+
+
+class _FakeResp:
+    def __init__(self, text, status=200):
+        self.text = text
+        self.status_code = status
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise OSError("bad status")
+
+
+class _FakeHttpx:
+    def __init__(self, text, status=200):
+        self._text = text
+        self._status = status
+
+    async def get(self, url, **kwargs):
+        return _FakeResp(self._text, self._status)
+
+
+class _FakeReplyEvent:
+    def __init__(self, fail_times=0):
+        self.replies = []
+        self._fail = fail_times
+
+    async def reply(self, text):
+        if self._fail > 0:
+            self._fail -= 1
+            raise OSError("boom")
+        self.replies.append(text)
+        return SimpleNamespace(id=77)
+
+
+class _StoreStub:
+    def __init__(self):
+        self.recent_reply_ids = set()
+        self.ctx_lock = asyncio.Lock()
+        self.chat_history = {}
+        self.model_overrides = {}
+        self.auto_respond = set()
+        self.ignored_chats = set()
+        self.ignored_users = set()
+        self.seen_msg_keys = set()
+        self.last_chat_activity = {}
+
+
+class ExtraToolsTest(BotTestCase):
+    CHAT_ID = -100
+
+    def setUp(self):
+        super().setUp()
+        self.fake_client = RichFakeClient()
+        self._orig_client = userbot.client
+        userbot.client = self.fake_client
+        self.addCleanup(setattr, userbot, "client", self._orig_client)
+
+    def _run(self, name, args):
+        return asyncio.run(userbot.execute_tool(name, args, self.CHAT_ID))
+
+    def test_get_chat_history_in_guard_and_ok(self):
+        self.assertEqual(self._run("get_chat_history_in", {}), "Пустой chat.")
+        out = self._run("get_chat_history_in", {"chat": "@x", "limit": 2})
+        self.assertEqual(len(out.splitlines()), 2)
+
+    def test_send_message_empty_and_ok(self):
+        self.assertEqual(self._run("send_message", {}), "Пустой текст.")
+        self.assertEqual(self._run("send_message", {"text": "hi"}), "Сообщение отправлено.")
+        self.assertEqual(self.fake_client.sent[-1], (self.CHAT_ID, "hi"))
+
+    def test_delete_message_bad_and_ok(self):
+        self.assertEqual(self._run("delete_message", {"message_id": "x"}), "Некорректный message_id.")
+        self.assertEqual(self._run("delete_message", {"message_id": 9}), "Сообщение удалено.")
+        self.assertEqual(self.fake_client.deleted[-1], (self.CHAT_ID, [9]))
+
+    def test_forward_message_bad_and_ok(self):
+        self.assertEqual(self._run("forward_message", {"message_id": "x", "target": "@t"}), "Некорректный message_id.")
+        self.assertEqual(self._run("forward_message", {"message_id": 1, "target": ""}), "Пустой target.")
+        self.assertEqual(self._run("forward_message", {"message_id": 1, "target": "@t"}), "Сообщение переслано.")
+        self.assertEqual(self.fake_client.forwarded[-1], ("@t", 1, self.CHAT_ID))
+
+    def test_create_poll_guards_and_ok(self):
+        self.assertEqual(self._run("create_poll", {"question": ""}), "Пустой вопрос.")
+        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a"]}), "Нужно минимум 2 варианта.")
+        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a", " ", ""]}), "Нужно минимум 2 непустых варианта.")
+        self.assertEqual(self._run("create_poll", {"question": "q", "options": ["a", "b"]}), "Опрос создан.")
+        self.assertEqual(len(self.fake_client.files), 1)
+
+    def test_pin_unpin_get_pinned(self):
+        self.assertEqual(self._run("pin_message", {"message_id": "x"}), "Некорректный message_id.")
+        self.assertEqual(self._run("pin_message", {"message_id": 3, "notify": True}), "Сообщение закреплено.")
+        self.assertEqual(self.fake_client.pinned[-1], (self.CHAT_ID, 3, True))
+        self.assertEqual(self._run("unpin_message", {"message_id": 3}), "Сообщение откреплено.")
+        self.assertEqual(self.fake_client.unpinned[-1], (self.CHAT_ID, 3))
+        self.assertEqual(self._run("get_pinned_messages", {}), "[5] 1: pinned")
+
+    def test_react_to_message_guards_and_ok(self):
+        self.assertEqual(self._run("react_to_message", {"message_id": "x", "emoji": "x"}), "Некорректный message_id.")
+        self.assertEqual(self._run("react_to_message", {"message_id": 1, "emoji": ""}), "Пустая реакция.")
+        self.assertEqual(self._run("react_to_message", {"message_id": 1, "emoji": "ok"}), "Реакция ok поставлена.")
+        self.assertEqual(len(self.fake_client.requests), 1)
+
+    def test_last_and_search_messages(self):
+        out = self._run("get_last_messages", {"limit": 2})
+        self.assertEqual(len(out.splitlines()), 2)
+        self.assertEqual(self._run("search_messages", {"query": ""}), "Пустой запрос.")
+        out = self._run("search_messages", {"query": "t", "limit": 2})
+        self.assertEqual(len(out.splitlines()), 2)
+
+    def test_web_search_empty_and_ok(self):
+        self.assertEqual(self._run("web_search", {"query": ""}), "Пустой запрос.")
+        html = '<a class="result__a" href="https://ex.com">Title</a>'
+        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)):
+            out = self._run("web_search", {"query": "x"})
+        self.assertIn("Title", out)
+        self.assertIn("https://ex.com", out)
+
+    def test_web_search_no_results(self):
+        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html></html>")):
+            self.assertEqual(self._run("web_search", {"query": "x"}), "Ничего не найдено.")
+
+    def test_fetch_url_guards_and_ok(self):
+        self.assertEqual(self._run("fetch_url", {}), "Пустой URL.")
+        self.assertEqual(self._run("fetch_url", {"url": "ftp://x"}), "URL должен начинаться с http:// или https://")
+        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html><body>Hi</body></html>")):
+            self.assertEqual(self._run("fetch_url", {"url": "https://ex.com"}), "Hi")
+
+    def test_run_subagent_guards(self):
+        self.assertEqual(self._run("run_subagent", {"task": "x"}), "Субагенты недоступны.")
+
+
+class CoreHelpersTest(BotTestCase):
+    def test_async_saver_writes_and_flushes(self):
+        calls = []
+        saver = core.AsyncSaver(lambda: calls.append(1), delay=0.01)
+
+        async def run():
+            saver.mark_dirty()
+            await asyncio.sleep(0.05)
+            await saver.flush()
+
+        asyncio.run(run())
+        self.assertGreaterEqual(len(calls), 1)
+
+    def test_safe_reply_empty_and_success(self):
+        event = _FakeReplyEvent()
+        recent = set()
+        sent = asyncio.run(core.safe_reply(event, "   ", 3, recent))
+        self.assertEqual(event.replies, ["…"])
+        self.assertEqual(sent.id, 77)
+        self.assertIn(77, recent)
+
+    def test_safe_reply_failure_returns_none(self):
+        event = _FakeReplyEvent(fail_times=5)
+        self.assertIsNone(asyncio.run(core.safe_reply(event, "hi", 2, set())))
+
+    def test_edit_text_success_and_failure(self):
+        client = RichFakeClient()
+
+        async def run():
+            return await core.edit_text(client, 1, 2, "t", 2)
+
+        self.assertTrue(asyncio.run(run()))
+
+    def test_fetch_replied_text(self):
+        class _Msg:
+            is_reply = True
+
+            async def get_reply_message(self):
+                return SimpleNamespace(message="orig")
+
+        self.assertEqual(asyncio.run(core.fetch_replied_text(_Msg())), "orig")
+
+    def test_fetch_replied_text_none(self):
+        class _Msg:
+            is_reply = False
+
+        self.assertIsNone(asyncio.run(core.fetch_replied_text(_Msg())))
+
+    def test_check_cooldown(self):
+        activity = {}
+        self.assertFalse(core.check_cooldown(1, 100.0, 10.0, activity))
+        self.assertTrue(core.check_cooldown(1, 105.0, 10.0, activity))
+
+    def test_check_cooldown_disabled(self):
+        self.assertFalse(core.check_cooldown(1, 100.0, 0.0, {}))
+
+    def _state(self):
+        return (
+            {},
+            {},
+            set(),
+            set(),
+            set(),
+        )
+
+    def test_handle_command_state_clear(self):
+        hist = {1: deque([{"role": "user", "content": "x"}], maxlen=5)}
+        resp = core.handle_command_state(("clear", None), 1, True, hist, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("Контекст очищен. / Context cleared.", False, True))
+        self.assertEqual(len(hist[1]), 0)
+
+    def test_handle_command_state_model(self):
+        overrides = {}
+        resp = core.handle_command_state(("model", "gpt"), 1, True, {}, overrides, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("Модель установлена / Model set: gpt", True, False))
+        self.assertEqual(overrides[1], "gpt")
+        resp = core.handle_command_state(("model", None), 1, True, {}, overrides, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("Текущая модель / Current model: gpt", False, False))
+
+    def test_handle_command_state_autorespond(self):
+        auto = set()
+        resp = core.handle_command_state(("autorespond", True), 1, True, {}, {}, auto, set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("Авто-ответ ВКЛ. / Auto-reply ON.", True, False))
+        self.assertIn(1, auto)
+        resp = core.handle_command_state(("autorespond", False), 1, True, {}, {}, auto, set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("Авто-ответ ВЫКЛ. / Auto-reply OFF.", True, False))
+        self.assertNotIn(1, auto)
+
+    def test_handle_command_state_auto_status(self):
+        resp = core.handle_command_state(("auto_status", None), 1, True, {}, {}, set(), set(), set(), 5, 5, True, "m", [], "h")
+        self.assertEqual(resp, ("Авто-ответ / Auto-reply: ON", False, False))
+
+    def test_handle_command_state_history(self):
+        hist = {1: deque([{"role": "user", "content": "ab"}])}
+        resp = core.handle_command_state(("history", None), 1, True, hist, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertIn("Messages in context: 1", resp[0])
+
+    def test_handle_command_state_ping(self):
+        resp = core.handle_command_state(("ping", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertIn("Model: m", resp[0])
+
+    def test_handle_command_state_models_and_help(self):
+        resp = core.handle_command_state(("models", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", ["m"], "h")
+        self.assertIn("m", resp[0])
+        resp = core.handle_command_state(("help", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertEqual(resp, ("h", False, False))
+
+    def test_handle_command_state_ignore(self):
+        ignored = set()
+        resp = core.handle_command_state(("ignore", None), 1, True, {}, {}, set(), ignored, set(), 5, 5, False, "m", [], "h")
+        self.assertIn(1, ignored)
+        self.assertTrue(resp[1])
+
+    def test_handle_command_state_unknown(self):
+        resp = core.handle_command_state(("nope", None), 1, True, {}, {}, set(), set(), set(), 5, 5, False, "m", [], "h")
+        self.assertIsNone(resp)
+
+    def test_append_group_history(self):
+        hist = {}
+        asyncio.run(core.append_group_history(1, "x", hist, 5, asyncio.Lock()))
+        self.assertEqual(hist[1][0]["content"], "x")
+
+    def test_prepare_messages(self):
+        store = _StoreStub()
+        store.chat_history[1] = deque([{"role": "user", "content": "x"}], maxlen=5)
+        hist, messages = asyncio.run(core.prepare_messages(store, 1, 5, 5, lambda cid: "sys"))
+        self.assertEqual(messages[0], {"role": "system", "content": "sys"})
+        self.assertEqual(messages[1]["content"], "x")
+
+    def test_make_stream_callbacks(self):
+        seen = []
+
+        def render(prefix, reasoning, tools, answer):
+            return f"{prefix}|{''.join(reasoning)}|{','.join(tools)}|{answer}"
+
+        async def edit(chat_id, msg_id, text):
+            seen.append(text)
+
+        state, render_fn, on_delta, on_reasoning, on_tool = core.make_stream_callbacks("p", render, edit, 1, 0.0)
+        state["edit_id"] = 5
+
+        async def run():
+            await on_reasoning("r")
+            await on_tool("t")
+            await on_delta("a")
+
+        asyncio.run(run())
+        self.assertTrue(seen)
+        self.assertIn("r", seen[-1])
+        self.assertIn("t", seen[-1])
+        self.assertIn("a", seen[-1])
+
+    def test_stream_answer_self_edit(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text):
+            edited.append(text)
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=1)
+
+        def render(prefix, reasoning, tools, answer):
+            return prefix + answer
+
+        async def stream_fn(messages, model, chat_id, on_delta, on_reasoning, on_tool, **kwargs):
+            await on_delta("hi")
+            return "hi"
+
+        answer = asyncio.run(
+            core.stream_answer(
+                store, None, 1, True, [], "m", "p:", 5, render, edit_fn, reply_fn,
+                _NullAsyncContext(), stream_fn, None, None, 0.0,
+            )
+        )
+        self.assertEqual(answer, "hi")
+        self.assertEqual(edited[-1], "p:hi")
+
+    def test_parse_state_data(self):
+        data = {
+            "model_overrides": {"1": "m"},
+            "auto_respond": [1],
+            "ignored_chats": [2],
+            "ignored_users": [3],
+        }
+        parsed = core.parse_state_data(data)
+        self.assertEqual(parsed["model_overrides"], {1: "m"})
+        self.assertEqual(parsed["auto_respond"], {1})
+
+
+class UserbotHelpersTest(BotTestCase):
+    def test_register_sender_and_is_unrestricted(self):
+        saved = userbot.OWNER_IDS
+        userbot.OWNER_IDS = {42}
+        self.addCleanup(setattr, userbot, "OWNER_IDS", saved)
+        self.assertTrue(userbot.register_sender(42, -1))
+        self.assertTrue(userbot.is_unrestricted(-1))
+        self.assertFalse(userbot.register_sender(7, -2))
+        self.assertFalse(userbot.is_unrestricted(-2))
+        self.assertFalse(userbot.register_sender(None, -3))
+
+    def test_model_for(self):
+        saved = dict(userbot.model_overrides)
+        userbot.model_overrides.clear()
+        self.addCleanup(userbot.model_overrides.update, saved)
+        self.assertEqual(userbot.model_for(1), userbot.DANYAPI_MODEL)
+        userbot.model_overrides[1] = "custom"
+        self.assertEqual(userbot.model_for(1), "custom")
+
+    def test_system_for(self):
+        self.assertEqual(userbot.system_for(1), userbot.SYSTEM_PROMPT)
+        self.assertEqual(userbot.system_for(1, mode="bot"), userbot.SYSTEM_PROMPT_BOT)
+
+    def test_make_session_plain(self):
+        self.assertEqual(userbot.make_session("plain"), "plain")
+
+    def test_get_sender_label(self):
+        class _Event:
+            sender_id = 5
+
+            async def get_sender(self):
+                return SimpleNamespace(first_name="A", last_name="B", username="u")
+
+        self.assertEqual(asyncio.run(userbot.get_sender_label(_Event())), "A B (@u)")
+
+    def test_get_sender_label_no_sender(self):
+        class _Event:
+            sender_id = 9
+
+            async def get_sender(self):
+                return None
+
+        self.assertEqual(asyncio.run(userbot.get_sender_label(_Event())), "9")
+
+    def test_sanitize_disabled(self):
+        saved = userbot.SANITIZE_ENABLED
+        userbot.SANITIZE_ENABLED = False
+        self.addCleanup(setattr, userbot, "SANITIZE_ENABLED", saved)
+        self.assertEqual(asyncio.run(userbot.sanitize_tool_output("x", "m")), "x")
+
+    def test_sanitize_unrestricted(self):
+        self.assertEqual(asyncio.run(userbot.sanitize_tool_output("x", "m", True)), "x")
+
+    def test_sanitize_cleans_output(self):
+        saved_ai = userbot.ai
+        userbot.ai = NonStreamAI(NonStreamResponse(NonStreamMessage(content="clean")))
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.assertEqual(asyncio.run(userbot.sanitize_tool_output("secret", "m")), "clean")
+
+    def test_sanitize_error_hides(self):
+        class _Boom:
+            class chat:
+                class completions:
+                    @staticmethod
+                    async def create(**kwargs):
+                        raise OSError("down")
+
+        saved_ai = userbot.ai
+        userbot.ai = _Boom()
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.assertIn("скрыт", asyncio.run(userbot.sanitize_tool_output("secret", "m")))
+
+    def test_refresh_models(self):
+        async def _list():
+            return SimpleNamespace(data=[SimpleNamespace(id="m1"), SimpleNamespace(id="m2")])
+
+        saved_ai = userbot.ai
+        saved_models = list(userbot.MODELS)
+        userbot.ai = SimpleNamespace(models=SimpleNamespace(list=_list))
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        asyncio.run(userbot.refresh_models())
+        self.assertEqual(userbot.MODELS, ["m1", "m2"])
+
+    def test_verify_unrestricted_short_circuit(self):
+        self.assertTrue(asyncio.run(userbot.verify_tool_call("run_shell", {"command": "rm -rf /"}, "m", True)))
+
+
+class BotModuleTest(BotTestCase):
+    def test_mention_helpers(self):
+        saved = bot.bot_username
+        bot.bot_username = "DanyBOTAPI_bot"
+        self.addCleanup(setattr, bot, "bot_username", saved)
+        self.assertTrue(bot._is_mentioned("hey @DanyBOTAPI_bot hi"))
+        self.assertEqual(bot._strip_mention("hey @DanyBOTAPI_bot hi"), "hey  hi")
+
+    def test_mention_none_without_username(self):
+        saved = bot.bot_username
+        bot.bot_username = ""
+        self.addCleanup(setattr, bot, "bot_username", saved)
+        self.assertFalse(bot._is_mentioned("@x"))
+
+    def test_state_roundtrip(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_botstate_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        saved = bot.STATE_FILE
+        bot.STATE_FILE = tmp / "state_bot.json"
+        self.addCleanup(setattr, bot, "STATE_FILE", saved)
+        saved_overrides = dict(bot.model_overrides)
+        self.addCleanup(bot.model_overrides.clear)
+        self.addCleanup(bot.model_overrides.update, saved_overrides)
+        bot.model_overrides[1] = "m"
+        bot.save_state()
+        bot.model_overrides.clear()
+        bot.load_state()
+        self.assertEqual(bot.model_overrides.get(1), "m")
+
+    def test_safe_reply_and_edit_text(self):
+        event = _FakeReplyEvent()
+        sent = asyncio.run(bot.safe_reply(event, "hi"))
+        self.assertIsNotNone(sent)
+        with mock.patch.object(bot, "get_bot_client", lambda: RichFakeClient()):
+            self.assertTrue(asyncio.run(bot.edit_text(1, 2, "t")))
+
+
+class SubagentsTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self._orig = dict(subagents._RUNTIME)
+
+        def restore():
+            subagents._RUNTIME.update(self._orig)
+
+        self.addCleanup(restore)
+
+    class _AI:
+        def __init__(self, content="done", tool_calls=None):
+            self._content = content
+            self._tool_calls = tool_calls
+
+            class _Completions:
+                def __init__(self, outer):
+                    self._outer = outer
+
+                async def create(self, **kwargs):
+                    message = SimpleNamespace(
+                        content=self._outer._content,
+                        tool_calls=self._outer._tool_calls,
+                    )
+                    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+            self.chat = SimpleNamespace(completions=_Completions(self))
+
+    def test_configure_and_is_configured(self):
+        subagents.configure(ai=object(), model="m", enabled=True)
+        self.assertTrue(subagents.is_configured())
+        subagents.configure(enabled=False)
+        self.assertFalse(subagents.is_configured())
+
+    def test_select_tools(self):
+        all_tools = subagents._select_tools(None)
+        self.assertTrue(all_tools)
+        picked = subagents._select_tools(["evaluate"])
+        self.assertTrue(any(t["function"]["name"] == "evaluate" for t in picked))
+
+    def test_loads_and_assistant_message(self):
+        self.assertEqual(subagents._loads(""), {})
+        self.assertEqual(subagents._loads("nope"), {})
+        self.assertEqual(subagents._loads('{"a": 1}'), {"a": 1})
+        tc = SimpleNamespace(
+            id="c1", function=SimpleNamespace(name="f", arguments="{}")
+        )
+        msg = subagents._assistant_message("c", [tc])
+        self.assertEqual(msg["tool_calls"][0]["id"], "c1")
+
+    def test_run_subagent_ok(self):
+        subagents.configure(ai=self._AI("answer"), model="m", verifier=None, enabled=True)
+        result = asyncio.run(subagents.run_subagent("do it"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], "answer")
+
+    def test_run_subagent_empty_task(self):
+        subagents.configure(ai=self._AI(), model="m", enabled=True)
+        result = asyncio.run(subagents.run_subagent(""))
+        self.assertFalse(result["ok"])
+
+    def test_run_subagent_not_configured(self):
+        subagents.configure(enabled=False)
+        result = asyncio.run(subagents.run_subagent("x"))
+        self.assertFalse(result["ok"])
+
+    def test_run_subagents_parallel(self):
+        subagents.configure(ai=self._AI("r"), model="m", verifier=None, enabled=True)
+        results = asyncio.run(subagents.run_subagents(["a", "b"], concurrency=2))
+        self.assertEqual(len(results), 2)
+
+
 def run_unit_tests():
     loader = unittest.TestLoader()
     suite = loader.loadTestsFromModule(sys.modules[__name__])
