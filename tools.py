@@ -8,6 +8,8 @@ import logging
 import math
 import os
 import re
+import sys
+import tempfile
 import urllib.parse
 from pathlib import Path
 from typing import Any, cast
@@ -51,6 +53,8 @@ MAX_WRITE_BYTES = 500_000
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILES = 4000
+MAX_SCRIPT_BYTES = 200_000
+MAX_SCRIPT_OUTPUT = 4000
 
 
 def _resolve_path(raw, root=None):
@@ -607,6 +611,7 @@ FILE_TOOL_NAMES = (
     "edit_file",
     "list_dir",
     "search_files",
+    "execute_script",
 )
 
 FILE_TOOLS: list[dict[str, Any]] = [
@@ -683,6 +688,27 @@ FILE_TOOLS: list[dict[str, Any]] = [
                     "limit": {"type": "integer", "minimum": 1, "maximum": 200},
                 },
                 "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "execute_script",
+            "description": (
+                "Выполнить python-скрипт целиком и вернуть rc, stdout и stderr"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string"},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Рабочий каталог внутри разрешённого корня",
+                    },
+                },
+                "required": ["code"],
             },
         },
     },
@@ -1338,6 +1364,62 @@ async def _tool_search_files(arguments, chat_id, client, stats):
     return "\n".join(matches)
 
 
+async def _tool_execute_script(arguments, chat_id, client, stats):
+    code = str(arguments.get("code", ""))
+    if not code.strip():
+        return "Пустой код."
+    encoded = code.encode("utf-8")
+    if len(encoded) > MAX_SCRIPT_BYTES:
+        return f"Слишком большой объём: {len(encoded)} байт"
+    timeout = _int_arg(arguments, "timeout", 30, 1, 120)
+    workdir = CODER_ROOT
+    raw_cwd = _str_arg(arguments, "cwd")
+    if raw_cwd:
+        workdir, err = _resolve_path(raw_cwd)
+        if err or workdir is None:
+            return err
+        if not workdir.is_dir():
+            return f"Каталог не найден: {workdir}"
+    script_path = None
+    try:
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".py", delete=False, encoding="utf-8"
+        )
+        with handle:
+            handle.write(code)
+        script_path = Path(handle.name)
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(script_path),
+            cwd=str(workdir),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        if script_path is not None:
+            with contextlib.suppress(OSError):
+                script_path.unlink()
+        return f"Ошибка запуска: {exc}"
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(Exception):
+            await proc.wait()
+        return f"Таймаут {timeout}s: скрипт прерван."
+    finally:
+        if script_path is not None:
+            with contextlib.suppress(OSError):
+                script_path.unlink()
+    out = stdout.decode("utf-8", errors="replace")
+    err = stderr.decode("utf-8", errors="replace")
+    result = f"rc={proc.returncode}\nstdout:\n{out}"
+    if err:
+        result += f"\nstderr:\n{err}"
+    return _clip(result, MAX_SCRIPT_OUTPUT)
+
+
 _HANDLERS = {
     "get_chat_history": _tool_get_chat_history,
     "list_chats": _tool_list_chats,
@@ -1371,6 +1453,7 @@ _HANDLERS = {
     "edit_file": _tool_edit_file,
     "list_dir": _tool_list_dir,
     "search_files": _tool_search_files,
+    "execute_script": _tool_execute_script,
 }
 
 

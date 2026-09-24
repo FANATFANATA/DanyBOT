@@ -2353,6 +2353,7 @@ class CoderModeTest(BotTestCase):
                 "edit_file",
                 "list_dir",
                 "search_files",
+                "execute_script",
                 "run_shell",
                 "web_search",
                 "fetch_url",
@@ -2468,6 +2469,49 @@ class CoderModeTest(BotTestCase):
             userbot.execute_tool("read_file", {"path": "/etc/passwd"}, -100)
         )
         self.assertIn("вне разрешённого корня", missing)
+
+    def test_execute_script_runs_and_returns_output(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "execute_script", {"code": "print('alpha')\nprint(1 + 2)"}, -100
+            )
+        )
+        self.assertIn("rc=0", result)
+        self.assertIn("alpha", result)
+        self.assertIn("3", result)
+
+    def test_execute_script_reports_traceback(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "execute_script", {"code": "raise ValueError('boom')"}, -100
+            )
+        )
+        self.assertIn("rc=1", result)
+        self.assertIn("ValueError", result)
+
+    def test_execute_script_empty_code(self):
+        self.assertEqual(
+            asyncio.run(userbot.execute_tool("execute_script", {}, -100)),
+            "Пустой код.",
+        )
+
+    def test_execute_script_cwd_outside_root(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "execute_script", {"code": "print(1)", "cwd": "/etc"}, -100
+            )
+        )
+        self.assertIn("вне разрешённого корня", result)
+
+    def test_execute_script_cwd_inside_root(self):
+        result = asyncio.run(
+            userbot.execute_tool(
+                "execute_script",
+                {"code": "import os\nprint(os.getcwd())", "cwd": "DanyBOT"},
+                -100,
+            )
+        )
+        self.assertIn("DanyBOT", result)
 
     def test_creator_info_exposed(self):
         self.assertIn("Создатель", userbot.CREATOR_INFO)
