@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import html
 import logging
 import re
 import time
@@ -29,6 +28,9 @@ model_overrides: dict[int, str] = {}
 auto_respond: set[int] = set()
 ignored_chats: set[int] = set()
 ignored_users: set[int] = set()
+coder_chats: set[int] = set()
+reasoning_hidden: set[int] = set()
+tools_hidden: set[int] = set()
 
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
@@ -76,7 +78,9 @@ BOT_HELP_TEXT = (
     "/clear — очистить контекст / clear context\n"
     "/history — размер контекста / context size\n"
     "/ping — статус / status\n"
-    "/auto on|off — авто-ответ / auto-reply\n\n"
+    "/auto on|off — авто-ответ / auto-reply\n"
+    "/reasoning on|off — показ рассуждений / show reasoning\n"
+    "/tools on|off — показ вызовов инструментов / show tool calls\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
 )
 
@@ -173,6 +177,25 @@ async def handler(event: Any):
         command = None
 
     if command and command[0] in ("ignore", "unignore"):
+        return
+
+    if command and command[0] in ("coder", "coder_status"):
+        await safe_reply(
+            event,
+            "Кодер-режим работает только в юзерботе владельца.",
+        )
+        return
+
+    if command and command[0] in core.VISIBILITY_COMMANDS:
+        if sender_id not in userbot.OWNER_IDS:
+            await safe_reply(event, "Переключение доступно только владельцу.")
+            return
+        text_out, changed = core.apply_visibility_command(
+            command, chat_id, reasoning_hidden, tools_hidden
+        )
+        if changed:
+            save_state()
+        await safe_reply(event, text_out)
         return
 
     if command:
@@ -283,7 +306,7 @@ async def handler(event: Any):
         )
 
     if is_self:
-        prefix = f"{html.escape(text)}\n\n"
+        prefix = f"{text}\n\n"
         self_edit_id = msg_id
     else:
         prefix = ""
@@ -299,7 +322,9 @@ async def handler(event: Any):
             model,
             prefix,
             self_edit_id,
-            userbot.render_response,
+            core.make_render(
+                userbot.render_response, reasoning_hidden, tools_hidden, chat_id
+            ),
             edit_text,
             safe_reply,
             cast(Any, get_bot_client().action(chat_id, "typing")),

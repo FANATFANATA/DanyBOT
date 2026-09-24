@@ -62,6 +62,51 @@ AUTO_ON_WORDS = ("on", "вкл", "включить", "1", "true", "yes", "да")
 AUTO_OFF_WORDS = ("off", "выкл", "выключить", "0", "false", "no", "нет")
 
 
+def _bool_command(name, arg):
+    low = arg.strip().lower()
+    if low in AUTO_ON_WORDS:
+        return (name, True)
+    if low in AUTO_OFF_WORDS:
+        return (name, False)
+    return (f"{name}_status", None)
+
+
+VISIBILITY_COMMANDS = ("reasoning", "reasoning_status", "tools", "tools_status")
+
+VISIBILITY_LABELS = {
+    "reasoning": "Рассуждения / Reasoning",
+    "tools": "Инструменты / Tools",
+}
+
+
+def apply_visibility_command(command, chat_id, reasoning_hidden, tools_hidden):
+    base = command[0].split("_")[0]
+    target = reasoning_hidden if base == "reasoning" else tools_hidden
+    label = VISIBILITY_LABELS[base]
+    if command[0].endswith("_status"):
+        state = "скрыты" if chat_id in target else "показаны"
+        return (f"{label}: {state}", False)
+    if command[1]:
+        target.discard(chat_id)
+        state = "показаны"
+    else:
+        target.add(chat_id)
+        state = "скрыты"
+    return (f"{label}: {state}", True)
+
+
+def make_render(render_fn, reasoning_hidden, tools_hidden, chat_id):
+    show_reasoning = chat_id not in reasoning_hidden
+    show_tools = chat_id not in tools_hidden
+
+    def render(prefix, reasoning_parts, tool_parts, answer):
+        return render_fn(
+            prefix, reasoning_parts, tool_parts, answer, show_reasoning, show_tools
+        )
+
+    return render
+
+
 def _alias_pattern(aliases):
     return r"(?:" + "|".join(re.escape(a) for a in aliases) + r")"
 
@@ -93,6 +138,9 @@ SUB_ALIASES = {
     "ping": ("ping", "пинг", "check"),
     "ignore": ("ignore", "игнор", "мут", "заглушить"),
     "unignore": ("unignore", "анмут", "размут", "включить"),
+    "coder": ("coder", "кодер"),
+    "reasoning": ("reasoning", "ризонинг", "размышления"),
+    "tools": ("tools", "инструменты"),
 }
 
 _SUB_LOOKUP = {
@@ -137,6 +185,8 @@ def handle_commands(text) -> tuple[str, Any] | None:
     cmd = _SUB_LOOKUP.get(sub)
     if cmd is None:
         return None
+    if cmd in ("coder", "reasoning", "tools"):
+        return _bool_command(cmd, arg)
     if cmd == "model":
         return ("model", arg or None)
     return (cmd, None)
@@ -159,6 +209,9 @@ BOT_COMMANDS = {
     "history": ("history", "история", "контекст", "ctx"),
     "ping": ("ping", "пинг", "check", "чек"),
     "auto": ("auto", "авто", "danyauto", "автоответ"),
+    "coder": ("coder", "кодер"),
+    "reasoning": ("reasoning", "ризонинг", "размышления"),
+    "tools": ("tools", "инструменты"),
 }
 
 _BOT_CMD_LOOKUP = {
@@ -188,6 +241,8 @@ def handle_bot_commands(text) -> tuple[str, Any] | None:
         if low in AUTO_OFF_WORDS:
             return ("autorespond", False)
         return ("auto_status", None)
+    if cmd in ("coder", "reasoning", "tools"):
+        return _bool_command(cmd, arg)
     if cmd == "model":
         return ("model", arg or None)
     if cmd == "models":
@@ -225,6 +280,9 @@ def parse_state_data(data):
         "auto_respond": {int(x) for x in data.get("auto_respond", [])},
         "ignored_chats": {int(x) for x in data.get("ignored_chats", [])},
         "ignored_users": {int(x) for x in data.get("ignored_users", [])},
+        "coder_chats": {int(x) for x in data.get("coder_chats", [])},
+        "reasoning_hidden": {int(x) for x in data.get("reasoning_hidden", [])},
+        "tools_hidden": {int(x) for x in data.get("tools_hidden", [])},
     }
 
 
@@ -243,6 +301,9 @@ def save_state_file(path, state):
         "auto_respond": sorted(state["auto_respond"]),
         "ignored_chats": sorted(state["ignored_chats"]),
         "ignored_users": sorted(state["ignored_users"]),
+        "coder_chats": sorted(state.get("coder_chats", [])),
+        "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
+        "tools_hidden": sorted(state.get("tools_hidden", [])),
     }
     try:
         path.write_text(
@@ -289,6 +350,9 @@ _MODE_KEYS = (
     "auto_respond",
     "ignored_chats",
     "ignored_users",
+    "coder_chats",
+    "reasoning_hidden",
+    "tools_hidden",
     "chat_history",
     "ctx_lock",
     "recent_reply_ids",
@@ -365,6 +429,9 @@ def load_state_into(store, state_file):
     store.auto_respond = state["auto_respond"]
     store.ignored_chats = state["ignored_chats"]
     store.ignored_users = state["ignored_users"]
+    store.coder_chats = state["coder_chats"]
+    store.reasoning_hidden = state["reasoning_hidden"]
+    store.tools_hidden = state["tools_hidden"]
 
 
 def save_state_from(store, state_file, logger):
@@ -375,6 +442,9 @@ def save_state_from(store, state_file, logger):
             "auto_respond": store.auto_respond,
             "ignored_chats": store.ignored_chats,
             "ignored_users": store.ignored_users,
+            "coder_chats": store.coder_chats,
+            "reasoning_hidden": store.reasoning_hidden,
+            "tools_hidden": store.tools_hidden,
         },
     ):
         logger.warning("Не удалось сохранить %s", state_file.name)
@@ -414,7 +484,7 @@ async def safe_reply(event, text, attempts, recent_ids):
 async def edit_text(client, chat_id, msg_id, text, attempts):
     for _attempt in range(attempts):
         try:
-            await client.edit_message(chat_id, msg_id, text, parse_mode="html")
+            await client.edit_message(chat_id, msg_id, text)
             return True
         except FloodWaitError as e:
             await asyncio.sleep(min(e.seconds, 30))

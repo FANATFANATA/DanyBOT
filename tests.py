@@ -874,17 +874,33 @@ class RenderResponseTest(BotTestCase):
             ["web_search", "web_search", "fetch_url"],
             "ответ текста",
         )
-        self.assertIn("💭 «<i>думаю дальше</i>» 💭", text)
-        self.assertIn("🔧", text)
-        self.assertIn("<code>web_search</code> <code>fetch_url</code>", text)
-        self.assertIn("💬 «<b>ответ текста</b>» 💬", text)
+        self.assertIn("reasoning:\nдумаю дальше", text)
+        self.assertIn("tools: web_search, fetch_url", text)
+        self.assertIn("ответ текста", text)
         self.assertEqual(text.count("web_search"), 1)
 
-    def test_escapes_html(self):
-        text = userbot.render_response("", ["a<b"], ["x&y"], "c<d>e")
-        self.assertIn("a&lt;b", text)
-        self.assertIn("x&amp;y", text)
-        self.assertIn("<b>c&lt;d&gt;e</b>", text)
+    def test_plain_text_output_has_no_markup(self):
+        text = userbot.render_response("p\n\n", ["a<b"], ["x&y"], "c<d>e")
+        self.assertIn("a<b", text)
+        self.assertIn("x&y", text)
+        self.assertIn("c<d>e", text)
+        for banned in ("<i>", "<b>", "<code>", "\U0001f4ad", "\U0001f527", "\U0001f4ac"):
+            self.assertNotIn(banned, text)
+
+    def test_hide_reasoning_and_tools(self):
+        text = userbot.render_response(
+            "p\n\n", ["думаю"], ["web_search"], "ответ", False, False
+        )
+        self.assertNotIn("думаю", text)
+        self.assertNotIn("web_search", text)
+        self.assertIn("ответ", text)
+
+    def test_show_only_reasoning(self):
+        text = userbot.render_response(
+            "p\n\n", ["думаю"], ["web_search"], "ответ", True, False
+        )
+        self.assertIn("думаю", text)
+        self.assertNotIn("web_search", text)
 
     def test_no_sections_when_empty(self):
         text = userbot.render_response("prefix:\n\n", [], [], "")
@@ -2169,6 +2185,192 @@ class CoreHelpersTest(BotTestCase):
         self.assertEqual(parsed["auto_respond"], {1})
 
 
+class VisibilityCommandsTest(BotTestCase):
+    CHAT_ID = 7591254790
+
+    def test_aliases_parse(self):
+        self.assertEqual(
+            userbot.handle_commands(".db reasoning off"), ("reasoning", False)
+        )
+        self.assertEqual(userbot.handle_commands(".db tools on"), ("tools", True))
+        self.assertEqual(
+            userbot.handle_commands(".db ризонинг выкл"), ("reasoning", False)
+        )
+        self.assertEqual(
+            userbot.handle_commands(".db инструменты"), ("tools_status", None)
+        )
+        self.assertEqual(bot.handle_bot_commands("/reasoning on"), ("reasoning", True))
+        self.assertEqual(bot.handle_bot_commands("/tools off"), ("tools", False))
+        self.assertEqual(bot.handle_bot_commands("/tools"), ("tools_status", None))
+
+    def test_apply_visibility_toggle(self):
+        reasoning_hidden = set()
+        tools_hidden = set()
+        text_out, changed = core.apply_visibility_command(
+            ("reasoning", False), self.CHAT_ID, reasoning_hidden, tools_hidden
+        )
+        self.assertTrue(changed)
+        self.assertIn(self.CHAT_ID, reasoning_hidden)
+        self.assertIn("скрыты", text_out)
+        text_out, changed = core.apply_visibility_command(
+            ("reasoning", True), self.CHAT_ID, reasoning_hidden, tools_hidden
+        )
+        self.assertTrue(changed)
+        self.assertNotIn(self.CHAT_ID, reasoning_hidden)
+        self.assertIn("показаны", text_out)
+
+    def test_apply_visibility_status_does_not_change(self):
+        reasoning_hidden = {self.CHAT_ID}
+        tools_hidden = set()
+        text_out, changed = core.apply_visibility_command(
+            ("reasoning_status", None), self.CHAT_ID, reasoning_hidden, tools_hidden
+        )
+        self.assertFalse(changed)
+        self.assertIn("скрыты", text_out)
+        text_out, changed = core.apply_visibility_command(
+            ("tools_status", None), self.CHAT_ID, reasoning_hidden, tools_hidden
+        )
+        self.assertFalse(changed)
+        self.assertIn("показаны", text_out)
+
+    def test_make_render_hides_sections(self):
+        def inner(prefix, reasoning, tools, answer, show_reasoning, show_tools):
+            reason = "".join(reasoning) if show_reasoning else "-"
+            calls = ",".join(tools) if show_tools else "-"
+            return f"{prefix}|{reason}|{calls}|{answer}"
+
+        render = core.make_render(inner, {self.CHAT_ID}, set(), self.CHAT_ID)
+        self.assertEqual(render("p", ["r"], ["t"], "a"), "p|-|t|a")
+        render = core.make_render(inner, set(), {self.CHAT_ID}, self.CHAT_ID)
+        self.assertEqual(render("p", ["r"], ["t"], "a"), "p|r|-|a")
+
+    def test_visibility_persisted_in_state(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_vis_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state_file = tmp / "state_userbot.json"
+        core.save_state_file(
+            state_file,
+            {
+                "model_overrides": {},
+                "auto_respond": set(),
+                "ignored_chats": set(),
+                "ignored_users": set(),
+                "coder_chats": {1},
+                "reasoning_hidden": {2},
+                "tools_hidden": {3},
+            },
+        )
+        parsed = core.load_state_file(state_file)
+        if parsed is None:
+            self.fail("state file did not parse")
+        self.assertEqual(parsed["coder_chats"], {1})
+        self.assertEqual(parsed["reasoning_hidden"], {2})
+        self.assertEqual(parsed["tools_hidden"], {3})
+
+
+class CoderModeTest(BotTestCase):
+    CHAT_ID = 7591254790
+
+    def test_aliases_parse(self):
+        self.assertEqual(userbot.handle_commands(".db coder on"), ("coder", True))
+        self.assertEqual(userbot.handle_commands(".db кодер выкл"), ("coder", False))
+        self.assertEqual(userbot.handle_commands(".db coder"), ("coder_status", None))
+        self.assertEqual(bot.handle_bot_commands("/coder off"), ("coder", False))
+        self.assertEqual(bot.handle_bot_commands("/coder"), ("coder_status", None))
+
+    def test_coder_tools_are_agentic(self):
+        names = {t["function"]["name"] for t in tools_module.CODER_TOOLS}
+        self.assertEqual(
+            names,
+            {
+                "read_file",
+                "write_file",
+                "edit_file",
+                "list_dir",
+                "search_files",
+                "run_shell",
+                "web_search",
+                "fetch_url",
+                "get_time",
+            },
+        )
+        telegram_names = {
+            "send_message",
+            "edit_message",
+            "delete_message",
+            "forward_message",
+            "pin_message",
+            "create_poll",
+            "list_chats",
+            "react_to_message",
+        }
+        self.assertFalse(names & telegram_names)
+
+    def test_subagents_get_no_coder_tools(self):
+        names = {t["function"]["name"] for t in subagents._select_tools(None)}
+        self.assertNotIn("run_subagent", names)
+        self.assertFalse(names & set(tools_module.FILE_TOOL_NAMES))
+
+    def test_is_coder_flag(self):
+        saved = set(userbot.coder_chats)
+        userbot.coder_chats.clear()
+        self.addCleanup(userbot.coder_chats.clear)
+        self.addCleanup(userbot.coder_chats.update, saved)
+        self.assertFalse(userbot.is_coder(self.CHAT_ID))
+        userbot.coder_chats.add(self.CHAT_ID)
+        self.assertTrue(userbot.is_coder(self.CHAT_ID))
+
+    def test_paths_are_confined_to_root(self):
+        inside, err = tools_module._resolve_path("DanyBOT/tools.py")
+        self.assertEqual(err, "")
+        self.assertTrue(str(inside).startswith(str(tools_module.CODER_ROOT)))
+        outside, err2 = tools_module._resolve_path("/etc/passwd")
+        self.assertIsNone(outside)
+        self.assertIn("вне разрешённого корня", err2)
+        escaped, err3 = tools_module._resolve_path("../etc/passwd")
+        self.assertIsNone(escaped)
+        self.assertIn("вне разрешённого корня", err3)
+
+    def test_file_tools_roundtrip(self):
+        tmp = tools_module.CODER_ROOT / ".coder_selftest"
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = ".coder_selftest/note.txt"
+        written = asyncio.run(
+            userbot.execute_tool(
+                "write_file", {"path": target, "content": "alpha\nbeta\n"}, -100
+            )
+        )
+        self.assertIn("Создан", written)
+        read = asyncio.run(userbot.execute_tool("read_file", {"path": target}, -100))
+        self.assertIn("1|alpha", read)
+        edited = asyncio.run(
+            userbot.execute_tool(
+                "edit_file",
+                {"path": target, "old_string": "beta", "new_string": "gamma"},
+                -100,
+            )
+        )
+        self.assertIn("Изменён", edited)
+        found = asyncio.run(
+            userbot.execute_tool(
+                "search_files", {"pattern": "gamma", "path": ".coder_selftest"}, -100
+            )
+        )
+        self.assertIn("note.txt:2", found)
+        listed = asyncio.run(
+            userbot.execute_tool("list_dir", {"path": ".coder_selftest"}, -100)
+        )
+        self.assertIn("note.txt", listed)
+        missing = asyncio.run(
+            userbot.execute_tool("read_file", {"path": "/etc/passwd"}, -100)
+        )
+        self.assertIn("вне разрешённого корня", missing)
+
+    def test_creator_info_exposed(self):
+        self.assertIn("Создатель", userbot.CREATOR_INFO)
+        self.assertTrue(userbot.CREATOR_ID)
+
+
 class UserbotHelpersTest(BotTestCase):
     def test_register_sender_and_is_unrestricted(self):
         saved = userbot.OWNER_IDS
@@ -2189,8 +2391,14 @@ class UserbotHelpersTest(BotTestCase):
         self.assertEqual(userbot.model_for(1), "custom")
 
     def test_system_for(self):
-        self.assertEqual(userbot.system_for(1), userbot.SYSTEM_PROMPT)
-        self.assertEqual(userbot.system_for(1, mode="bot"), userbot.SYSTEM_PROMPT_BOT)
+        self.assertTrue(userbot.system_for(1).startswith(userbot.SYSTEM_PROMPT))
+        self.assertTrue(
+            userbot.system_for(1, mode="bot").startswith(userbot.SYSTEM_PROMPT_BOT)
+        )
+        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(1))
+        self.assertTrue(
+            userbot.system_for(1, mode="coder").startswith(userbot.CODER_SYSTEM_PROMPT)
+        )
 
     def test_make_session_plain(self):
         self.assertEqual(userbot.make_session("plain"), "plain")

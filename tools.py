@@ -5,8 +5,10 @@ import datetime
 import html
 import json
 import math
+import os
 import re
 import urllib.parse
+from pathlib import Path
 from typing import Any, cast
 
 import httpx
@@ -40,6 +42,27 @@ SAFE_CONSTS = {
     "pi": math.pi,
     "e": math.e,
 }
+
+CODER_ROOT = Path(os.getenv("CODER_ROOT", "/root")).expanduser().resolve()
+MAX_WRITE_BYTES = 500_000
+MAX_LIST_ENTRIES = 500
+MAX_SEARCH_RESULTS = 200
+MAX_SEARCH_FILES = 4000
+
+
+def _resolve_path(raw, root=None):
+    base = (root or CODER_ROOT).resolve()
+    candidate = Path(str(raw).strip() if raw else ".")
+    if not candidate.is_absolute():
+        candidate = base / candidate
+    candidate = Path(os.path.normpath(str(candidate)))
+    try:
+        resolved = candidate.resolve()
+    except (OSError, RuntimeError):
+        return None, "Не удалось разрешить путь."
+    if resolved != base and base not in resolved.parents:
+        return None, f"Путь вне разрешённого корня: {base}"
+    return resolved, ""
 
 
 def _clip(text: str, limit: int) -> str:
@@ -127,7 +150,7 @@ def _str_arg(arguments, key, default=""):
     return str(arguments.get(key, default)).strip()
 
 
-def _format_messages(msgs, limit):
+def _format_messages(msgs):
     lines = []
     for m in reversed(list(msgs)):
         sender = getattr(m, "sender_id", None)
@@ -146,33 +169,38 @@ async def _get_messages(client, chat, limit, error_msg, empty_msg, query=None):
         return f"{error_msg}{exc}"
     if not msgs:
         return empty_msg
-    return _format_messages(msgs, limit)
+    return _format_messages(msgs)
 
 
-def render_response(prefix, reasoning_parts, tool_parts, full_answer):
-    reasoning = _clip("".join(reasoning_parts), 3000)
+def render_response(
+    prefix,
+    reasoning_parts,
+    tool_parts,
+    full_answer,
+    show_reasoning=True,
+    show_tools=True,
+):
+    reasoning = _clip("".join(reasoning_parts), 3000) if show_reasoning else ""
     answer = _clip(full_answer, 3000)
-    blocks = []
+    parts = []
     if reasoning:
-        blocks.append(("reasoning", f"💭 «<i>{html.escape(reasoning)}</i>» 💭"))
-    seen = []
-    for tool in tool_parts:
-        if tool not in seen:
-            seen.append(tool)
-    if seen:
-        body = " ".join(f"<code>{html.escape(tool)}</code>" for tool in seen)
-        blocks.append(("tools", f"🔧 [ {body} ] 🔧"))
+        parts.append(f"reasoning:\n{reasoning}")
+    if show_tools:
+        seen = []
+        for tool in tool_parts:
+            if tool not in seen:
+                seen.append(tool)
+        if seen:
+            parts.append("tools: " + ", ".join(seen))
     if answer:
-        blocks.append(("answer", f"💬 «<b>{html.escape(answer)}</b>» 💬"))
-    parts = [text for _kind, text in blocks]
+        parts.append(answer)
     text = prefix + "\n\n".join(parts)
     if len(text) > 4000:
-        for drop in (1, 0):
+        for drop in (0, 1):
             if drop < len(parts):
                 kept = [p for i, p in enumerate(parts) if i != drop]
                 candidate = prefix + "\n\n".join(kept)
                 if len(candidate) <= 4000:
-                    parts = kept
                     text = candidate
                     break
     if len(text) > 4000:
@@ -180,7 +208,7 @@ def render_response(prefix, reasoning_parts, tool_parts, full_answer):
     return text
 
 
-TOOLS = [
+TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
@@ -319,6 +347,10 @@ TOOLS = [
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                    "cwd": {
+                        "type": "string",
+                        "description": "Рабочий каталог внутри разрешённого корня",
+                    },
                 },
                 "required": ["command"],
             },
@@ -566,6 +598,109 @@ TOOLS = [
 ]
 
 
+FILE_TOOL_NAMES = (
+    "read_file",
+    "write_file",
+    "edit_file",
+    "list_dir",
+    "search_files",
+)
+
+FILE_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Прочитать текстовый файл с нумерацией строк",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": "integer", "minimum": 1},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 5000},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Записать файл целиком, создав каталоги при необходимости",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["path", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Заменить фрагмент текста в файле",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_string": {"type": "string"},
+                    "new_string": {"type": "string"},
+                    "replace_all": {"type": "boolean"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "Показать содержимое каталога",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": "Найти строки по регулярному выражению в файлах",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "glob": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+]
+
+
+CODER_TOOL_NAMES = (
+    *FILE_TOOL_NAMES,
+    "run_shell",
+    "web_search",
+    "fetch_url",
+    "get_time",
+)
+
+CODER_TOOLS: list[dict[str, Any]] = [
+    item for item in [*FILE_TOOLS, *TOOLS] if item["function"]["name"] in CODER_TOOL_NAMES
+]
+
+SUBAGENT_EXCLUDED_TOOLS = frozenset({"run_subagent", *FILE_TOOL_NAMES})
+
+
 async def _tool_get_chat_history(arguments, chat_id, client, stats):
     limit = _int_arg(arguments, "limit", 20, 1, 100)
     return await _get_messages(
@@ -698,8 +833,17 @@ async def _tool_run_shell(arguments, chat_id, client, stats):
     if not command:
         return "Пустая команда."
     timeout = _int_arg(arguments, "timeout", 30, 1, 120)
+    workdir = None
+    raw_cwd = _str_arg(arguments, "cwd")
+    if raw_cwd:
+        workdir, err = _resolve_path(raw_cwd)
+        if err or workdir is None:
+            return err
+        if not workdir.is_dir():
+            return f"Каталог не найден: {workdir}"
     proc = await asyncio.create_subprocess_shell(
         command,
+        cwd=str(workdir) if workdir else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -718,8 +862,6 @@ async def _tool_run_shell(arguments, chat_id, client, stats):
         result += f"\nstderr:\n{err}"
     return result[:4000]
 
-
-_asyncio_gather = asyncio.gather
 
 _httpx_singleton = None
 
@@ -1003,6 +1145,144 @@ async def _tool_run_subagent(arguments, chat_id, client, stats):
     return json.dumps(results, ensure_ascii=False)[:8000]
 
 
+async def _tool_read_file(arguments, chat_id, client, stats):
+    path, err = _resolve_path(arguments.get("path"))
+    if err or path is None:
+        return err
+    if not path.exists():
+        return f"Файл не найден: {path}"
+    if path.is_dir():
+        return f"Это каталог: {path}. Используй list_dir."
+    offset = _int_arg(arguments, "offset", 1, 1, 10**9)
+    limit = _int_arg(arguments, "limit", 400, 1, 5000)
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+    except (OSError, ValueError) as exc:
+        return f"Ошибка чтения: {exc}"
+    lines = raw.splitlines()
+    total = len(lines)
+    start = min(offset, total + 1)
+    chunk = lines[start - 1 : start - 1 + limit]
+    head = f"{path} | строк {total} | показано {len(chunk)} с {start}"
+    if not chunk:
+        return f"{head}\n(пусто)"
+    body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
+    return f"{head}\n{body}"
+
+
+async def _tool_write_file(arguments, chat_id, client, stats):
+    path, err = _resolve_path(arguments.get("path"))
+    if err or path is None:
+        return err
+    content = str(arguments.get("content", ""))
+    if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
+        return f"Слишком большой объём: {len(content.encode('utf-8'))} байт"
+    if path.is_dir():
+        return f"Это каталог: {path}"
+    existed = path.exists()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return f"Ошибка записи: {exc}"
+    action = "Перезаписан" if existed else "Создан"
+    return f"{action}: {path} ({len(content)} символов)"
+
+
+async def _tool_edit_file(arguments, chat_id, client, stats):
+    path, err = _resolve_path(arguments.get("path"))
+    if err or path is None:
+        return err
+    if not path.is_file():
+        return f"Файл не найден: {path}"
+    old = str(arguments.get("old_string", ""))
+    new = str(arguments.get("new_string", ""))
+    if not old:
+        return "Пустой old_string."
+    if old == new:
+        return "old_string и new_string совпадают."
+    replace_all = bool(arguments.get("replace_all", False))
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return f"Ошибка чтения: {exc}"
+    count = raw.count(old)
+    if count == 0:
+        return "Фрагмент не найден."
+    if count > 1 and not replace_all:
+        return f"Фрагмент встречается {count} раз, уточни old_string или replace_all."
+    updated = raw.replace(old, new) if replace_all else raw.replace(old, new, 1)
+    try:
+        path.write_text(updated, encoding="utf-8")
+    except (OSError, ValueError) as exc:
+        return f"Ошибка записи: {exc}"
+    return f"Изменён: {path} (замен {count if replace_all else 1})"
+
+
+async def _tool_list_dir(arguments, chat_id, client, stats):
+    path, err = _resolve_path(arguments.get("path", "."))
+    if err or path is None:
+        return err
+    if not path.exists():
+        return f"Каталог не найден: {path}"
+    if path.is_file():
+        return f"Это файл: {path}. Используй read_file."
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+    except OSError as exc:
+        return f"Ошибка чтения каталога: {exc}"
+    rows = []
+    for entry in entries[:MAX_LIST_ENTRIES]:
+        try:
+            rows.append(f"{entry.name}/" if entry.is_dir() else f"{entry.name} ({entry.stat().st_size})")
+        except OSError:
+            rows.append(entry.name)
+    head = f"{path} | элементов {len(entries)}"
+    if len(entries) > MAX_LIST_ENTRIES:
+        head += f", показано {MAX_LIST_ENTRIES}"
+    if not rows:
+        return f"{head}\n(пусто)"
+    return head + "\n" + "\n".join(rows)
+
+
+async def _tool_search_files(arguments, chat_id, client, stats):
+    pattern = _str_arg(arguments, "pattern")
+    if not pattern:
+        return "Пустой pattern."
+    path, err = _resolve_path(arguments.get("path", "."))
+    if err or path is None:
+        return err
+    if not path.exists():
+        return f"Путь не найден: {path}"
+    glob_pat = _str_arg(arguments, "glob") or "*"
+    limit = _int_arg(arguments, "limit", 60, 1, MAX_SEARCH_RESULTS)
+    try:
+        rx = re.compile(pattern)
+    except re.error as exc:
+        return f"Некорректное выражение: {exc}"
+    candidates = [path] if path.is_file() else sorted(path.rglob(glob_pat))
+    matches = []
+    scanned = 0
+    for item in candidates:
+        if len(matches) >= limit or scanned >= MAX_SEARCH_FILES:
+            break
+        if not item.is_file():
+            continue
+        scanned += 1
+        try:
+            text = item.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+        for idx, line in enumerate(text.splitlines(), start=1):
+            if rx.search(line):
+                matches.append(f"{item}:{idx}: {line.strip()[:200]}")
+                if len(matches) >= limit:
+                    break
+    if not matches:
+        return "Совпадений не найдено."
+    return "\n".join(matches)
+
+
 _HANDLERS = {
     "get_chat_history": _tool_get_chat_history,
     "list_chats": _tool_list_chats,
@@ -1031,6 +1311,11 @@ _HANDLERS = {
     "text_stats": _tool_text_stats,
     "get_bot_stats": _tool_get_bot_stats,
     "run_subagent": _tool_run_subagent,
+    "read_file": _tool_read_file,
+    "write_file": _tool_write_file,
+    "edit_file": _tool_edit_file,
+    "list_dir": _tool_list_dir,
+    "search_files": _tool_search_files,
 }
 
 

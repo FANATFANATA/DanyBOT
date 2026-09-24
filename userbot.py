@@ -1,6 +1,5 @@
 import asyncio
 import contextlib
-import html
 import json
 import logging
 import os
@@ -103,6 +102,40 @@ COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
 SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
 
+CODER_SYSTEM_PROMPT = os.getenv(
+    "CODER_SYSTEM_PROMPT",
+    "Ты — DanyBOT в режиме кодера. Работаешь как агент: доступны файловые "
+    "операции read_file, write_file, edit_file, list_dir, search_files, "
+    "run_shell, web_search, fetch_url. Действуй по шагам, проверяй результат "
+    "инструментами, не выдумывай содержимое файлов. Отвечай кратко и по делу "
+    "на языке последнего сообщения.",
+)
+
+CREATOR_NAME = _env_str("CREATOR_NAME", "")
+CREATOR_USERNAME = _env_str("CREATOR_USERNAME", "")
+CREATOR_ID = _env_str("CREATOR_ID", "")
+CREATOR_PHONE = _env_str("CREATOR_PHONE", "")
+CREATOR_EXTRA = _env_str("CREATOR_EXTRA", "")
+
+
+def _build_creator_info():
+    fields = (CREATOR_NAME, CREATOR_USERNAME, CREATOR_ID, CREATOR_PHONE)
+    if not any(fields):
+        return CREATOR_EXTRA
+    label = CREATOR_NAME or CREATOR_USERNAME or "неизвестен"
+    line = f"Создатель и владелец: {label}"
+    if CREATOR_USERNAME:
+        line += f", @{CREATOR_USERNAME}"
+    if CREATOR_ID:
+        line += f", id {CREATOR_ID}"
+    if CREATOR_PHONE:
+        line += f", телефон {CREATOR_PHONE}"
+    line += "."
+    return f"{line} {CREATOR_EXTRA}".strip() if CREATOR_EXTRA else line
+
+
+CREATOR_INFO = _build_creator_info()
+
 ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
 ENABLE_BOT = _env_bool("ENABLE_BOT", False)
 BOT_TOKEN = _env_str("BOT_TOKEN", "")
@@ -181,6 +214,9 @@ model_overrides: dict[int, str] = {}
 auto_respond: set[int] = set()
 ignored_chats: set[int] = set()
 ignored_users: set[int] = set()
+coder_chats: set[int] = set()
+reasoning_hidden: set[int] = set()
+tools_hidden: set[int] = set()
 
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
@@ -247,13 +283,26 @@ def model_for(chat_id):
 
 
 def system_for(chat_id, mode="userbot"):
-    base = SYSTEM_PROMPT_BOT if mode == "bot" else SYSTEM_PROMPT
+    if mode == "coder":
+        base = CODER_SYSTEM_PROMPT
+    elif mode == "bot":
+        base = SYSTEM_PROMPT_BOT
+    else:
+        base = SYSTEM_PROMPT
+    parts = [base]
+    if CREATOR_INFO:
+        parts.append(CREATOR_INFO)
     if EXTRA_SYSTEM:
-        return f"{base}\n\n{EXTRA_SYSTEM}"
-    return base
+        parts.append(EXTRA_SYSTEM)
+    return "\n\n".join(parts)
+
+
+def is_coder(chat_id):
+    return chat_id in coder_chats
 
 
 TOOLS = tools_module.TOOLS
+CODER_TOOLS = tools_module.CODER_TOOLS
 safe_eval = tools_module.safe_eval
 render_response = tools_module.render_response
 
@@ -565,6 +614,11 @@ HELP_TEXT = (
     ".danybot ping — статус / status\n"
     ".danybot ignore / unignore — заглушить/разглушить чат / mute/unmute "
     "chat\n"
+    ".danybot coder on/off — режим кодера, только владелец / coder mode, "
+    "owner only\n"
+    ".danybot reasoning on/off — показ рассуждений / show reasoning\n"
+    ".danybot tools on/off — показ вызовов инструментов / show tool calls\n"
+    ".danybot creator — создатель / creator\n"
     ".danybot help — эта справка / this help\n\n"
     "Авто-ответ / Auto-reply: .danyauto on/off (.da .auto .авто)"
 )
@@ -597,6 +651,49 @@ async def handler(event: Any):
         command = handle_commands(text)
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         command = None
+
+    if command and command[0] == "creator":
+        await safe_reply(event, CREATOR_INFO or "Создатель не задан.")
+        return
+
+    if command and command[0] in ("coder", "coder_status"):
+        if sender_id not in OWNER_IDS:
+            await safe_reply(event, "Кодер-режим доступен только владельцу.")
+            return
+        if command[0] == "coder_status":
+            state = "ON" if is_coder(chat_id) else "OFF"
+            await safe_reply(event, f"Кодер-режим / Coder mode: {state}")
+            return
+        async with ctx_lock:
+            if command[1]:
+                coder_chats.add(chat_id)
+            else:
+                coder_chats.discard(chat_id)
+        save_state()
+        if command[1]:
+            names = ", ".join(t["function"]["name"] for t in CODER_TOOLS)
+            await safe_reply(
+                event,
+                "Кодер-режим ВКЛ. Телеграм-функции отключены.\n"
+                f"Инструменты: {names}\n"
+                f"Корень: {tools_module.CODER_ROOT}\n"
+                "Выключить: .db coder off",
+            )
+        else:
+            await safe_reply(event, "Кодер-режим ВЫКЛ.")
+        return
+
+    if command and command[0] in core.VISIBILITY_COMMANDS:
+        if sender_id not in OWNER_IDS:
+            await safe_reply(event, "Переключение доступно только владельцу.")
+            return
+        text_out, changed = core.apply_visibility_command(
+            command, chat_id, reasoning_hidden, tools_hidden
+        )
+        if changed:
+            save_state()
+        await safe_reply(event, text_out)
+        return
 
     if command and command[0] == "unignore":
         async with ctx_lock:
@@ -652,7 +749,9 @@ async def handler(event: Any):
         HISTORY_SAVER.mark_dirty,
     )
 
-    if triggered:
+    coder_active = is_coder(chat_id) and sender_id in OWNER_IDS
+
+    if triggered or coder_active:
         effective_trigger = True
     elif not is_self:
         effective_trigger = chat_id in auto_respond or AUTO_RESPOND_GLOBAL
@@ -693,13 +792,15 @@ async def handler(event: Any):
         prompt = prompt[:MAX_REQUEST_LEN]
 
     model = model_for(chat_id)
+    mode = "coder" if coder_active else "userbot"
+    system_fn = lambda cid: system_for(cid, mode=mode)
     if is_private:
         hist, messages = await core.prepare_messages(
             STORE,
             chat_id,
             DM_HISTORY_LIMIT,
             GROUP_HISTORY_LIMIT,
-            system_for,
+            system_fn,
         )
     else:
         label = await get_sender_label(event)
@@ -712,11 +813,11 @@ async def handler(event: Any):
             chat_id,
             DM_HISTORY_LIMIT,
             GROUP_HISTORY_LIMIT,
-            system_for,
+            system_fn,
         )
 
     if is_self:
-        prefix = f"{html.escape(text)}\n\n{model}:\n\n"
+        prefix = f"{text}\n\n{model}:\n\n"
         self_edit_id = msg_id
     else:
         prefix = f"{model}:\n\n"
@@ -732,13 +833,15 @@ async def handler(event: Any):
             model,
             prefix,
             self_edit_id,
-            render_response,
+            core.make_render(
+                render_response, reasoning_hidden, tools_hidden, chat_id
+            ),
             edit_text,
             safe_reply,
             cast(Any, get_client().action(chat_id, "typing")),
             stream_with_tools,
             None,
-            None,
+            CODER_TOOLS if coder_active else TOOLS,
             EDIT_INTERVAL,
             sender_id,
         )
