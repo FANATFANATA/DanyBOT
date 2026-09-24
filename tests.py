@@ -1777,6 +1777,21 @@ class ExtraToolsTest(BotTestCase):
         self.assertIn("Title", out)
         self.assertIn("https://ex.com", out)
 
+    def test_web_search_brave_html(self):
+        html = (
+            '<div class="snippet svelte-x" data-pos="0" data-type="web">'
+            '<a href="https://docs.python.org/3/whatsnew/3.14.html">'
+            '<div class="title search-snippet-title">Python 3.14 docs</div></a>'
+            '<div class="generic-snippet">Release highlights</div></div>'
+        )
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)
+        ):
+            out = self._run("web_search", {"query": "python 3.14"})
+        self.assertIn("Python 3.14 docs", out)
+        self.assertIn("https://docs.python.org/3/whatsnew/3.14.html", out)
+        self.assertIn("Release highlights", out)
+
     def test_web_search_no_results(self):
         with mock.patch.object(
             tools_module, "_get_httpx_client", lambda: _FakeHttpx("<html></html>")

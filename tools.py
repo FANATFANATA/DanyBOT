@@ -4,6 +4,7 @@ import contextlib
 import datetime
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -21,6 +22,8 @@ from telethon.tl.types import (
     PollAnswer,
     ReactionEmoji,
 )
+
+logger = logging.getLogger("danybot.tools")
 
 SAFE_FUNCS = {
     "abs": abs,
@@ -872,10 +875,73 @@ def _get_httpx_client():
         _httpx_singleton = httpx.AsyncClient(
             timeout=30,
             follow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0"},
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+                ),
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
         )
     return _httpx_singleton
+
+
+BRAVE_SEARCH_URL = "https://search.brave.com/search"
+DDG_SEARCH_URL = "https://duckduckgo.com/html/"
+
+_BRAVE_START = re.compile(r'<div class="snippet[^"]*"[^>]*data-type="web"')
+_BRAVE_HREF = re.compile(r'<a href="(https?://[^"]+)"')
+_BRAVE_TITLE = re.compile(r'class="title[^"]*"[^>]*>(.*?)</div>', re.DOTALL)
+_BRAVE_DESC = re.compile(r'class="generic-snippet[^"]*"[^>]*>(.*?)</div>', re.DOTALL)
+_DDG_RESULT = re.compile(
+    r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
+    re.DOTALL,
+)
+
+
+def _strip_tags(value):
+    return html.unescape(re.sub(r"<[^>]+>", "", value)).strip()
+
+
+def _brave_blocks(text):
+    starts = [m.start() for m in _BRAVE_START.finditer(text)]
+    for index, start in enumerate(starts):
+        end = starts[index + 1] if index + 1 < len(starts) else len(text)
+        yield text[start:end]
+
+
+def _parse_brave(text, limit):
+    results = []
+    for block in _brave_blocks(text):
+        match = _BRAVE_HREF.search(block)
+        if not match:
+            continue
+        href = match.group(1)
+        title = _BRAVE_TITLE.search(block)
+        desc = _BRAVE_DESC.search(block)
+        lines = [_strip_tags(title.group(1)) if title else "", href]
+        if desc:
+            lines.append(_strip_tags(desc.group(1)))
+        chunk = "\n".join(line for line in lines if line)
+        if chunk:
+            results.append(chunk)
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _parse_ddg(text, limit):
+    results = []
+    for href, title in _DDG_RESULT.findall(text):
+        clean = _strip_tags(title)
+        if "uddg=" in href:
+            parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
+            href = parsed.get("uddg", [href])[0]
+        results.append(f"{clean}\n{href}")
+        if len(results) >= limit:
+            break
+    return results
 
 
 async def _tool_web_search(arguments, chat_id, client, stats):
@@ -883,34 +949,23 @@ async def _tool_web_search(arguments, chat_id, client, stats):
     if not query:
         return "Пустой запрос."
     limit = _int_arg(arguments, "limit", 5, 1, 10)
-    try:
-        hc = _get_httpx_client()
-        resp = await hc.get(
-            "https://duckduckgo.com/html/",
-            params={"q": query},
-            timeout=20,
-        )
-        resp.raise_for_status()
-        text = resp.text
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        return f"Ошибка поиска: {exc}"
-    results = []
-    pattern = re.compile(
-        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>',
-        re.DOTALL,
-    )
-    for href, title in pattern.findall(text):
-        title_clean = re.sub(r"<[^>]+>", "", title).strip()
-        title_clean = html.unescape(title_clean)
-        if "uddg=" in href:
-            parsed = urllib.parse.parse_qs(urllib.parse.urlparse(href).query)
-            href = parsed.get("uddg", [href])[0]
-        results.append(f"{title_clean}\n{href}")
-        if len(results) >= limit:
-            break
-    if not results:
-        return "Ничего не найдено."
-    return "\n\n".join(results)
+    hc = _get_httpx_client()
+    errors = []
+    for url, parser in ((BRAVE_SEARCH_URL, _parse_brave), (DDG_SEARCH_URL, _parse_ddg)):
+        try:
+            resp = await hc.get(url, params={"q": query}, timeout=20)
+            resp.raise_for_status()
+        except (httpx.HTTPError, OSError, ValueError) as exc:
+            errors.append(f"{url}: {exc}")
+            continue
+        results = parser(resp.text, limit)
+        if results:
+            return "\n\n".join(results)
+        errors.append(f"{url}: пустая выдача")
+    logger.warning("web_search без результатов: %s", "; ".join(errors))
+    if len(errors) == 2 and all("пустая выдача" not in e for e in errors):
+        return f"Ошибка поиска: {errors[0]}"
+    return "Ничего не найдено."
 
 
 async def _tool_fetch_url(arguments, chat_id, client, stats):
