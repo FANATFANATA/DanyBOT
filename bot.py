@@ -7,7 +7,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, cast
 
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
 from telethon.errors import AuthKeyError, RPCError
 from telethon.sessions import StringSession
 from telethon.tl import functions, types
@@ -72,19 +72,13 @@ def _strip_mention(text):
 
 
 BOT_HELP_TEXT = (
-    "DanyBOT — команды / commands:\n"
-    "/help /start — справка / help\n"
-    "/model <id> — сменить модель / set model\n"
-    "/models — список моделей / list models\n"
-    "/clear — очистить контекст / clear context\n"
-    "/history — размер контекста / context size\n"
-    "/ping — статус / status\n"
-    "/auto on|off — авто-ответ / auto-reply\n"
-    "/reasoning on|off — показ рассуждений / show reasoning\n"
-    "/tools on|off — показ вызовов инструментов / show tool calls\n"
-    "/coder on|off — кодер-режим, только владелец / coder mode, owner only\n"
-    "/prompt — системный промпт, только владелец / system prompt, owner only\n\n"
+    "DanyBOT - команды / commands:\n"
+    "/help /start - справка / help\n"
+    "/settings - настройки, инлайн-меню / settings, inline menu\n\n"
+    "Модель, авто-ответ, рассуждения, инструменты, кодер-режим, очистка\n"
+    "контекста и системный промпт - в меню /settings.\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
+
 )
 
 
@@ -223,6 +217,16 @@ async def handler(event: Any):
             return
         mode = "coder" if coder_active_for(sender_id, chat_id) else "bot"
         await safe_reply(event, userbot.system_prompt_report(chat_id, mode=mode))
+        return
+
+    if command and command[0] == "settings":
+        if sender_id not in userbot.OWNER_IDS:
+            await safe_reply(event, "Настройки доступны только владельцу.")
+            return
+        try:
+            await event.reply(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+        except (RPCError, OSError, ValueError, TypeError):
+            logger.exception("Бот: не удалось отправить меню настроек")
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:
@@ -398,6 +402,129 @@ async def handler(event: Any):
         )
 
 
+def _settings_rows(chat_id):
+    auto_state = "вкл"
+    if not (chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL):
+        auto_state = "выкл"
+    reasoning_state = "видно"
+    if chat_id in reasoning_hidden:
+        reasoning_state = "скрыто"
+    tools_state = "видно"
+    if chat_id in tools_hidden:
+        tools_state = "скрыто"
+    coder_state = "выкл"
+    if is_coder(chat_id):
+        coder_state = "вкл"
+    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+    rows = [
+        [Button.inline(f"Модель: {current}", b"settings:model")],
+        [Button.inline(f"Авто-ответ: {auto_state}", b"settings:auto")],
+        [Button.inline(f"Рассуждения: {reasoning_state}", b"settings:reasoning")],
+        [Button.inline(f"Инструменты: {tools_state}", b"settings:tools")],
+        [Button.inline(f"Кодер-режим: {coder_state}", b"settings:coder")],
+        [Button.inline("Очистить контекст", b"settings:clear")],
+        [Button.inline("Системный промпт", b"settings:prompt")],
+    ]
+    return rows
+
+
+def _model_rows(chat_id):
+    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+    rows = []
+    for name in userbot.MODELS[:20]:
+        marker = " *" if name == current else ""
+        rows.append(
+            [Button.inline(f"{name}{marker}", f"settings:pick:{name}".encode("utf-8"))]
+        )
+    rows.append([Button.inline("Назад", b"settings:main")])
+    return rows
+
+
+def _settings_text(chat_id):
+    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+    ctx_len = len(chat_history.get(chat_id, deque()))
+    return (
+        "Настройки / Settings\n"
+        f"Модель / Model: {current}\n"
+        f"Контекст / Context: {ctx_len}"
+    )
+
+
+async def callback_handler(event: Any):
+    chat_id = event.chat_id
+    if chat_id is None:
+        return
+    if event.sender_id not in userbot.OWNER_IDS:
+        await event.answer("Настройки доступны только владельцу.", alert=True)
+        return
+    raw = (event.data or b"").decode("utf-8", errors="replace")
+    parts = raw.split(":", 2)
+    action = parts[1].strip() if len(parts) > 1 else ""
+    arg = parts[2].strip() if len(parts) > 2 else ""
+    if action == "auto":
+        async with ctx_lock:
+            if chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL:
+                auto_respond.discard(chat_id)
+            else:
+                auto_respond.add(chat_id)
+        save_state()
+    elif action == "reasoning":
+        async with ctx_lock:
+            if chat_id in reasoning_hidden:
+                reasoning_hidden.discard(chat_id)
+            else:
+                reasoning_hidden.add(chat_id)
+        save_state()
+    elif action == "tools":
+        async with ctx_lock:
+            if chat_id in tools_hidden:
+                tools_hidden.discard(chat_id)
+            else:
+                tools_hidden.add(chat_id)
+        save_state()
+    elif action == "coder":
+        async with ctx_lock:
+            if chat_id in coder_chats:
+                coder_chats.discard(chat_id)
+            else:
+                coder_chats.add(chat_id)
+        save_state()
+    elif action == "clear":
+        limit = userbot.GROUP_HISTORY_LIMIT
+        if chat_id > 0:
+            limit = userbot.DM_HISTORY_LIMIT
+        async with ctx_lock:
+            chat_history[chat_id] = deque(maxlen=limit)
+        save_history()
+    elif action == "pick" and arg:
+        async with ctx_lock:
+            model_overrides[chat_id] = arg
+        save_state()
+        await event.answer("Модель обновлена.")
+        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
+            await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+        return
+    elif action == "model":
+        await event.answer("Выбор модели.")
+        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
+            await event.edit("Модель / Model:", buttons=_model_rows(chat_id))
+        return
+    elif action == "main":
+        await event.answer()
+        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
+            await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+        return
+    elif action == "prompt":
+        mode = "coder" if coder_active_for(event.sender_id, chat_id) else "bot"
+        await safe_reply(event, userbot.system_prompt_report(chat_id, mode=mode))
+    else:
+        await event.answer("Неизвестное действие.", alert=True)
+        return
+    await event.answer("Готово.")
+    with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
+        await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+
+
 async def start_bot():
     global bot_username, bot_id
     if not userbot.BOT_TOKEN:
@@ -412,6 +539,7 @@ async def start_bot():
 
     cli = get_bot_client()
     cli.add_event_handler(handler, events.NewMessage(incoming=None))
+    cli.add_event_handler(callback_handler, events.CallbackQuery())
 
     candidates = await proxies.get_proxy_candidates(limit=40)
     if not candidates:
@@ -439,43 +567,8 @@ async def start_bot():
                                 command="help", description="Справка / Help"
                             ),
                             types.BotCommand(
-                                command="model",
-                                description="Сменить модель / Set model",
-                            ),
-                            types.BotCommand(
-                                command="models",
-                                description="Список моделей / List models",
-                            ),
-                            types.BotCommand(
-                                command="clear",
-                                description="Очистить контекст / Clear context",
-                            ),
-                            types.BotCommand(
-                                command="history",
-                                description="Размер контекста / Context size",
-                            ),
-                            types.BotCommand(
-                                command="ping", description="Статус / Status"
-                            ),
-                            types.BotCommand(
-                                command="auto",
-                                description="Авто-ответ on/off / Auto-reply on/off",
-                            ),
-                            types.BotCommand(
-                                command="coder",
-                                description="Кодер-режим on/off / Coder mode on/off",
-                            ),
-                            types.BotCommand(
-                                command="reasoning",
-                                description="Показ рассуждений on/off / Show reasoning",
-                            ),
-                            types.BotCommand(
-                                command="tools",
-                                description="Показ вызовов инструментов on/off / Show tool calls",
-                            ),
-                            types.BotCommand(
-                                command="prompt",
-                                description="Системный промпт / System prompt",
+                                command="settings",
+                                description="Настройки / Settings",
                             ),
                         ],
                     )

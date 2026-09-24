@@ -139,6 +139,19 @@ def restore_bot_state(snap):
     userbot.MODELS = snap["MODELS"]
 
 
+def btn_data(btn):
+    data = getattr(btn, "data", None)
+    if data is None:
+        data = getattr(getattr(btn, "type", None), "data", None)
+    if isinstance(data, bytes):
+        return data.decode("utf-8")
+    return str(data)
+
+
+def rows_data(rows):
+    return {btn_data(btn) for row in rows for btn in row}
+
+
 class BotTestCase(unittest.TestCase):
     def setUp(self):
         patch_paths(self)
@@ -358,8 +371,6 @@ class HandleCommandsTest(unittest.TestCase):
         (".даниавто нет", ("autorespond", False)),
         (".bot help", ("help", None)),
         (".ai ?", ("help", None)),
-        (".db ping", ("ping", None)),
-        (".дани история", ("history", None)),
         (".данибот модели", ("models", None)),
     )
     NONE_CASES = (
@@ -1053,16 +1064,14 @@ class BotCommandsTest(BotTestCase):
         ("/модели", ("models", None)),
         ("/clear", ("clear", None)),
         ("/очистить", ("clear", None)),
-        ("/history", ("history", None)),
-        ("/история", ("history", None)),
-        ("/ping", ("ping", None)),
-        ("/пинг", ("ping", None)),
+        ("/settings", ("settings", None)),
+        ("/настройки", ("settings", None)),
         ("/auto on", ("autorespond", True)),
         ("/авто выкл", ("autorespond", False)),
         ("/auto off", ("autorespond", False)),
         ("/auto", ("auto_status", None)),
         ("/help@DanyBOTAPI_bot", ("help", None)),
-        ("  /PING  ", ("ping", None)),
+        ("  /SETTINGS  ", ("settings", None)),
     ]
 
     NONE_CASES: ClassVar[list] = [
@@ -1071,6 +1080,8 @@ class BotCommandsTest(BotTestCase):
         "/",
         "/ignore",
         "/unignore",
+        "/ping",
+        "/history",
         ".db ping",
     ]
 
@@ -1969,48 +1980,26 @@ class CoreHelpersTest(BotTestCase):
         )
         self.assertEqual(resp, ("Авто-ответ / Auto-reply: ON", False, False))
 
-    def test_handle_command_state_history(self):
-        hist = {1: deque([{"role": "user", "content": "ab"}])}
-        resp = core.handle_command_state(
-            ("history", None),
-            1,
-            True,
-            hist,
-            {},
-            set(),
-            set(),
-            set(),
-            5,
-            5,
-            False,
-            "m",
-            [],
-            "h",
-        )
-        if resp is None:
-            self.fail("resp is None")
-        self.assertIn("Messages in context: 1", resp[0])
-
-    def test_handle_command_state_ping(self):
-        resp = core.handle_command_state(
-            ("ping", None),
-            1,
-            True,
-            {},
-            {},
-            set(),
-            set(),
-            set(),
-            5,
-            5,
-            False,
-            "m",
-            [],
-            "h",
-        )
-        if resp is None:
-            self.fail("resp is None")
-        self.assertIn("Model: m", resp[0])
+    def test_handle_command_state_ping_and_history_removed(self):
+        for command in (("ping", None), ("history", None)):
+            with self.subTest(command=command):
+                resp = core.handle_command_state(
+                    command,
+                    1,
+                    True,
+                    {},
+                    {},
+                    set(),
+                    set(),
+                    set(),
+                    5,
+                    5,
+                    False,
+                    "m",
+                    [],
+                    "h",
+                )
+                self.assertIsNone(resp)
 
     def test_handle_command_state_models_and_help(self):
         resp = core.handle_command_state(
@@ -2234,12 +2223,16 @@ class ContractPromptTest(BotTestCase):
             with self.subTest(text=text):
                 self.assertEqual(bot.handle_bot_commands(text), ("prompt", None))
 
-    def test_prompt_registered_in_menu(self):
+    def test_prompt_reachable_from_settings_menu(self):
+        rows = bot._settings_rows(self.CHAT_ID)
+        data = {btn_data(btn) for row in rows for btn in row}
+        self.assertIn("settings:prompt", data)
         source = Path("bot.py").read_text(encoding="utf-8")
         menu_block = source[
             source.index("SetBotCommandsRequest") : source.index("]", source.index("SetBotCommandsRequest"))
         ]
-        self.assertIn('command="prompt"', menu_block)
+        self.assertIn('command="settings"', menu_block)
+        self.assertNotIn('command="prompt"', menu_block)
 
 
 class VisibilityCommandsTest(BotTestCase):
@@ -2407,7 +2400,7 @@ class CoderModeTest(BotTestCase):
         help_block = help_block[: help_block.index("\n)\n")]
         for name in menu:
             self.assertIn(f"/{name}", help_block)
-        for name in ("coder", "reasoning", "tools"):
+        for name in ("settings",):
             self.assertIn(name, menu)
 
     def test_bot_handler_uses_coder_tools(self):
@@ -2464,6 +2457,157 @@ class CoderModeTest(BotTestCase):
     def test_creator_info_exposed(self):
         self.assertIn("Создатель", userbot.CREATOR_INFO)
         self.assertTrue(userbot.CREATOR_ID)
+
+
+class _CallbackEvent:
+    def __init__(self, data, chat_id, sender_id):
+        self.data = data
+        self.chat_id = chat_id
+        self.sender_id = sender_id
+        self.answers = []
+        self.edits = []
+        self.replies = []
+
+    async def answer(self, text=None, alert=False):
+        self.answers.append((text, alert))
+
+    async def edit(self, text, buttons=None):
+        self.edits.append((text, buttons))
+
+    async def reply(self, text, buttons=None):
+        self.replies.append((text, buttons))
+        return SimpleNamespace(id=1)
+
+
+class SettingsMenuTest(BotTestCase):
+    CHAT_ID = 7591254790
+
+    def setUp(self):
+        super().setUp()
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_settings_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        saved_state = bot.STATE_FILE
+        saved_history = bot.HISTORY_FILE
+        bot.STATE_FILE = tmp / "state_bot.json"
+        bot.HISTORY_FILE = tmp / "history_bot.json"
+        self.addCleanup(setattr, bot, "STATE_FILE", saved_state)
+        self.addCleanup(setattr, bot, "HISTORY_FILE", saved_history)
+        saved_owners = userbot.OWNER_IDS
+        userbot.OWNER_IDS = {self.CHAT_ID}
+        self.addCleanup(setattr, userbot, "OWNER_IDS", saved_owners)
+        saved = {
+            "coder": set(bot.coder_chats),
+            "auto": set(bot.auto_respond),
+            "reasoning": set(bot.reasoning_hidden),
+            "tools": set(bot.tools_hidden),
+            "models": dict(bot.model_overrides),
+        }
+
+        def restore():
+            bot.coder_chats.clear()
+            bot.coder_chats.update(saved["coder"])
+            bot.auto_respond.clear()
+            bot.auto_respond.update(saved["auto"])
+            bot.reasoning_hidden.clear()
+            bot.reasoning_hidden.update(saved["reasoning"])
+            bot.tools_hidden.clear()
+            bot.tools_hidden.update(saved["tools"])
+            bot.model_overrides.clear()
+            bot.model_overrides.update(saved["models"])
+
+        self.addCleanup(restore)
+
+    def test_settings_aliases_parse(self):
+        self.assertEqual(bot.handle_bot_commands("/settings"), ("settings", None))
+        self.assertEqual(bot.handle_bot_commands("/настройки"), ("settings", None))
+
+    def test_ping_and_history_commands_gone(self):
+        for text in ("/ping", "/history", "/пинг", "/история"):
+            with self.subTest(text=text):
+                self.assertIsNone(bot.handle_bot_commands(text))
+        for text in (".db ping", ".db history", ".дани история"):
+            with self.subTest(text=text):
+                self.assertIsNone(userbot.handle_commands(text))
+
+    def test_settings_rows_expose_every_toggle(self):
+        rows = bot._settings_rows(self.CHAT_ID)
+        self.assertEqual(
+            rows_data(rows),
+            {
+                "settings:model",
+                "settings:auto",
+                "settings:reasoning",
+                "settings:tools",
+                "settings:coder",
+                "settings:clear",
+                "settings:prompt",
+            },
+        )
+
+    def test_settings_text_reports_state(self):
+        text = bot._settings_text(self.CHAT_ID)
+        self.assertIn("Настройки / Settings", text)
+        self.assertIn(userbot.DANYAPI_MODEL, text)
+        self.assertIn("Контекст / Context", text)
+
+    def test_callback_toggles_auto_reply(self):
+        with mock.patch.object(userbot, "AUTO_RESPOND_GLOBAL", False):
+            bot.auto_respond.discard(self.CHAT_ID)
+            event = _CallbackEvent(b"settings:auto", self.CHAT_ID, self.CHAT_ID)
+            asyncio.run(bot.callback_handler(event))
+            self.assertIn(self.CHAT_ID, bot.auto_respond)
+            self.assertTrue(event.edits)
+            asyncio.run(bot.callback_handler(event))
+            self.assertNotIn(self.CHAT_ID, bot.auto_respond)
+
+    def test_callback_toggles_visibility(self):
+        bot.reasoning_hidden.discard(self.CHAT_ID)
+        bot.tools_hidden.discard(self.CHAT_ID)
+        event = _CallbackEvent(b"settings:reasoning", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn(self.CHAT_ID, bot.reasoning_hidden)
+        event = _CallbackEvent(b"settings:tools", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn(self.CHAT_ID, bot.tools_hidden)
+
+    def test_callback_toggles_coder(self):
+        bot.coder_chats.discard(self.CHAT_ID)
+        event = _CallbackEvent(b"settings:coder", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertTrue(bot.is_coder(self.CHAT_ID))
+
+    def test_callback_rejects_non_owner(self):
+        event = _CallbackEvent(b"settings:auto", self.CHAT_ID, self.CHAT_ID + 1)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(event.edits, [])
+        self.assertTrue(event.answers[-1][1])
+
+    def test_callback_clear_resets_context(self):
+        self.addCleanup(bot.chat_history.pop, self.CHAT_ID, None)
+        bot.chat_history[self.CHAT_ID] = deque(
+            [{"role": "user", "content": "x"}], maxlen=userbot.DM_HISTORY_LIMIT
+        )
+        event = _CallbackEvent(b"settings:clear", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(len(bot.chat_history[self.CHAT_ID]), 0)
+
+    def test_callback_model_picker(self):
+        userbot.MODELS = ["m-one", "m-two"]
+        event = _CallbackEvent(b"settings:model", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        picked = rows_data(event.edits[-1][1])
+        self.assertIn("settings:pick:m-one", picked)
+        self.assertIn("settings:pick:m-two", picked)
+        self.assertIn("settings:main", picked)
+        pick = _CallbackEvent(b"settings:pick:m-two", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(pick))
+        self.assertEqual(bot.model_overrides[self.CHAT_ID], "m-two")
+
+    def test_callback_unknown_action(self):
+        event = _CallbackEvent(b"settings:nope", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(event.edits, [])
+        self.assertEqual(event.answers[-1][1], True)
 
 
 class UserbotHelpersTest(BotTestCase):

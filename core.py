@@ -133,9 +133,7 @@ SUB_ALIASES = {
     ),
     "model": ("model", "модель"),
     "models": ("models", "модели"),
-    "history": ("history", "история", "контекст", "ctx"),
     "help": ("help", "помощь", "хелп", "справка", "?"),
-    "ping": ("ping", "пинг", "check"),
     "ignore": ("ignore", "игнор", "мут", "заглушить"),
     "unignore": ("unignore", "анмут", "размут", "включить"),
     "coder": ("coder", "кодер"),
@@ -207,8 +205,7 @@ BOT_COMMANDS = {
     ),
     "model": ("model", "модель"),
     "models": ("models", "модели"),
-    "history": ("history", "история", "контекст", "ctx"),
-    "ping": ("ping", "пинг", "check", "чек"),
+    "settings": ("settings", "настройки", "настройка"),
     "auto": ("auto", "авто", "danyauto", "автоответ"),
     "coder": ("coder", "кодер"),
     "reasoning": ("reasoning", "ризонинг", "размышления"),
@@ -567,29 +564,6 @@ def handle_command_state(
         enabled = chat_id in auto_respond or auto_respond_global
         state = "ON" if enabled else "OFF"
         return (f"Авто-ответ / Auto-reply: {state}", False, False)
-    if cmd == "history":
-        hist = chat_history.get(chat_id, deque())
-        n = len(hist)
-        chars = sum(len(m["content"]) for m in hist)
-        return (
-            (
-                f"Сообщений в контексте / Messages in context: {n}, "
-                f"символов / chars: {chars}"
-            ),
-            False,
-            False,
-        )
-    if cmd == "ping":
-        ctx_len = len(chat_history.get(chat_id, deque()))
-        current = model_overrides.get(chat_id, default_model)
-        return (
-            (
-                f"Онлайн / Online. Модель / Model: {current}\n"
-                f"Контекст / Context: {ctx_len} сообщений / messages"
-            ),
-            False,
-            False,
-        )
     if cmd == "models":
         current = model_overrides.get(chat_id, default_model)
         return (models_text(current, models_list), False, False)
