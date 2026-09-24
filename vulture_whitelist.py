@@ -42,3 +42,10 @@ apply_visibility_command
 make_render
 reasoning_hidden
 tools_hidden
+CONTRACT_ENABLED
+CONTRACT_DIR
+CONTRACT_FILES
+_contract_cache
+_contract_signature
+load_contract
+system_prompt_report

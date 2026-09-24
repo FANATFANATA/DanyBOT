@@ -2185,6 +2185,63 @@ class CoreHelpersTest(BotTestCase):
         self.assertEqual(parsed["auto_respond"], {1})
 
 
+class ContractPromptTest(BotTestCase):
+    CHAT_ID = 7591254790
+
+    def test_contract_loaded_from_repo(self):
+        text = userbot.load_contract()
+        self.assertIn("# Capabilities", text)
+        self.assertIn("# Контракт", text)
+        self.assertIn("Anti-AI traces", text)
+        self.assertIn("//full", text)
+
+    def test_contract_cached_until_mtime_changes(self):
+        first = userbot.load_contract()
+        second = userbot.load_contract()
+        self.assertEqual(first, second)
+        self.assertIsNotNone(userbot._contract_cache["key"])
+        self.assertEqual(len(first), len(second))
+
+    def test_contract_can_be_disabled(self):
+        saved = userbot.CONTRACT_ENABLED
+        userbot.CONTRACT_ENABLED = False
+        self.addCleanup(setattr, userbot, "CONTRACT_ENABLED", saved)
+        userbot._contract_cache["key"] = None
+        userbot._contract_cache["text"] = ""
+        self.assertEqual(userbot.load_contract(), "")
+        userbot.CONTRACT_ENABLED = saved
+        userbot._contract_cache["key"] = None
+        userbot._contract_cache["text"] = ""
+
+    def test_contract_in_every_mode(self):
+        contract = userbot.load_contract()
+        for mode in ("userbot", "bot", "coder"):
+            with self.subTest(mode=mode):
+                self.assertIn(contract, userbot.system_for(self.CHAT_ID, mode=mode))
+
+    def test_system_prompt_report_shape(self):
+        report = userbot.system_prompt_report(self.CHAT_ID, mode="bot")
+        self.assertIn("Режим / Mode: bot", report)
+        self.assertIn("Контракт / Contract: включён", report)
+        self.assertIn("capabilities.server.md (ok)", report)
+        self.assertIn("contract.md (ok)", report)
+
+    def test_prompt_aliases_parse(self):
+        for text in (".db prompt", ".db промпт", ".db system", ".db система"):
+            with self.subTest(text=text):
+                self.assertEqual(userbot.handle_commands(text), ("prompt", None))
+        for text in ("/prompt", "/промпт", "/system"):
+            with self.subTest(text=text):
+                self.assertEqual(bot.handle_bot_commands(text), ("prompt", None))
+
+    def test_prompt_registered_in_menu(self):
+        source = Path("bot.py").read_text(encoding="utf-8")
+        menu_block = source[
+            source.index("SetBotCommandsRequest") : source.index("]", source.index("SetBotCommandsRequest"))
+        ]
+        self.assertIn('command="prompt"', menu_block)
+
+
 class VisibilityCommandsTest(BotTestCase):
     CHAT_ID = 7591254790
 

@@ -282,6 +282,48 @@ def model_for(chat_id):
     return model_overrides.get(chat_id, DANYAPI_MODEL)
 
 
+CONTRACT_ENABLED = _env_bool("CONTRACT_ENABLED", True)
+CONTRACT_DIR = Path(_env_str("CONTRACT_DIR", "/root/cdn"))
+CONTRACT_FILES = ("capabilities.server.md", "contract.md")
+
+_contract_cache: dict[str, Any] = {"key": None, "text": ""}
+
+
+def _contract_signature():
+    signature = []
+    for name in CONTRACT_FILES:
+        path = CONTRACT_DIR / name
+        try:
+            stat = path.stat()
+        except OSError:
+            signature.append((name, 0, 0))
+            continue
+        signature.append((name, stat.st_mtime_ns, stat.st_size))
+    return tuple(signature)
+
+
+def load_contract():
+    if not CONTRACT_ENABLED:
+        return ""
+    signature = _contract_signature()
+    if signature == _contract_cache["key"]:
+        return _contract_cache["text"]
+    blocks = []
+    for name in CONTRACT_FILES:
+        path = CONTRACT_DIR / name
+        try:
+            text = path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning("Не удалось прочитать %s: %s", path, exc)
+            continue
+        if text:
+            blocks.append(text)
+    combined = "\n\n".join(blocks)
+    _contract_cache["key"] = signature
+    _contract_cache["text"] = combined
+    return combined
+
+
 def system_for(chat_id, mode="userbot"):
     if mode == "coder":
         base = CODER_SYSTEM_PROMPT
@@ -294,7 +336,29 @@ def system_for(chat_id, mode="userbot"):
         parts.append(CREATOR_INFO)
     if EXTRA_SYSTEM:
         parts.append(EXTRA_SYSTEM)
+    contract = load_contract()
+    if contract:
+        parts.append(contract)
     return "\n\n".join(parts)
+
+
+def system_prompt_report(chat_id, mode="userbot", limit=3000):
+    text = system_for(chat_id, mode=mode)
+    contract = load_contract()
+    files = ", ".join(
+        f"{name} ({'ok' if (CONTRACT_DIR / name).is_file() else 'нет'})"
+        for name in CONTRACT_FILES
+    )
+    head = (
+        f"Режим / Mode: {mode}\n"
+        f"Длина / Length: {len(text)} символов\n"
+        f"Контракт / Contract: "
+        f"{'включён' if contract else 'выключен'} ({len(contract)} символов)\n"
+        f"Источник / Source: {CONTRACT_DIR} — {files}\n"
+    )
+    if len(text) <= limit:
+        return f"{head}\n{text}"
+    return f"{head}\n{text[:limit]}\n… (обрезано / truncated)"
 
 
 TOOLS = tools_module.TOOLS
@@ -613,6 +677,7 @@ HELP_TEXT = (
     ".danybot reasoning on/off — показ рассуждений / show reasoning\n"
     ".danybot tools on/off — показ вызовов инструментов / show tool calls\n"
     ".danybot creator — создатель / creator\n"
+    ".danybot prompt — системный промпт, только владелец / system prompt, owner only\n"
     ".danybot help — эта справка / this help\n\n"
     "Авто-ответ / Auto-reply: .danyauto on/off (.da .auto .авто)"
 )
@@ -654,6 +719,13 @@ async def handler(event: Any):
         await safe_reply(
             event, "Кодер-режим работает только в боте: /coder on"
         )
+        return
+
+    if command and command[0] == "prompt":
+        if sender_id not in OWNER_IDS:
+            await safe_reply(event, "Системный промпт доступен только владельцу.")
+            return
+        await safe_reply(event, system_prompt_report(chat_id, mode="userbot"))
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:

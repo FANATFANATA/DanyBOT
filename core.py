@@ -141,6 +141,7 @@ SUB_ALIASES = {
     "coder": ("coder", "кодер"),
     "reasoning": ("reasoning", "ризонинг", "размышления"),
     "tools": ("tools", "инструменты"),
+    "prompt": ("prompt", "промпт", "system", "система"),
 }
 
 _SUB_LOOKUP = {
@@ -212,6 +213,7 @@ BOT_COMMANDS = {
     "coder": ("coder", "кодер"),
     "reasoning": ("reasoning", "ризонинг", "размышления"),
     "tools": ("tools", "инструменты"),
+    "prompt": ("prompt", "промпт", "system", "система"),
 }
 
 _BOT_CMD_LOOKUP = {

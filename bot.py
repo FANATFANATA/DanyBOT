@@ -82,7 +82,8 @@ BOT_HELP_TEXT = (
     "/auto on|off — авто-ответ / auto-reply\n"
     "/reasoning on|off — показ рассуждений / show reasoning\n"
     "/tools on|off — показ вызовов инструментов / show tool calls\n"
-    "/coder on|off — кодер-режим, только владелец / coder mode, owner only\n\n"
+    "/coder on|off — кодер-режим, только владелец / coder mode, owner only\n"
+    "/prompt — системный промпт, только владелец / system prompt, owner only\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
 )
 
@@ -214,6 +215,14 @@ async def handler(event: Any):
             )
         else:
             await safe_reply(event, "Кодер-режим ВЫКЛ.")
+        return
+
+    if command and command[0] == "prompt":
+        if sender_id not in userbot.OWNER_IDS:
+            await safe_reply(event, "Системный промпт доступен только владельцу.")
+            return
+        mode = "coder" if coder_active_for(sender_id, chat_id) else "bot"
+        await safe_reply(event, userbot.system_prompt_report(chat_id, mode=mode))
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:
@@ -463,6 +472,10 @@ async def start_bot():
                             types.BotCommand(
                                 command="tools",
                                 description="Показ вызовов инструментов on/off / Show tool calls",
+                            ),
+                            types.BotCommand(
+                                command="prompt",
+                                description="Системный промпт / System prompt",
                             ),
                         ],
                     )
