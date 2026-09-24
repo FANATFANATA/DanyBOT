@@ -1346,6 +1346,45 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(answer, "Итог: 5")
         self.assertEqual(tools_seen, ["evaluate"])
 
+    def test_denied_tool_is_not_reported(self):
+        self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(tool_calls=[make_tc(tc_id="call1", name="run_shell")])
+                    ),
+                    make_chunk(
+                        make_delta(tool_calls=[make_tc(arguments='{"command": "rm -rf /"}')])
+                    ),
+                ],
+                [make_chunk(make_delta(content="отказ"))],
+            ]
+        )
+        tools_seen = []
+
+        async def deny(name, args, model, unrestricted=False):
+            return False
+
+        async def on_tool(name):
+            tools_seen.append(name)
+
+        with mock.patch.object(userbot, "verify_tool_call", deny):
+            answer = asyncio.run(
+                userbot.stream_with_tools(
+                    [{"role": "user", "content": "q"}],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                    on_tool,
+                    tools=userbot.TOOLS,
+                    verify_tools=True,
+                )
+            )
+        self.assertEqual(answer, "отказ")
+        self.assertEqual(tools_seen, [])
+        self.assertEqual(self.tool_calls_made, [])
+
     def test_tool_round_limit_reached(self):
         endless = [
             make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
@@ -2512,6 +2551,18 @@ class CoderModeTest(BotTestCase):
             )
         )
         self.assertIn("DanyBOT", result)
+
+    def test_coder_prompt_mentions_every_tool(self):
+        names = {t["function"]["name"] for t in tools_module.CODER_TOOLS}
+        prompt = userbot.CODER_SYSTEM_PROMPT
+        for name in sorted(names):
+            with self.subTest(tool=name):
+                self.assertIn(name, prompt)
+
+    def test_coder_prompt_has_all_coder_tools(self):
+        names = {t["function"]["name"] for t in tools_module.CODER_TOOLS}
+        self.assertIn("execute_script", names)
+        self.assertIn("execute_script", userbot.CODER_SYSTEM_PROMPT)
 
     def test_creator_info_exposed(self):
         self.assertIn("Создатель", userbot.CREATOR_INFO)

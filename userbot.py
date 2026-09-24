@@ -106,9 +106,9 @@ CODER_SYSTEM_PROMPT = os.getenv(
     "CODER_SYSTEM_PROMPT",
     "Ты — DanyBOT в режиме кодера. Работаешь как агент: доступны файловые "
     "операции read_file, write_file, edit_file, list_dir, search_files, "
-    "run_shell, web_search, fetch_url. Действуй по шагам, проверяй результат "
-    "инструментами, не выдумывай содержимое файлов. Отвечай кратко и по делу "
-    "на языке последнего сообщения.",
+    "execute_script, run_shell, web_search, fetch_url, get_time. Действуй по "
+    "шагам, проверяй результат инструментами, не выдумывай содержимое файлов. "
+    "Отвечай кратко и по делу на языке последнего сообщения.",
 )
 
 CREATOR_NAME = _env_str("CREATOR_NAME", "")
@@ -597,8 +597,6 @@ async def stream_with_tools(
 
         results = await asyncio.gather(*(run_slot(s) for s in slots))
         for slot, result in results:
-            if on_tool is not None:
-                await on_tool(slot["name"])
             if result is None:
                 working.append(
                     {
@@ -608,6 +606,8 @@ async def stream_with_tools(
                     }
                 )
                 continue
+            if on_tool is not None:
+                await on_tool(slot["name"])
             working.append(
                 {
                     "role": "tool",
