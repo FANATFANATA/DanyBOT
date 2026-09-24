@@ -2311,14 +2311,36 @@ class CoderModeTest(BotTestCase):
         self.assertNotIn("run_subagent", names)
         self.assertFalse(names & set(tools_module.FILE_TOOL_NAMES))
 
-    def test_is_coder_flag(self):
-        saved = set(userbot.coder_chats)
-        userbot.coder_chats.clear()
-        self.addCleanup(userbot.coder_chats.clear)
-        self.addCleanup(userbot.coder_chats.update, saved)
-        self.assertFalse(userbot.is_coder(self.CHAT_ID))
-        userbot.coder_chats.add(self.CHAT_ID)
-        self.assertTrue(userbot.is_coder(self.CHAT_ID))
+    def test_coder_flag_lives_in_bot(self):
+        saved = set(bot.coder_chats)
+        bot.coder_chats.clear()
+        self.addCleanup(bot.coder_chats.clear)
+        self.addCleanup(bot.coder_chats.update, saved)
+        self.assertFalse(bot.is_coder(self.CHAT_ID))
+        bot.coder_chats.add(self.CHAT_ID)
+        self.assertTrue(bot.is_coder(self.CHAT_ID))
+
+    def test_coder_active_requires_owner(self):
+        saved = set(bot.coder_chats)
+        saved_owners = userbot.OWNER_IDS
+        bot.coder_chats.clear()
+        userbot.OWNER_IDS = {self.CHAT_ID}
+        self.addCleanup(bot.coder_chats.clear)
+        self.addCleanup(bot.coder_chats.update, saved)
+        self.addCleanup(setattr, userbot, "OWNER_IDS", saved_owners)
+        bot.coder_chats.add(self.CHAT_ID)
+        self.assertTrue(bot.coder_active_for(self.CHAT_ID, self.CHAT_ID))
+        self.assertFalse(bot.coder_active_for(self.CHAT_ID + 1, self.CHAT_ID))
+
+    def test_userbot_handler_does_not_switch_to_coder(self):
+        source = Path("userbot.py").read_text(encoding="utf-8")
+        self.assertNotIn("CODER_TOOLS if", source)
+        self.assertNotIn('mode="coder"', source)
+
+    def test_bot_handler_uses_coder_tools(self):
+        source = Path("bot.py").read_text(encoding="utf-8")
+        self.assertIn("tools_module.CODER_TOOLS if coder_active else userbot.TOOLS", source)
+        self.assertIn('mode = "coder" if coder_active else "bot"', source)
 
     def test_paths_are_confined_to_root(self):
         inside, err = tools_module._resolve_path("DanyBOT/tools.py")

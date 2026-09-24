@@ -297,12 +297,7 @@ def system_for(chat_id, mode="userbot"):
     return "\n\n".join(parts)
 
 
-def is_coder(chat_id):
-    return chat_id in coder_chats
-
-
 TOOLS = tools_module.TOOLS
-CODER_TOOLS = tools_module.CODER_TOOLS
 safe_eval = tools_module.safe_eval
 render_response = tools_module.render_response
 
@@ -614,8 +609,7 @@ HELP_TEXT = (
     ".danybot ping — статус / status\n"
     ".danybot ignore / unignore — заглушить/разглушить чат / mute/unmute "
     "chat\n"
-    ".danybot coder on/off — режим кодера, только владелец / coder mode, "
-    "owner only\n"
+    ".danybot coder — кодер-режим живёт в боте / coder mode lives in the bot\n"
     ".danybot reasoning on/off — показ рассуждений / show reasoning\n"
     ".danybot tools on/off — показ вызовов инструментов / show tool calls\n"
     ".danybot creator — создатель / creator\n"
@@ -657,30 +651,9 @@ async def handler(event: Any):
         return
 
     if command and command[0] in ("coder", "coder_status"):
-        if sender_id not in OWNER_IDS:
-            await safe_reply(event, "Кодер-режим доступен только владельцу.")
-            return
-        if command[0] == "coder_status":
-            state = "ON" if is_coder(chat_id) else "OFF"
-            await safe_reply(event, f"Кодер-режим / Coder mode: {state}")
-            return
-        async with ctx_lock:
-            if command[1]:
-                coder_chats.add(chat_id)
-            else:
-                coder_chats.discard(chat_id)
-        save_state()
-        if command[1]:
-            names = ", ".join(t["function"]["name"] for t in CODER_TOOLS)
-            await safe_reply(
-                event,
-                "Кодер-режим ВКЛ. Телеграм-функции отключены.\n"
-                f"Инструменты: {names}\n"
-                f"Корень: {tools_module.CODER_ROOT}\n"
-                "Выключить: .db coder off",
-            )
-        else:
-            await safe_reply(event, "Кодер-режим ВЫКЛ.")
+        await safe_reply(
+            event, "Кодер-режим работает только в боте: /coder on"
+        )
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:
@@ -749,9 +722,7 @@ async def handler(event: Any):
         HISTORY_SAVER.mark_dirty,
     )
 
-    coder_active = is_coder(chat_id) and sender_id in OWNER_IDS
-
-    if triggered or coder_active:
+    if triggered:
         effective_trigger = True
     elif not is_self:
         effective_trigger = chat_id in auto_respond or AUTO_RESPOND_GLOBAL
@@ -792,8 +763,7 @@ async def handler(event: Any):
         prompt = prompt[:MAX_REQUEST_LEN]
 
     model = model_for(chat_id)
-    mode = "coder" if coder_active else "userbot"
-    system_fn = lambda cid: system_for(cid, mode=mode)
+    system_fn = lambda cid: system_for(cid, mode="userbot")
     if is_private:
         hist, messages = await core.prepare_messages(
             STORE,
@@ -841,7 +811,7 @@ async def handler(event: Any):
             cast(Any, get_client().action(chat_id, "typing")),
             stream_with_tools,
             None,
-            CODER_TOOLS if coder_active else TOOLS,
+            TOOLS,
             EDIT_INTERVAL,
             sender_id,
         )

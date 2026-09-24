@@ -14,6 +14,7 @@ from telethon.tl import functions, types
 
 import core
 import proxies
+import tools as tools_module
 import userbot
 
 logger = logging.getLogger("danybot.bot")
@@ -80,7 +81,8 @@ BOT_HELP_TEXT = (
     "/ping — статус / status\n"
     "/auto on|off — авто-ответ / auto-reply\n"
     "/reasoning on|off — показ рассуждений / show reasoning\n"
-    "/tools on|off — показ вызовов инструментов / show tool calls\n\n"
+    "/tools on|off — показ вызовов инструментов / show tool calls\n"
+    "/coder on|off — кодер-режим, только владелец / coder mode, owner only\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
 )
 
@@ -122,6 +124,14 @@ def save_history():
 
 
 HISTORY_SAVER = core.AsyncSaver(save_history, delay=0.5, logger=logger)
+
+
+def is_coder(chat_id):
+    return chat_id in coder_chats
+
+
+def coder_active_for(sender_id, chat_id):
+    return chat_id in coder_chats and sender_id in userbot.OWNER_IDS
 
 
 async def safe_reply(event, text):
@@ -180,10 +190,30 @@ async def handler(event: Any):
         return
 
     if command and command[0] in ("coder", "coder_status"):
-        await safe_reply(
-            event,
-            "Кодер-режим работает только в юзерботе владельца.",
-        )
+        if sender_id not in userbot.OWNER_IDS:
+            await safe_reply(event, "Кодер-режим доступен только владельцу.")
+            return
+        if command[0] == "coder_status":
+            state = "ON" if is_coder(chat_id) else "OFF"
+            await safe_reply(event, f"Кодер-режим / Coder mode: {state}")
+            return
+        async with ctx_lock:
+            if command[1]:
+                coder_chats.add(chat_id)
+            else:
+                coder_chats.discard(chat_id)
+        save_state()
+        if command[1]:
+            names = ", ".join(t["function"]["name"] for t in tools_module.CODER_TOOLS)
+            await safe_reply(
+                event,
+                "Кодер-режим ВКЛ. Телеграм-функции отключены.\n"
+                f"Инструменты: {names}\n"
+                f"Корень: {tools_module.CODER_ROOT}\n"
+                "Выключить: /coder off",
+            )
+        else:
+            await safe_reply(event, "Кодер-режим ВЫКЛ.")
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:
@@ -240,7 +270,15 @@ async def handler(event: Any):
         HISTORY_SAVER.mark_dirty,
     )
 
-    if triggered or mentioned or reply_to_bot or (is_private and not is_self):
+    coder_active = coder_active_for(sender_id, chat_id)
+
+    if (
+        triggered
+        or coder_active
+        or mentioned
+        or reply_to_bot
+        or (is_private and not is_self)
+    ):
         effective_trigger = True
     elif not is_self:
         effective_trigger = chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL
@@ -279,13 +317,15 @@ async def handler(event: Any):
         prompt = prompt[: userbot.MAX_REQUEST_LEN]
 
     model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+    mode = "coder" if coder_active else "bot"
+    system_fn = lambda cid: userbot.system_for(cid, mode=mode)
     if is_private:
         hist, messages = await core.prepare_messages(
             STORE,
             chat_id,
             userbot.DM_HISTORY_LIMIT,
             userbot.GROUP_HISTORY_LIMIT,
-            lambda cid: userbot.system_for(cid, mode="bot"),
+            system_fn,
         )
     else:
         label = await userbot.get_sender_label(event)
@@ -302,7 +342,7 @@ async def handler(event: Any):
             chat_id,
             userbot.DM_HISTORY_LIMIT,
             userbot.GROUP_HISTORY_LIMIT,
-            lambda cid: userbot.system_for(cid, mode="bot"),
+            system_fn,
         )
 
     if is_self:
@@ -330,7 +370,7 @@ async def handler(event: Any):
             cast(Any, get_bot_client().action(chat_id, "typing")),
             userbot.stream_with_tools,
             get_bot_client(),
-            userbot.TOOLS,
+            tools_module.CODER_TOOLS if coder_active else userbot.TOOLS,
             userbot.EDIT_INTERVAL,
             sender_id,
         )
@@ -411,6 +451,10 @@ async def start_bot():
                             types.BotCommand(
                                 command="auto",
                                 description="Авто-ответ on/off / Auto-reply on/off",
+                            ),
+                            types.BotCommand(
+                                command="coder",
+                                description="Кодер-режим on/off / Coder mode on/off",
                             ),
                         ],
                     )
