@@ -456,6 +456,14 @@ async def start_bot():
                                 command="coder",
                                 description="Кодер-режим on/off / Coder mode on/off",
                             ),
+                            types.BotCommand(
+                                command="reasoning",
+                                description="Показ рассуждений on/off / Show reasoning",
+                            ),
+                            types.BotCommand(
+                                command="tools",
+                                description="Показ вызовов инструментов on/off / Show tool calls",
+                            ),
                         ],
                     )
                 )

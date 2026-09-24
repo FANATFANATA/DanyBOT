@@ -2337,6 +2337,22 @@ class CoderModeTest(BotTestCase):
         self.assertNotIn("CODER_TOOLS if", source)
         self.assertNotIn('mode="coder"', source)
 
+    def test_menu_covers_every_help_command(self):
+        source = Path("bot.py").read_text(encoding="utf-8")
+        start = source.index("SetBotCommandsRequest")
+        menu_block = source[start : source.index("]", start)]
+        menu = {
+            line.split('command="', 1)[1].split('"', 1)[0]
+            for line in menu_block.splitlines()
+            if 'command="' in line
+        }
+        help_block = source[source.index("BOT_HELP_TEXT = (") :]
+        help_block = help_block[: help_block.index("\n)\n")]
+        for name in menu:
+            self.assertIn(f"/{name}", help_block)
+        for name in ("coder", "reasoning", "tools"):
+            self.assertIn(name, menu)
+
     def test_bot_handler_uses_coder_tools(self):
         source = Path("bot.py").read_text(encoding="utf-8")
         self.assertIn("tools_module.CODER_TOOLS if coder_active else userbot.TOOLS", source)
