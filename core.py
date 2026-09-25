@@ -481,6 +481,10 @@ async def safe_reply(event, text, attempts, recent_ids):
 
 
 async def edit_text(client, chat_id, msg_id, text, attempts, logger=None):
+    if not text or not text.strip():
+        if logger is not None:
+            logger.warning("edit_message пропущен: пустой текст")
+        return False
     last_error = ""
     for attempt in range(attempts):
         try:
@@ -722,28 +726,48 @@ async def stream_answer(
     placeholder_id = None
     if self_edit_id is not None:
         state["edit_id"] = self_edit_id
-    async with action:
-        if not is_self:
-            placeholder = await reply_fn(event, "…")
-            if placeholder:
-                placeholder_id = placeholder.id
-                state["edit_id"] = placeholder.id
-                store.recent_reply_ids.add(placeholder.id)
-        result = await stream_fn(
-            messages,
-            model,
-            chat_id,
-            on_delta,
-            on_reasoning,
-            on_tool,
-            client_override=tool_client,
-            tools=tools,
-            verify_tools=not unrestricted,
-            sanitize_tools=not unrestricted,
-            unrestricted=unrestricted,
-        )
+    error = None
+    result = None
+    try:
+        async with action:
+            if not is_self:
+                placeholder = await reply_fn(event, "…")
+                if placeholder:
+                    placeholder_id = placeholder.id
+                    state["edit_id"] = placeholder.id
+                    store.recent_reply_ids.add(placeholder.id)
+            result = await stream_fn(
+                messages,
+                model,
+                chat_id,
+                on_delta,
+                on_reasoning,
+                on_tool,
+                client_override=tool_client,
+                tools=tools,
+                verify_tools=not unrestricted,
+                sanitize_tools=not unrestricted,
+                unrestricted=unrestricted,
+            )
+    except (
+        userbot_module.OpenAIError,
+        RPCError,
+        OSError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        error = exc
     full_answer = result or "".join(state["answer_parts"])
     final_text = render()
+    if not final_text.strip() or final_text.strip() == "…":
+        fallback = full_answer.strip()
+        if not fallback:
+            fallback = (
+                "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+                if error is not None
+                else "(пустой ответ / empty answer)"
+            )
+        final_text = fallback
     if state["edit_id"] is not None:
         edited = await edit_fn(
             chat_id, state["edit_id"], final_text, logger=logger
@@ -753,9 +777,11 @@ async def stream_answer(
                 logger.warning(
                     "финальный edit не удался, отправляю ответ новым сообщением"
                 )
-            await reply_fn(event, final_text or "…")
+            await reply_fn(event, final_text)
     if placeholder_id is not None:
         store.recent_reply_ids.discard(placeholder_id)
+    if error is not None:
+        raise error
     return full_answer
 
 
