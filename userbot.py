@@ -639,8 +639,10 @@ async def safe_reply(event, text):
     return await core.safe_reply(event, text, REPLY_ATTEMPTS, recent_reply_ids)
 
 
-async def edit_text(chat_id, msg_id, text):
-    return await core.edit_text(get_client(), chat_id, msg_id, text, REPLY_ATTEMPTS)
+async def edit_text(chat_id, msg_id, text, logger=None):
+    return await core.edit_text(
+        get_client(), chat_id, msg_id, text, REPLY_ATTEMPTS, logger
+    )
 
 
 def models_text(chat_id) -> str:
@@ -886,6 +888,7 @@ async def handler(event: Any):
             TOOLS,
             EDIT_INTERVAL,
             sender_id,
+            logger,
         )
 
         async with ctx_lock:

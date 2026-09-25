@@ -480,16 +480,32 @@ async def safe_reply(event, text, attempts, recent_ids):
     return None
 
 
-async def edit_text(client, chat_id, msg_id, text, attempts):
-    for _attempt in range(attempts):
+async def edit_text(client, chat_id, msg_id, text, attempts, logger=None):
+    last_error = ""
+    for attempt in range(attempts):
         try:
             await client.edit_message(chat_id, msg_id, text)
             return True
         except FloodWaitError as e:
+            last_error = f"FloodWait {e.seconds}s"
+            if logger is not None:
+                logger.warning(
+                    "edit_message флуд-лимит: %ss, попытка %d/%d",
+                    e.seconds,
+                    attempt + 1,
+                    attempts,
+                )
             await asyncio.sleep(min(e.seconds, 30))
             continue
-        except (RPCError, OSError, ValueError, TypeError):
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            if logger is not None:
+                logger.warning("edit_message ошибка: %s", last_error)
             return False
+    if logger is not None:
+        logger.warning(
+            "edit_message не удался после %d попыток: %s", attempts, last_error
+        )
     return False
 
 
@@ -588,7 +604,9 @@ def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
     return _do()
 
 
-def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interval):
+def make_stream_callbacks(
+    prefix, render_fn, edit_text_fn, chat_id, edit_interval, tool_edit_interval=5.0
+):
     state = {
         "answer_parts": [],
         "last_edit": 0.0,
@@ -605,9 +623,12 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
             "".join(state["answer_parts"]),
         )
 
-    async def _maybe_edit():
+    async def _maybe_edit(min_interval=None):
         now = time.monotonic()
-        if state["edit_id"] is not None and (now - state["last_edit"]) >= edit_interval:
+        wait = edit_interval
+        if min_interval is not None:
+            wait = max(edit_interval, min_interval)
+        if state["edit_id"] is not None and (now - state["last_edit"]) >= wait:
             state["last_edit"] = now
             await edit_text_fn(chat_id, state["edit_id"], render())
 
@@ -621,7 +642,7 @@ def make_stream_callbacks(prefix, render_fn, edit_text_fn, chat_id, edit_interva
 
     async def on_tool(name):
         state["tool_parts"].append(name)
-        await _maybe_edit()
+        await _maybe_edit(tool_edit_interval)
 
     return state, render, on_delta, on_reasoning, on_tool
 
@@ -690,6 +711,7 @@ async def stream_answer(
     tools,
     edit_interval,
     owner_id=None,
+    logger=None,
 ):
     import userbot as userbot_module
 
@@ -697,12 +719,14 @@ async def stream_answer(
     state, render, on_delta, on_reasoning, on_tool = make_stream_callbacks(
         prefix, render_fn, edit_fn, chat_id, edit_interval
     )
+    placeholder_id = None
     if self_edit_id is not None:
         state["edit_id"] = self_edit_id
     async with action:
         if not is_self:
             placeholder = await reply_fn(event, "…")
             if placeholder:
+                placeholder_id = placeholder.id
                 state["edit_id"] = placeholder.id
                 store.recent_reply_ids.add(placeholder.id)
         result = await stream_fn(
@@ -719,8 +743,19 @@ async def stream_answer(
             unrestricted=unrestricted,
         )
     full_answer = result or "".join(state["answer_parts"])
+    final_text = render()
     if state["edit_id"] is not None:
-        await edit_fn(chat_id, state["edit_id"], render())
+        edited = await edit_fn(
+            chat_id, state["edit_id"], final_text, logger=logger
+        )
+        if not edited and placeholder_id is not None:
+            if logger is not None:
+                logger.warning(
+                    "финальный edit не удался, отправляю ответ новым сообщением"
+                )
+            await reply_fn(event, final_text or "…")
+    if placeholder_id is not None:
+        store.recent_reply_ids.discard(placeholder_id)
     return full_answer
 
 

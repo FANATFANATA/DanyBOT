@@ -133,9 +133,9 @@ async def safe_reply(event, text):
     return await core.safe_reply(event, text, userbot.REPLY_ATTEMPTS, recent_reply_ids)
 
 
-async def edit_text(chat_id, msg_id, text):
+async def edit_text(chat_id, msg_id, text, logger=None):
     return await core.edit_text(
-        get_bot_client(), chat_id, msg_id, text, userbot.REPLY_ATTEMPTS
+        get_bot_client(), chat_id, msg_id, text, userbot.REPLY_ATTEMPTS, logger
     )
 
 
@@ -386,6 +386,7 @@ async def handler(event: Any):
             tools_module.CODER_TOOLS if coder_active else userbot.TOOLS,
             userbot.EDIT_INTERVAL,
             sender_id,
+            logger,
         )
 
         async with ctx_lock:

@@ -2178,7 +2178,7 @@ class CoreHelpersTest(BotTestCase):
         store = _StoreStub()
         edited = []
 
-        async def edit_fn(chat_id, msg_id, text):
+        async def edit_fn(chat_id, msg_id, text, logger=None):
             edited.append(text)
 
         async def reply_fn(event, text):
