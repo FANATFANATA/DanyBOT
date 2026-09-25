@@ -49,3 +49,17 @@ _contract_cache
 _contract_signature
 load_contract
 system_prompt_report
+MEMORY_TOOL_NAMES
+memory_remember
+memory_recall
+memory_forget
+memory_list
+save_skill
+load_skill
+list_skills
+delete_skill
+remember
+recall
+forget
+list_memories
+dumps

@@ -20,3 +20,4 @@ toolrun.log
 subagent_cache.json
 collected.xml
 collecter.py
+data/

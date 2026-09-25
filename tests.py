@@ -2397,6 +2397,14 @@ class CoderModeTest(BotTestCase):
                 "web_search",
                 "fetch_url",
                 "get_time",
+                "memory_remember",
+                "memory_recall",
+                "memory_forget",
+                "memory_list",
+                "save_skill",
+                "load_skill",
+                "list_skills",
+                "delete_skill",
             },
         )
         telegram_names = {

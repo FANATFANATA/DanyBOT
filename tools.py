@@ -560,6 +560,132 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "memory_remember",
+            "description": (
+                "Сохранить факт в долговременную память: ключ, значение, теги"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "value": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_recall",
+            "description": (
+                "Прочитать из памяти: по ключу, по подстроке (query) или последние"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_forget",
+            "description": "Удалить запись из памяти по ключу или id",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string"},
+                    "id": {"type": "integer"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_list",
+            "description": "Список последних записей памяти и статистика",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "save_skill",
+            "description": (
+                "Сохранить или обновить скилл: имя, описание, тело, теги"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"},
+                    "body": {"type": "string"},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["name", "body"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Загрузить скилл по имени и увеличить счётчик использования",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_skills",
+            "description": "Список скиллов с фильтром по тегу или подстроке",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tag": {"type": "string"},
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_skill",
+            "description": "Удалить скилл по имени",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "run_subagent",
             "description": (
                 "Запустить одного или нескольких универсальных субагентов. "
@@ -715,8 +841,20 @@ FILE_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+MEMORY_TOOL_NAMES = (
+    "memory_remember",
+    "memory_recall",
+    "memory_forget",
+    "memory_list",
+    "save_skill",
+    "load_skill",
+    "list_skills",
+    "delete_skill",
+)
+
 CODER_TOOL_NAMES = (
     *FILE_TOOL_NAMES,
+    *MEMORY_TOOL_NAMES,
     "run_shell",
     "web_search",
     "fetch_url",
@@ -727,7 +865,9 @@ CODER_TOOLS: list[dict[str, Any]] = [
     item for item in [*FILE_TOOLS, *TOOLS] if item["function"]["name"] in CODER_TOOL_NAMES
 ]
 
-SUBAGENT_EXCLUDED_TOOLS = frozenset({"run_subagent", *FILE_TOOL_NAMES})
+SUBAGENT_EXCLUDED_TOOLS = frozenset(
+    {"run_subagent", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
+)
 
 
 async def _tool_get_chat_history(arguments, chat_id, client, stats):
@@ -1420,6 +1560,83 @@ async def _tool_execute_script(arguments, chat_id, client, stats):
     return _clip(result, MAX_SCRIPT_OUTPUT)
 
 
+
+async def _tool_memory_remember(arguments, chat_id, client, stats):
+    import memory
+
+    key = _str_arg(arguments, "key")
+    value = str(arguments.get("value", ""))
+    tags = arguments.get("tags")
+    result = memory.remember(chat_id, key, value, tags)
+    return memory.dumps(result)
+
+
+async def _tool_memory_recall(arguments, chat_id, client, stats):
+    import memory
+
+    key = _str_arg(arguments, "key")
+    query = _str_arg(arguments, "query")
+    limit = _int_arg(arguments, "limit", 10, 1, 200)
+    result = memory.recall(chat_id, key=key, query=query, limit=limit)
+    return memory.dumps(result)
+
+
+async def _tool_memory_forget(arguments, chat_id, client, stats):
+    import memory
+
+    key = _str_arg(arguments, "key")
+    mem_id = _int_arg(arguments, "id", 0, 0, 10**9)
+    result = memory.forget(chat_id, key=key, mem_id=mem_id)
+    return memory.dumps(result)
+
+
+async def _tool_memory_list(arguments, chat_id, client, stats):
+    import memory
+
+    limit = _int_arg(arguments, "limit", 50, 1, 200)
+    result = memory.list_memories(chat_id, limit=limit)
+    result["stats"] = memory.stats(chat_id)
+    return memory.dumps(result)
+
+
+async def _tool_save_skill(arguments, chat_id, client, stats):
+    import skills
+
+    name = _str_arg(arguments, "name")
+    description = _str_arg(arguments, "description")
+    body = str(arguments.get("body", ""))
+    tags = arguments.get("tags")
+    result = skills.save_skill(name, description, body, tags)
+    return skills.dumps(result)
+
+
+async def _tool_load_skill(arguments, chat_id, client, stats):
+    import skills
+
+    name = _str_arg(arguments, "name")
+    result = skills.load_skill(name)
+    return skills.dumps(result)
+
+
+async def _tool_list_skills(arguments, chat_id, client, stats):
+    import skills
+
+    tag = _str_arg(arguments, "tag")
+    query = _str_arg(arguments, "query")
+    limit = _int_arg(arguments, "limit", 50, 1, 200)
+    result = skills.list_skills(tag=tag, query=query, limit=limit)
+    result["stats"] = skills.stats()
+    return skills.dumps(result)
+
+
+async def _tool_delete_skill(arguments, chat_id, client, stats):
+    import skills
+
+    name = _str_arg(arguments, "name")
+    result = skills.delete_skill(name)
+    return skills.dumps(result)
+
+
 _HANDLERS = {
     "get_chat_history": _tool_get_chat_history,
     "list_chats": _tool_list_chats,
@@ -1447,6 +1664,14 @@ _HANDLERS = {
     "get_time": _tool_get_time,
     "text_stats": _tool_text_stats,
     "get_bot_stats": _tool_get_bot_stats,
+    "memory_remember": _tool_memory_remember,
+    "memory_recall": _tool_memory_recall,
+    "memory_forget": _tool_memory_forget,
+    "memory_list": _tool_memory_list,
+    "save_skill": _tool_save_skill,
+    "load_skill": _tool_load_skill,
+    "list_skills": _tool_list_skills,
+    "delete_skill": _tool_delete_skill,
     "run_subagent": _tool_run_subagent,
     "read_file": _tool_read_file,
     "write_file": _tool_write_file,
