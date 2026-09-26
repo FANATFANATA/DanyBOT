@@ -41,25 +41,12 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 TRIGGER_ALIASES = (
-    ".danybot",
-    ".danyapi",
-    ".dany",
     ".db",
-    ".gpt",
     ".ai",
-    ".bot",
-    ".бот",
-    ".д",
-    ".d",
-    ".б",
-    ".данибот",
-    ".даниапи",
-    ".дани",
 )
-AUTO_ALIASES = (".danyauto", ".da", ".auto", ".авто", ".даниавто")
 
-AUTO_ON_WORDS = ("on", "вкл", "включить", "1", "true", "yes", "да")
-AUTO_OFF_WORDS = ("off", "выкл", "выключить", "0", "false", "no", "нет")
+AUTO_ON_WORDS = ("on", "1", "true", "yes")
+AUTO_OFF_WORDS = ("off", "0", "false", "no")
 
 
 def _bool_command(name, arg):
@@ -121,34 +108,21 @@ def _build_trigger_re():
 TRIGGER_RE = _build_trigger_re()
 
 SUB_ALIASES = {
-    "clear": (
-        "clear",
-        "сброс",
-        "сбросить",
-        "забыть",
-        "забудь",
-        "стоп",
-        "очистить",
-        "очистка",
-    ),
-    "model": ("model", "модель"),
-    "models": ("models", "модели"),
-    "help": ("help", "помощь", "хелп", "справка", "?"),
-    "ignore": ("ignore", "игнор", "мут", "заглушить"),
-    "unignore": ("unignore", "анмут", "размут", "включить"),
-    "coder": ("coder", "кодер"),
-    "reasoning": ("reasoning", "ризонинг", "размышления"),
-    "tools": ("tools", "инструменты"),
-    "prompt": ("prompt", "промпт", "system", "система"),
+    "clear": ("clear",),
+    "model": ("model",),
+    "models": ("models",),
+    "help": ("help", "?"),
+    "coder": ("coder",),
+    "reasoning": ("reasoning",),
+    "tools": ("tools",),
+    "prompt": ("prompt",),
 }
 
 _SUB_LOOKUP = {
     alias: name for name, aliases in SUB_ALIASES.items() for alias in aliases
 }
 
-_ALL_ALIASES = tuple(
-    sorted(dict.fromkeys((*TRIGGER_ALIASES, *AUTO_ALIASES)), key=len, reverse=True)
-)
+_ALL_ALIASES = tuple(sorted(dict.fromkeys(TRIGGER_ALIASES), key=len, reverse=True))
 
 
 def _strip_alias_prefix(low):
@@ -175,12 +149,6 @@ def handle_commands(text) -> tuple[str, Any] | None:
     sub = parts[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if alias in AUTO_ALIASES:
-        if sub in AUTO_ON_WORDS:
-            return ("autorespond", True)
-        if sub in AUTO_OFF_WORDS:
-            return ("autorespond", False)
-
     cmd = _SUB_LOOKUP.get(sub)
     if cmd is None:
         return None
@@ -192,25 +160,15 @@ def handle_commands(text) -> tuple[str, Any] | None:
 
 
 BOT_COMMANDS = {
-    "start": ("start", "help", "помощь", "хелп", "справка", "начать", "старт", "?"),
-    "clear": (
-        "clear",
-        "сброс",
-        "сбросить",
-        "забыть",
-        "забудь",
-        "стоп",
-        "очистить",
-        "очистка",
-    ),
-    "model": ("model", "модель"),
-    "models": ("models", "модели"),
-    "settings": ("settings", "настройки", "настройка"),
-    "auto": ("auto", "авто", "danyauto", "автоответ"),
-    "coder": ("coder", "кодер"),
-    "reasoning": ("reasoning", "ризонинг", "размышления"),
-    "tools": ("tools", "инструменты"),
-    "prompt": ("prompt", "промпт", "system", "система"),
+    "start": ("start", "help", "?"),
+    "clear": ("clear",),
+    "model": ("model",),
+    "models": ("models",),
+    "settings": ("settings",),
+    "coder": ("coder",),
+    "reasoning": ("reasoning",),
+    "tools": ("tools",),
+    "prompt": ("prompt",),
 }
 
 _BOT_CMD_LOOKUP = {
@@ -233,13 +191,6 @@ def handle_bot_commands(text) -> tuple[str, Any] | None:
     cmd = _BOT_CMD_LOOKUP.get(head.lower())
     if cmd is None:
         return None
-    if cmd == "auto":
-        low = arg.lower()
-        if low in AUTO_ON_WORDS:
-            return ("autorespond", True)
-        if low in AUTO_OFF_WORDS:
-            return ("autorespond", False)
-        return ("auto_status", None)
     if cmd in ("coder", "reasoning", "tools"):
         return _bool_command(cmd, arg)
     if cmd == "model":
@@ -276,9 +227,6 @@ def parse_state_data(data):
         "model_overrides": {
             int(k): v for k, v in data.get("model_overrides", {}).items()
         },
-        "auto_respond": {int(x) for x in data.get("auto_respond", [])},
-        "ignored_chats": {int(x) for x in data.get("ignored_chats", [])},
-        "ignored_users": {int(x) for x in data.get("ignored_users", [])},
         "coder_chats": {int(x) for x in data.get("coder_chats", [])},
         "reasoning_hidden": {int(x) for x in data.get("reasoning_hidden", [])},
         "tools_hidden": {int(x) for x in data.get("tools_hidden", [])},
@@ -297,9 +245,6 @@ def load_state_file(path):
 def save_state_file(path, state):
     data = {
         "model_overrides": {str(k): v for k, v in state["model_overrides"].items()},
-        "auto_respond": sorted(state["auto_respond"]),
-        "ignored_chats": sorted(state["ignored_chats"]),
-        "ignored_users": sorted(state["ignored_users"]),
         "coder_chats": sorted(state.get("coder_chats", [])),
         "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
         "tools_hidden": sorted(state.get("tools_hidden", [])),
@@ -346,9 +291,6 @@ def save_history_file(path, history):
 
 _MODE_KEYS = (
     "model_overrides",
-    "auto_respond",
-    "ignored_chats",
-    "ignored_users",
     "coder_chats",
     "reasoning_hidden",
     "tools_hidden",
@@ -425,9 +367,6 @@ def load_state_into(store, state_file):
     if state is None:
         return
     store.model_overrides = state["model_overrides"]
-    store.auto_respond = state["auto_respond"]
-    store.ignored_chats = state["ignored_chats"]
-    store.ignored_users = state["ignored_users"]
     store.coder_chats = state["coder_chats"]
     store.reasoning_hidden = state["reasoning_hidden"]
     store.tools_hidden = state["tools_hidden"]
@@ -438,9 +377,6 @@ def save_state_from(store, state_file, logger):
         state_file,
         {
             "model_overrides": store.model_overrides,
-            "auto_respond": store.auto_respond,
-            "ignored_chats": store.ignored_chats,
-            "ignored_users": store.ignored_users,
             "coder_chats": store.coder_chats,
             "reasoning_hidden": store.reasoning_hidden,
             "tools_hidden": store.tools_hidden,
@@ -551,12 +487,8 @@ def handle_command_state(
     is_private,
     chat_history,
     model_overrides,
-    auto_respond,
-    ignored_chats,
-    ignored_users,
     dm_limit,
     group_limit,
-    auto_respond_global,
     default_model,
     models_list,
     help_text,
@@ -573,29 +505,11 @@ def handle_command_state(
             return (f"Модель установлена / Model set: {val}", True, False)
         current = model_overrides.get(chat_id, default_model)
         return (f"Текущая модель / Current model: {current}", False, False)
-    if cmd == "autorespond":
-        val = command[1]
-        if val:
-            auto_respond.add(chat_id)
-            return ("Авто-ответ ВКЛ. / Auto-reply ON.", True, False)
-        auto_respond.discard(chat_id)
-        return ("Авто-ответ ВЫКЛ. / Auto-reply OFF.", True, False)
-    if cmd == "auto_status":
-        enabled = chat_id in auto_respond or auto_respond_global
-        state = "ON" if enabled else "OFF"
-        return (f"Авто-ответ / Auto-reply: {state}", False, False)
     if cmd == "models":
         current = model_overrides.get(chat_id, default_model)
         return (models_text(current, models_list), False, False)
     if cmd == "help":
         return (help_text, False, False)
-    if cmd == "ignore":
-        ignored_chats.add(chat_id)
-        return (
-            "Чат заглушен / Chat muted. Размут / Unmute: .db unignore",
-            True,
-            False,
-        )
     return None
 
 

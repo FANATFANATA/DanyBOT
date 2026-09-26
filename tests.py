@@ -124,9 +124,9 @@ def patch_paths(testcase):
 def snapshot_bot_state():
     return {
         "model_overrides": dict(userbot.model_overrides),
-        "auto_respond": set(userbot.auto_respond),
-        "ignored_chats": set(userbot.ignored_chats),
-        "ignored_users": set(userbot.ignored_users),
+        "coder_chats": set(userbot.coder_chats),
+        "reasoning_hidden": set(userbot.reasoning_hidden),
+        "tools_hidden": set(userbot.tools_hidden),
         "chat_history": {
             k: deque(v, maxlen=v.maxlen) for k, v in userbot.chat_history.items()
         },
@@ -136,9 +136,9 @@ def snapshot_bot_state():
 
 def restore_bot_state(snap):
     userbot.model_overrides = snap["model_overrides"]
-    userbot.auto_respond = snap["auto_respond"]
-    userbot.ignored_chats = snap["ignored_chats"]
-    userbot.ignored_users = snap["ignored_users"]
+    userbot.coder_chats = snap["coder_chats"]
+    userbot.reasoning_hidden = snap["reasoning_hidden"]
+    userbot.tools_hidden = snap["tools_hidden"]
     userbot.chat_history = snap["chat_history"]
     userbot.MODELS = snap["MODELS"]
 
@@ -332,10 +332,9 @@ class MakeSessionTest(unittest.TestCase):
 class TriggerRegexTest(unittest.TestCase):
     MATCH_CASES = (
         ".db привет",
-        ".danybot",
-        ".gpt?",
-        ".bot как дела",
-        "привет\n.bot после строки",
+        ".ai вопрос",
+        ".DB тест",
+        "привет\n.ai после строки",
     )
     NO_MATCH_CASES = (
         "",
@@ -343,9 +342,12 @@ class TriggerRegexTest(unittest.TestCase):
         "x.db привет",
         ".dbx",
         ".dbмодель",
-        "abc.danybot def",
+        "abc.ai def",
         ".дб привет",
         ".ДБ привет",
+        ".danybot",
+        ".gpt?",
+        ".bot как дела",
     )
 
     def test_matches(self):
@@ -364,26 +366,24 @@ class HandleCommandsTest(unittest.TestCase):
         (".db clear", ("clear", None)),
         ("  .DB CLEAR ", ("clear", None)),
         (".db clear extra args", ("clear", None)),
-        (".db очистить", ("clear", None)),
-        (".db очистка", ("clear", None)),
-        (".db сброс", ("clear", None)),
-        (".gpt модель gpt-x", ("model", "gpt-x")),
+        (".db model gpt-x", ("model", "gpt-x")),
         (".db model", ("model", None)),
-        (".da on", ("autorespond", True)),
-        (".авто выкл", ("autorespond", False)),
-        (".danyauto да", ("autorespond", True)),
-        (".даниавто нет", ("autorespond", False)),
-        (".bot help", ("help", None)),
-        (".ai ?", ("help", None)),
-        (".данибот модели", ("models", None)),
+        (".ai model", ("model", None)),
+        (".db coder on", ("coder", True)),
+        (".ai coder off", ("coder", False)),
+        (".db reasoning on", ("reasoning", True)),
+        (".db tools", ("tools_status", None)),
+        (".ai prompt", ("prompt", None)),
+        (".db models", ("models", None)),
+        (".ai help", ("help", None)),
+        (".db ?", ("help", None)),
     )
     NONE_CASES = (
         "hello",
         "",
         ".",
         ".db",
-        ".da",
-        ".da maybe",
+        ".ai",
         ".db unknowncmd",
         ".dbmodel",
         ".unknown clear",
@@ -804,26 +804,27 @@ class GetWorkingProxiesTest(BotTestCase):
 class StateRoundtripTest(BotTestCase):
     def test_save_load_roundtrip(self):
         userbot.model_overrides = {123: "model-a", -456: "model-b"}
-        userbot.auto_respond = {1, -2}
-        userbot.ignored_chats = {-100}
-        userbot.ignored_users = {777}
+        userbot.coder_chats = {1, -2}
+        userbot.reasoning_hidden = {-100}
+        userbot.tools_hidden = {777}
         userbot.save_state()
         userbot.model_overrides = {}
-        userbot.auto_respond = set()
-        userbot.ignored_chats = set()
-        userbot.ignored_users = set()
+        userbot.coder_chats = set()
+        userbot.reasoning_hidden = set()
+        userbot.tools_hidden = set()
         userbot.load_state()
         self.assertEqual(userbot.model_overrides, {123: "model-a", -456: "model-b"})
-        self.assertEqual(userbot.auto_respond, {1, -2})
-        self.assertEqual(userbot.ignored_chats, {-100})
-        self.assertEqual(userbot.ignored_users, {777})
+        self.assertEqual(userbot.coder_chats, {1, -2})
+        self.assertEqual(userbot.reasoning_hidden, {-100})
+        self.assertEqual(userbot.tools_hidden, {777})
 
     def test_corrupt_json_tolerated(self):
         userbot.STATE_FILE.write_text("{not json", encoding="utf-8")
         userbot.model_overrides = {}
+        userbot.coder_chats = set()
         userbot.load_state()
         self.assertEqual(userbot.model_overrides, {})
-        self.assertEqual(userbot.auto_respond, set())
+        self.assertEqual(userbot.coder_chats, set())
 
     def test_wrong_structure_tolerated(self):
         userbot.STATE_FILE.write_text('{"model_overrides": [1, 2]}', encoding="utf-8")
@@ -1066,21 +1067,19 @@ class BotCommandsTest(BotTestCase):
     CASES: ClassVar[list] = [
         ("/help", ("help", None)),
         ("/start", ("help", None)),
-        ("/помощь", ("help", None)),
-        ("/справка", ("help", None)),
+        ("/?", ("help", None)),
         ("/model gpt-x", ("model", "gpt-x")),
-        ("/модель gpt-x", ("model", "gpt-x")),
         ("/model", ("model", None)),
         ("/models", ("models", None)),
-        ("/модели", ("models", None)),
         ("/clear", ("clear", None)),
-        ("/очистить", ("clear", None)),
         ("/settings", ("settings", None)),
-        ("/настройки", ("settings", None)),
-        ("/auto on", ("autorespond", True)),
-        ("/авто выкл", ("autorespond", False)),
-        ("/auto off", ("autorespond", False)),
-        ("/auto", ("auto_status", None)),
+        ("/coder on", ("coder", True)),
+        ("/coder off", ("coder", False)),
+        ("/coder", ("coder_status", None)),
+        ("/reasoning on", ("reasoning", True)),
+        ("/tools off", ("tools", False)),
+        ("/tools", ("tools_status", None)),
+        ("/prompt", ("prompt", None)),
         ("/help@DanyBOTAPI_bot", ("help", None)),
         ("  /SETTINGS  ", ("settings", None)),
     ]
@@ -1712,9 +1711,9 @@ class _StoreStub:
         self.ctx_lock = asyncio.Lock()
         self.chat_history = {}
         self.model_overrides = {}
-        self.auto_respond = set()
-        self.ignored_chats = set()
-        self.ignored_users = set()
+        self.coder_chats = set()
+        self.reasoning_hidden = set()
+        self.tools_hidden = set()
         self.seen_msg_keys = set()
         self.last_chat_activity = {}
 
@@ -1940,12 +1939,8 @@ class CoreHelpersTest(BotTestCase):
             True,
             hist,
             {},
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             [],
             "h",
@@ -1961,12 +1956,8 @@ class CoreHelpersTest(BotTestCase):
             True,
             {},
             overrides,
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             [],
             "h",
@@ -1979,78 +1970,21 @@ class CoreHelpersTest(BotTestCase):
             True,
             {},
             overrides,
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             [],
             "h",
         )
         self.assertEqual(resp, ("Текущая модель / Current model: gpt", False, False))
 
-    def test_handle_command_state_autorespond(self):
-        auto = set()
-        resp = core.handle_command_state(
-            ("autorespond", True),
-            1,
-            True,
-            {},
-            {},
-            auto,
-            set(),
-            set(),
-            5,
-            5,
-            False,
-            "m",
-            [],
-            "h",
-        )
-        self.assertEqual(resp, ("Авто-ответ ВКЛ. / Auto-reply ON.", True, False))
-        self.assertIn(1, auto)
-        resp = core.handle_command_state(
-            ("autorespond", False),
-            1,
-            True,
-            {},
-            {},
-            auto,
-            set(),
-            set(),
-            5,
-            5,
-            False,
-            "m",
-            [],
-            "h",
-        )
-        self.assertEqual(resp, ("Авто-ответ ВЫКЛ. / Auto-reply OFF.", True, False))
-        self.assertNotIn(1, auto)
-
-    def test_handle_command_state_auto_status(self):
-        resp = core.handle_command_state(
-            ("auto_status", None),
-            1,
-            True,
-            {},
-            {},
-            set(),
-            set(),
-            set(),
-            5,
-            5,
-            True,
-            "m",
-            [],
-            "h",
-        )
-        self.assertEqual(resp, ("Авто-ответ / Auto-reply: ON", False, False))
-
     def test_handle_command_state_ping_and_history_removed(self):
-        for command in (("ping", None), ("history", None)):
+        for command in (
+            ("ping", None),
+            ("history", None),
+            ("autorespond", True),
+            ("ignore", None),
+        ):
             with self.subTest(command=command):
                 resp = core.handle_command_state(
                     command,
@@ -2058,12 +1992,8 @@ class CoreHelpersTest(BotTestCase):
                     True,
                     {},
                     {},
-                    set(),
-                    set(),
-                    set(),
                     5,
                     5,
-                    False,
                     "m",
                     [],
                     "h",
@@ -2077,12 +2007,8 @@ class CoreHelpersTest(BotTestCase):
             True,
             {},
             {},
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             ["m"],
             "h",
@@ -2096,40 +2022,13 @@ class CoreHelpersTest(BotTestCase):
             True,
             {},
             {},
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             [],
             "h",
         )
         self.assertEqual(resp, ("h", False, False))
-
-    def test_handle_command_state_ignore(self):
-        ignored = set()
-        resp = core.handle_command_state(
-            ("ignore", None),
-            1,
-            True,
-            {},
-            {},
-            set(),
-            ignored,
-            set(),
-            5,
-            5,
-            False,
-            "m",
-            [],
-            "h",
-        )
-        self.assertIn(1, ignored)
-        if resp is None:
-            self.fail("resp is None")
-        self.assertTrue(resp[1])
 
     def test_handle_command_state_unknown(self):
         resp = core.handle_command_state(
@@ -2138,12 +2037,8 @@ class CoreHelpersTest(BotTestCase):
             True,
             {},
             {},
-            set(),
-            set(),
-            set(),
             5,
             5,
-            False,
             "m",
             [],
             "h",
@@ -2234,13 +2129,15 @@ class CoreHelpersTest(BotTestCase):
     def test_parse_state_data(self):
         data = {
             "model_overrides": {"1": "m"},
-            "auto_respond": [1],
-            "ignored_chats": [2],
-            "ignored_users": [3],
+            "coder_chats": [1],
+            "reasoning_hidden": [2],
+            "tools_hidden": [3],
         }
         parsed = core.parse_state_data(data)
         self.assertEqual(parsed["model_overrides"], {1: "m"})
-        self.assertEqual(parsed["auto_respond"], {1})
+        self.assertEqual(parsed["coder_chats"], {1})
+        self.assertEqual(parsed["reasoning_hidden"], {2})
+        self.assertEqual(parsed["tools_hidden"], {3})
 
 
 class ContractPromptTest(BotTestCase):
@@ -2317,10 +2214,10 @@ class ContractPromptTest(BotTestCase):
         self.assertIn("Контракт / Contract: включён", report)
 
     def test_prompt_aliases_parse(self):
-        for text in (".db prompt", ".db промпт", ".db system", ".db система"):
+        for text in (".db prompt", ".ai prompt"):
             with self.subTest(text=text):
                 self.assertEqual(userbot.handle_commands(text), ("prompt", None))
-        for text in ("/prompt", "/промпт", "/system"):
+        for text in ("/prompt",):
             with self.subTest(text=text):
                 self.assertEqual(bot.handle_bot_commands(text), ("prompt", None))
 
@@ -2563,9 +2460,6 @@ class BotHandlerTest(BotTestCase):
     def setUp(self):
         super().setUp()
         for mod, attr, value in (
-            (bot, "auto_respond", set()),
-            (bot, "ignored_chats", set()),
-            (bot, "ignored_users", set()),
             (bot, "coder_chats", set()),
             (bot, "reasoning_hidden", set()),
             (bot, "tools_hidden", set()),
@@ -2581,7 +2475,6 @@ class BotHandlerTest(BotTestCase):
             ("OWNER_IDS", {self.OWNER}),
             ("ENABLE_USERBOT", False),
             ("COOLDOWN", 0),
-            ("AUTO_RESPOND_GLOBAL", False),
         ):
             saved = getattr(userbot, attr)
             self.addCleanup(setattr, userbot, attr, saved)
@@ -2650,16 +2543,6 @@ class BotHandlerTest(BotTestCase):
         self._run(self._group_event("просто текст"))
         self.assertEqual(self.stream_calls, [])
 
-    def test_group_auto_respond_triggers(self):
-        bot.auto_respond.add(self.GROUP)
-        self._run(self._group_event("просто текст"))
-        self.assertEqual(len(self.stream_calls), 1)
-
-    def test_global_auto_respond_triggers(self):
-        userbot.AUTO_RESPOND_GLOBAL = True
-        self._run(self._group_event("просто текст"))
-        self.assertEqual(len(self.stream_calls), 1)
-
     def test_db_trigger_without_userbot(self):
         self._run(self._group_event(".db привет"))
         self.assertEqual(len(self.stream_calls), 1)
@@ -2684,8 +2567,7 @@ class BotHandlerTest(BotTestCase):
         self.assertIn("вопрос", self._prompt())
 
     def test_reply_without_text_uses_replied_text(self):
-        bot.auto_respond.add(self.GROUP)
-        replied = _FakeMessage("только реплай", msg_id=6)
+        replied = _FakeMessage("только реплай", msg_id=6, out=True)
         self._run(self._group_event("   ", is_reply=True, reply_msg=replied))
         self.assertIn("только реплай", self._prompt())
 
@@ -2817,11 +2699,6 @@ class BotHandlerTest(BotTestCase):
         self.assertIn("владельцу", event.sent[0])
         self.assertEqual(self.stream_calls, [])
 
-    def test_ignore_command_skipped(self):
-        event = self._group_event("/ignore", sender_id=self.OWNER)
-        self._run(event)
-        self.assertEqual(self.stream_calls, [])
-
     def test_visibility_command_for_owner(self):
         event = self._group_event("/reasoning off", sender_id=self.OWNER)
         self._run(event)
@@ -2844,11 +2721,9 @@ class VisibilityCommandsTest(BotTestCase):
         )
         self.assertEqual(userbot.handle_commands(".db tools on"), ("tools", True))
         self.assertEqual(
-            userbot.handle_commands(".db ризонинг выкл"), ("reasoning", False)
+            userbot.handle_commands(".ai reasoning on"), ("reasoning", True)
         )
-        self.assertEqual(
-            userbot.handle_commands(".db инструменты"), ("tools_status", None)
-        )
+        self.assertEqual(userbot.handle_commands(".db tools"), ("tools_status", None))
         self.assertEqual(bot.handle_bot_commands("/reasoning on"), ("reasoning", True))
         self.assertEqual(bot.handle_bot_commands("/tools off"), ("tools", False))
         self.assertEqual(bot.handle_bot_commands("/tools"), ("tools_status", None))
@@ -2902,9 +2777,6 @@ class VisibilityCommandsTest(BotTestCase):
             state_file,
             {
                 "model_overrides": {},
-                "auto_respond": set(),
-                "ignored_chats": set(),
-                "ignored_users": set(),
                 "coder_chats": {1},
                 "reasoning_hidden": {2},
                 "tools_hidden": {3},
@@ -2932,7 +2804,7 @@ class CoderModeTest(BotTestCase):
 
     def test_aliases_parse(self):
         self.assertEqual(userbot.handle_commands(".db coder on"), ("coder", True))
-        self.assertEqual(userbot.handle_commands(".db кодер выкл"), ("coder", False))
+        self.assertEqual(userbot.handle_commands(".ai coder off"), ("coder", False))
         self.assertEqual(userbot.handle_commands(".db coder"), ("coder_status", None))
         self.assertEqual(bot.handle_bot_commands("/coder off"), ("coder", False))
         self.assertEqual(bot.handle_bot_commands("/coder"), ("coder_status", None))
@@ -3033,10 +2905,10 @@ class CoderModeTest(BotTestCase):
         self.addCleanup(setattr, userbot, "ENABLE_USERBOT", saved)
         userbot.ENABLE_USERBOT = True
         self.assertFalse(bot._db_triggered(".db привет"))
-        self.assertFalse(bot._db_triggered(".danybot привет"))
+        self.assertFalse(bot._db_triggered(".ai привет"))
         userbot.ENABLE_USERBOT = False
         self.assertTrue(bot._db_triggered(".db привет"))
-        self.assertTrue(bot._db_triggered("привет .gpt"))
+        self.assertTrue(bot._db_triggered("привет .ai"))
         self.assertFalse(bot._db_triggered("привет"))
         self.assertFalse(bot._db_triggered(None))
 
@@ -3141,62 +3013,6 @@ class CoderModeTest(BotTestCase):
         self.assertIn("execute_script", names)
         self.assertIn("execute_script", userbot.CODER_SYSTEM_PROMPT)
 
-    def test_creator_info_exposed(self):
-        self.assertIn("Создатель", userbot.CREATOR_INFO)
-        if userbot.CREATOR_ID:
-            self.assertIn(userbot.CREATOR_ID, userbot.CREATOR_INFO)
-        self.assertEqual(userbot.CREATOR_CONFIGURED, bool(userbot.CREATOR_EXTRA))
-
-    def test_creator_info_built_from_settings(self):
-        names = (
-            "CREATOR_NAME",
-            "CREATOR_USERNAME",
-            "CREATOR_ID",
-            "CREATOR_PHONE",
-            "CREATOR_EXTRA",
-        )
-        saved = {name: getattr(userbot, name) for name in names}
-        self.addCleanup(lambda: [setattr(userbot, name, saved[name]) for name in names])
-
-        def apply(**values):
-            for name in names:
-                setattr(userbot, name, values.get(name, ""))
-            return userbot._build_creator_info()
-
-        info = apply(
-            CREATOR_NAME="Danya",
-            CREATOR_USERNAME="tester",
-            CREATOR_ID="42",
-            CREATOR_PHONE="+79990000000",
-            CREATOR_EXTRA="люблю котиков",
-        )
-        self.assertIn("Создатель и владелец: Danya", info)
-        self.assertIn("@tester", info)
-        self.assertIn("id 42", info)
-        self.assertIn("+79990000000", info)
-        self.assertIn("люблю котиков", info)
-        self.assertIn("Создатель", apply(CREATOR_ID="7"))
-        self.assertEqual(apply(), userbot.CREATOR_UNSET_TEXT)
-        self.assertIn("Создатель", apply(CREATOR_EXTRA="приват"))
-
-    def test_creator_prompt_keeps_configured_info(self):
-        names = (
-            "CREATOR_NAME",
-            "CREATOR_USERNAME",
-            "CREATOR_ID",
-            "CREATOR_PHONE",
-            "CREATOR_EXTRA",
-            "CREATOR_CONFIGURED",
-        )
-        saved = {name: getattr(userbot, name) for name in names}
-        self.addCleanup(lambda: [setattr(userbot, name, saved[name]) for name in names])
-        for name in names[:-1]:
-            setattr(userbot, name, "")
-        userbot.CREATOR_CONFIGURED = False
-        self.assertNotIn(userbot.CREATOR_UNSET_TEXT, userbot.system_for(-100))
-        userbot.CREATOR_CONFIGURED = True
-        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(-100))
-
 
 class _CallbackEvent:
     def __init__(self, data, chat_id, sender_id):
@@ -3236,7 +3052,6 @@ class SettingsMenuTest(BotTestCase):
         self.addCleanup(setattr, userbot, "OWNER_IDS", saved_owners)
         saved = {
             "coder": set(bot.coder_chats),
-            "auto": set(bot.auto_respond),
             "reasoning": set(bot.reasoning_hidden),
             "tools": set(bot.tools_hidden),
             "models": dict(bot.model_overrides),
@@ -3245,8 +3060,6 @@ class SettingsMenuTest(BotTestCase):
         def restore():
             bot.coder_chats.clear()
             bot.coder_chats.update(saved["coder"])
-            bot.auto_respond.clear()
-            bot.auto_respond.update(saved["auto"])
             bot.reasoning_hidden.clear()
             bot.reasoning_hidden.update(saved["reasoning"])
             bot.tools_hidden.clear()
@@ -3258,13 +3071,12 @@ class SettingsMenuTest(BotTestCase):
 
     def test_settings_aliases_parse(self):
         self.assertEqual(bot.handle_bot_commands("/settings"), ("settings", None))
-        self.assertEqual(bot.handle_bot_commands("/настройки"), ("settings", None))
 
     def test_ping_and_history_commands_gone(self):
-        for text in ("/ping", "/history", "/пинг", "/история"):
+        for text in ("/ping", "/history"):
             with self.subTest(text=text):
                 self.assertIsNone(bot.handle_bot_commands(text))
-        for text in (".db ping", ".db history", ".дани история"):
+        for text in (".db ping", ".db history"):
             with self.subTest(text=text):
                 self.assertIsNone(userbot.handle_commands(text))
 
@@ -3274,7 +3086,6 @@ class SettingsMenuTest(BotTestCase):
             rows_data(rows),
             {
                 "settings:model",
-                "settings:auto",
                 "settings:reasoning",
                 "settings:tools",
                 "settings:coder",
@@ -3288,16 +3099,6 @@ class SettingsMenuTest(BotTestCase):
         self.assertIn("Настройки / Settings", text)
         self.assertIn(userbot.DANYAPI_MODEL, text)
         self.assertIn("Контекст / Context", text)
-
-    def test_callback_toggles_auto_reply(self):
-        with mock.patch.object(userbot, "AUTO_RESPOND_GLOBAL", False):
-            bot.auto_respond.discard(self.CHAT_ID)
-            event = _CallbackEvent(b"settings:auto", self.CHAT_ID, self.CHAT_ID)
-            asyncio.run(bot.callback_handler(event))
-            self.assertIn(self.CHAT_ID, bot.auto_respond)
-            self.assertTrue(event.edits)
-            asyncio.run(bot.callback_handler(event))
-            self.assertNotIn(self.CHAT_ID, bot.auto_respond)
 
     def test_callback_toggles_visibility(self):
         bot.reasoning_hidden.discard(self.CHAT_ID)
@@ -3316,7 +3117,7 @@ class SettingsMenuTest(BotTestCase):
         self.assertTrue(bot.is_coder(self.CHAT_ID))
 
     def test_callback_rejects_non_owner(self):
-        event = _CallbackEvent(b"settings:auto", self.CHAT_ID, self.CHAT_ID + 1)
+        event = _CallbackEvent(b"settings:reasoning", self.CHAT_ID, self.CHAT_ID + 1)
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(event.edits, [])
         self.assertTrue(event.answers[-1][1])
@@ -3376,14 +3177,6 @@ class UserbotHelpersTest(BotTestCase):
         self.assertTrue(
             userbot.system_for(1, mode="coder").startswith(userbot.CODER_SYSTEM_PROMPT)
         )
-
-    def test_system_for_creator_block(self):
-        saved = userbot.CREATOR_CONFIGURED
-        self.addCleanup(setattr, userbot, "CREATOR_CONFIGURED", saved)
-        userbot.CREATOR_CONFIGURED = True
-        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(1))
-        userbot.CREATOR_CONFIGURED = False
-        self.assertNotIn(userbot.CREATOR_INFO, userbot.system_for(1))
 
     def test_make_session_plain(self):
         self.assertEqual(userbot.make_session("plain"), "plain")

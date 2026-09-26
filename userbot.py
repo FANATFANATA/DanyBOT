@@ -88,7 +88,6 @@ SANITIZE_PROMPT = os.getenv(
 )
 
 TRIGGER_ALIASES = core.TRIGGER_ALIASES
-AUTO_ALIASES = core.AUTO_ALIASES
 TRIGGER_RE = core.TRIGGER_RE
 
 EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
@@ -97,7 +96,6 @@ DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
 MAX_TOOL_ROUNDS = max(1, _env_int("MAX_TOOL_ROUNDS", 8))
-AUTO_RESPOND_GLOBAL = _env_str("AUTO_RESPOND", "0").lower() in ("1", "true", "yes")
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
 SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
@@ -111,43 +109,6 @@ CODER_SYSTEM_PROMPT = os.getenv(
     "save_skill, load_skill, list_skills, delete_skill. Действуй по "
     "шагам, проверяй результат инструментами, не выдумывай содержимое файлов. "
     "Отвечай кратко и по делу на языке последнего сообщения.",
-)
-
-CREATOR_NAME = _env_str("CREATOR_NAME", "")
-CREATOR_USERNAME = _env_str("CREATOR_USERNAME", "")
-CREATOR_ID = _env_str("CREATOR_ID", "")
-CREATOR_PHONE = _env_str("CREATOR_PHONE", "")
-CREATOR_EXTRA = _env_str("CREATOR_EXTRA", "")
-
-CREATOR_UNSET_TEXT = (
-    "Создатель и владелец не задан. Задай CREATOR_NAME, CREATOR_USERNAME, "
-    "CREATOR_ID или CREATOR_PHONE в .env."
-)
-
-
-def _build_creator_info():
-    parts = []
-    if CREATOR_NAME:
-        parts.append(CREATOR_NAME)
-    if CREATOR_USERNAME:
-        parts.append(f"@{CREATOR_USERNAME}")
-    if CREATOR_ID:
-        parts.append(f"id {CREATOR_ID}")
-    if CREATOR_PHONE:
-        parts.append(f"телефон {CREATOR_PHONE}")
-    if not parts:
-        if not CREATOR_EXTRA:
-            return CREATOR_UNSET_TEXT
-        return f"Создатель и владелец. {CREATOR_EXTRA}"
-    line = "Создатель и владелец: " + ", ".join(parts)
-    if CREATOR_EXTRA:
-        line = f"{line}. {CREATOR_EXTRA}"
-    return f"{line}."
-
-
-CREATOR_INFO = _build_creator_info()
-CREATOR_CONFIGURED = any(
-    (CREATOR_NAME, CREATOR_USERNAME, CREATOR_ID, CREATOR_PHONE, CREATOR_EXTRA)
 )
 
 ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
@@ -225,9 +186,6 @@ HISTORY_FILE = Path(__file__).parent / "history_userbot.json"
 MODELS: list[str] = ["deepseek-v4-flash"]
 
 model_overrides: dict[int, str] = {}
-auto_respond: set[int] = set()
-ignored_chats: set[int] = set()
-ignored_users: set[int] = set()
 coder_chats: set[int] = set()
 reasoning_hidden: set[int] = set()
 tools_hidden: set[int] = set()
@@ -387,8 +345,6 @@ def system_for(chat_id, mode="userbot"):
     else:
         base = SYSTEM_PROMPT
     parts = [base]
-    if CREATOR_CONFIGURED:
-        parts.append(CREATOR_INFO)
     if EXTRA_SYSTEM:
         parts.append(EXTRA_SYSTEM)
     contract = load_contract()
@@ -717,25 +673,18 @@ async def refresh_models():
 
 
 HELP_TEXT = (
-    "Алиасы триггера / Trigger aliases: .danybot .danyapi .dany .db .gpt .ai "
-    ".бот .д .б\n"
-    "Алиасы команд / Command aliases: help/помощь, model/модель, "
-    "models/модели, clear/забудь/сброс/очистить\n\n"
+    "Алиасы триггера / Trigger aliases: .db .ai\n"
     "Команды / Commands:\n"
-    ".danybot <текст/text> — вопрос / question\n"
-    ".danybot model <id> — сменить модель / set model\n"
-    ".danybot models — список моделей / list models\n"
-    ".danybot model — показать текущую модель / show current model\n"
-    ".danybot clear — очистить контекст / clear context\n"
-    ".danybot ignore / unignore — заглушить/разглушить чат / mute/unmute "
-    "chat\n"
-    ".danybot coder — кодер-режим живёт в боте / coder mode lives in the bot\n"
-    ".danybot reasoning on/off — показ рассуждений / show reasoning\n"
-    ".danybot tools on/off — показ вызовов инструментов / show tool calls\n"
-    ".danybot creator — создатель / creator\n"
-    ".danybot prompt — системный промпт, только владелец / system prompt, owner only\n"
-    ".danybot help — эта справка / this help\n\n"
-    "Авто-ответ / Auto-reply: .danyauto on/off (.da .auto .авто)"
+    ".db <текст/text> — вопрос / question\n"
+    ".db model <id> — сменить модель / set model\n"
+    ".db models — список моделей / list models\n"
+    ".db model — показать текущую модель / show current model\n"
+    ".db clear — очистить контекст / clear context\n"
+    ".db coder — кодер-режим живёт в боте / coder mode lives in the bot\n"
+    ".db reasoning on/off — показ рассуждений / show reasoning\n"
+    ".db tools on/off — показ вызовов инструментов / show tool calls\n"
+    ".db prompt — системный промпт, только владелец / system prompt, owner only\n"
+    ".db help — эта справка / this help\n"
 )
 
 
@@ -767,10 +716,6 @@ async def handler(event: Any):
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         command = None
 
-    if command and command[0] == "creator":
-        await safe_reply(event, CREATOR_INFO)
-        return
-
     if command and command[0] in ("coder", "coder_status"):
         await safe_reply(event, "Кодер-режим работает только в боте: /coder on")
         return
@@ -794,18 +739,6 @@ async def handler(event: Any):
         await safe_reply(event, text_out)
         return
 
-    if command and command[0] == "unignore":
-        async with ctx_lock:
-            ignored_chats.discard(chat_id)
-        save_state()
-        await safe_reply(event, "Чат разглушен. / Chat unmuted.")
-        return
-
-    if chat_id in ignored_chats:
-        return
-    if sender_id is not None and sender_id in ignored_users:
-        return
-
     if command:
         resp = core.handle_command_state(
             command,
@@ -813,12 +746,8 @@ async def handler(event: Any):
             is_private,
             chat_history,
             model_overrides,
-            auto_respond,
-            ignored_chats,
-            ignored_users,
             DM_HISTORY_LIMIT,
             GROUP_HISTORY_LIMIT,
-            AUTO_RESPOND_GLOBAL,
             DANYAPI_MODEL,
             MODELS,
             HELP_TEXT,
@@ -848,14 +777,7 @@ async def handler(event: Any):
         HISTORY_SAVER.mark_dirty,
     )
 
-    if triggered:
-        effective_trigger = True
-    elif not is_self:
-        effective_trigger = chat_id in auto_respond or AUTO_RESPOND_GLOBAL
-    else:
-        effective_trigger = False
-
-    if not effective_trigger:
+    if not triggered:
         return
 
     if (

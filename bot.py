@@ -26,9 +26,6 @@ STATE_FILE = Path(__file__).parent / "state_bot.json"
 HISTORY_FILE = Path(__file__).parent / "history_bot.json"
 
 model_overrides: dict[int, str] = {}
-auto_respond: set[int] = set()
-ignored_chats: set[int] = set()
-ignored_users: set[int] = set()
 coder_chats: set[int] = set()
 reasoning_hidden: set[int] = set()
 tools_hidden: set[int] = set()
@@ -81,7 +78,7 @@ BOT_HELP_TEXT = (
     "DanyBOT - команды / commands:\n"
     "/help /start - справка / help\n"
     "/settings - настройки, инлайн-меню / settings, inline menu\n\n"
-    "Модель, авто-ответ, рассуждения, инструменты, кодер-режим, очистка\n"
+    "Модель, рассуждения, инструменты, кодер-режим, очистка\n"
     "контекста и системный промпт - в меню /settings.\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
 )
@@ -186,9 +183,6 @@ async def handler(event: Any):
     except (KeyError, IndexError, TypeError, AttributeError, ValueError):
         command = None
 
-    if command and command[0] in ("ignore", "unignore"):
-        return
-
     if command and command[0] in ("coder", "coder_status"):
         if sender_id not in userbot.OWNER_IDS:
             await safe_reply(event, "Кодер-режим доступен только владельцу.")
@@ -253,12 +247,8 @@ async def handler(event: Any):
             is_private,
             chat_history,
             model_overrides,
-            auto_respond,
-            ignored_chats,
-            ignored_users,
             userbot.DM_HISTORY_LIMIT,
             userbot.GROUP_HISTORY_LIMIT,
-            userbot.AUTO_RESPOND_GLOBAL,
             userbot.DANYAPI_MODEL,
             userbot.MODELS,
             BOT_HELP_TEXT,
@@ -298,8 +288,6 @@ async def handler(event: Any):
         or (is_private and not is_self)
     ):
         effective_trigger = True
-    elif not is_self:
-        effective_trigger = chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL
     else:
         effective_trigger = False
 
@@ -412,9 +400,6 @@ async def handler(event: Any):
 
 
 def _settings_rows(chat_id):
-    auto_state = "вкл"
-    if not (chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL):
-        auto_state = "выкл"
     reasoning_state = "видно"
     if chat_id in reasoning_hidden:
         reasoning_state = "скрыто"
@@ -427,7 +412,6 @@ def _settings_rows(chat_id):
     current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     rows = [
         [Button.inline(f"Модель: {current}", b"settings:model")],
-        [Button.inline(f"Авто-ответ: {auto_state}", b"settings:auto")],
         [Button.inline(f"Рассуждения: {reasoning_state}", b"settings:reasoning")],
         [Button.inline(f"Инструменты: {tools_state}", b"settings:tools")],
         [Button.inline(f"Кодер-режим: {coder_state}", b"settings:coder")],
@@ -470,14 +454,7 @@ async def callback_handler(event: Any):
     parts = raw.split(":", 2)
     action = parts[1].strip() if len(parts) > 1 else ""
     arg = parts[2].strip() if len(parts) > 2 else ""
-    if action == "auto":
-        async with ctx_lock:
-            if chat_id in auto_respond or userbot.AUTO_RESPOND_GLOBAL:
-                auto_respond.discard(chat_id)
-            else:
-                auto_respond.add(chat_id)
-        save_state()
-    elif action == "reasoning":
+    if action == "reasoning":
         async with ctx_lock:
             if chat_id in reasoning_hidden:
                 reasoning_hidden.discard(chat_id)
