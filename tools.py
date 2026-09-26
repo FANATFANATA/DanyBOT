@@ -1273,7 +1273,7 @@ async def _tool_memory_remember(arguments, chat_id, client, stats, unrestricted=
     key = _str_arg(arguments, "key")
     value = str(arguments.get("value", ""))
     tags = arguments.get("tags")
-    result = memory.remember(chat_id, key, value, tags)
+    result = await asyncio.to_thread(memory.remember, chat_id, key, value, tags)
     return memory.dumps(result)
 
 
@@ -1283,7 +1283,9 @@ async def _tool_memory_recall(arguments, chat_id, client, stats, unrestricted=Fa
     key = _str_arg(arguments, "key")
     query = _str_arg(arguments, "query")
     limit = _int_arg(arguments, "limit", 10, 1, 200)
-    result = memory.recall(chat_id, key=key, query=query, limit=limit)
+    result = await asyncio.to_thread(
+        memory.recall, chat_id, key=key, query=query, limit=limit
+    )
     return memory.dumps(result)
 
 
@@ -1292,7 +1294,7 @@ async def _tool_memory_forget(arguments, chat_id, client, stats, unrestricted=Fa
 
     key = _str_arg(arguments, "key")
     mem_id = _int_arg(arguments, "id", 0, 0, 10**9)
-    result = memory.forget(chat_id, key=key, mem_id=mem_id)
+    result = await asyncio.to_thread(memory.forget, chat_id, key=key, mem_id=mem_id)
     return memory.dumps(result)
 
 
@@ -1300,8 +1302,8 @@ async def _tool_memory_list(arguments, chat_id, client, stats, unrestricted=Fals
     import memory
 
     limit = _int_arg(arguments, "limit", 50, 1, 200)
-    result = memory.list_memories(chat_id, limit=limit)
-    result["stats"] = memory.stats(chat_id)
+    result = await asyncio.to_thread(memory.list_memories, chat_id, limit=limit)
+    result["stats"] = await asyncio.to_thread(memory.stats, chat_id)
     return memory.dumps(result)
 
 
@@ -1312,7 +1314,7 @@ async def _tool_save_skill(arguments, chat_id, client, stats, unrestricted=False
     description = _str_arg(arguments, "description")
     body = str(arguments.get("body", ""))
     tags = arguments.get("tags")
-    result = skills.save_skill(name, description, body, tags)
+    result = await asyncio.to_thread(skills.save_skill, name, description, body, tags)
     return skills.dumps(result)
 
 
@@ -1320,7 +1322,7 @@ async def _tool_load_skill(arguments, chat_id, client, stats, unrestricted=False
     import skills
 
     name = _str_arg(arguments, "name")
-    result = skills.load_skill(name)
+    result = await asyncio.to_thread(skills.load_skill, name)
     return skills.dumps(result)
 
 
@@ -1330,8 +1332,10 @@ async def _tool_list_skills(arguments, chat_id, client, stats, unrestricted=Fals
     tag = _str_arg(arguments, "tag")
     query = _str_arg(arguments, "query")
     limit = _int_arg(arguments, "limit", 50, 1, 200)
-    result = skills.list_skills(tag=tag, query=query, limit=limit)
-    result["stats"] = skills.stats()
+    result = await asyncio.to_thread(
+        skills.list_skills, tag=tag, query=query, limit=limit
+    )
+    result["stats"] = await asyncio.to_thread(skills.stats)
     return skills.dumps(result)
 
 
@@ -1339,7 +1343,7 @@ async def _tool_delete_skill(arguments, chat_id, client, stats, unrestricted=Fal
     import skills
 
     name = _str_arg(arguments, "name")
-    result = skills.delete_skill(name)
+    result = await asyncio.to_thread(skills.delete_skill, name)
     return skills.dumps(result)
 
 
@@ -1373,13 +1377,30 @@ _HANDLERS = {
 
 
 async def execute_tool(
-    name, arguments, chat_id, client=None, stats=None, unrestricted=False
+    name,
+    arguments,
+    chat_id,
+    client=None,
+    stats=None,
+    unrestricted=False,
+    allowed=None,
 ):
     handler = _HANDLERS.get(name)
     if handler is None:
         return f"Неизвестная функция: {name}"
+    if allowed is not None and name not in allowed:
+        logger.warning("Инструмент %s не разрешён в этой сессии", name)
+        return f"Инструмент недоступен в этой сессии: {name}"
     try:
         return await handler(arguments, chat_id, client, stats, unrestricted)
     except TOOL_ERRORS as exc:
         logger.exception("Инструмент %s упал", name)
         return f"Ошибка инструмента {name}: {type(exc).__name__}: {exc}"
+
+
+def tool_names_of(schema) -> set:
+    return {
+        item["function"]["name"]
+        for item in schema
+        if isinstance(item, dict) and "function" in item
+    }

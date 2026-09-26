@@ -67,6 +67,8 @@ TOOL_VERIFY_PROMPT = os.getenv(
     "Ответь строго одним словом: ALLOW или DENY.",
 )
 TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
+VERIFY_TOKENS_SHELL = _env_int("VERIFY_TOKENS_SHELL", 1024)
+VERIFY_TOKENS_TOOL = _env_int("VERIFY_TOKENS_TOOL", 512)
 RUN_SHELL_MODEL = _env_str("RUN_SHELL_MODEL", "")
 RUN_SHELL_VERIFY_PROMPT = os.getenv(
     "RUN_SHELL_VERIFY_PROMPT",
@@ -407,12 +409,18 @@ def _bot_stats(chat_id):
 
 
 async def execute_tool(
-    name: str, arguments: dict, chat_id, client=None, stats=None, unrestricted=False
+    name: str,
+    arguments: dict,
+    chat_id,
+    client=None,
+    stats=None,
+    unrestricted=False,
+    allowed=None,
 ):
     if client is None:
         client = globals()["client"]
     return await tools_module.execute_tool(
-        name, arguments, chat_id, client, stats or _bot_stats, unrestricted
+        name, arguments, chat_id, client, stats or _bot_stats, unrestricted, allowed
     )
 
 
@@ -436,11 +444,11 @@ async def verify_tool_call(
     if name == "run_shell":
         prompt = RUN_SHELL_VERIFY_PROMPT
         use_model = RUN_SHELL_MODEL or model
-        max_tokens = 1024
+        max_tokens = VERIFY_TOKENS_SHELL
     else:
         prompt = TOOL_VERIFY_PROMPT
         use_model = model
-        max_tokens = 8
+        max_tokens = VERIFY_TOKENS_TOOL
     try:
         resp = await asyncio.wait_for(
             ai.chat.completions.create(
@@ -548,6 +556,7 @@ async def stream_with_tools(
     rounds = 0
     all_parts: list[str] = []
     content_parts: list[str] = []
+    allowed = tools_module.tool_names_of(tools if tools is not None else TOOLS)
     while True:
         rounds += 1
         if 0 < MAX_TOOL_ROUNDS < rounds:
@@ -641,7 +650,13 @@ async def stream_with_tools(
             ):
                 return slot, None
             result = await execute_tool(
-                slot["name"], args, chat_id, client_override, stats, unrestricted
+                slot["name"],
+                args,
+                chat_id,
+                client_override,
+                stats,
+                unrestricted,
+                allowed,
             )
             if slot["name"] in SANITIZED_TOOLS and sanitize_tools and not unrestricted:
                 result = await sanitize_tool_output(result, model)

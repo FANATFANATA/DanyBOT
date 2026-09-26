@@ -608,7 +608,7 @@ class ProxyToggleTest(BotTestCase):
         self.assertEqual(result, [])
 
     def test_enabled_collects_manual_and_auto(self):
-        async def fake_get_working(limit=10, prefer_protocol="socks5"):
+        async def fake_get_working(limit=10, prefer_protocol="socks5", deadline=180.0):
             return [("socks5", "9.9.9.9", 1080)]
 
         with (
@@ -806,6 +806,44 @@ class GetWorkingProxiesTest(BotTestCase):
         with mock.patch.object(proxies, "fetch_sources", fake_fetch_sources):
             result = asyncio.run(proxies.get_working_proxies(limit=3))
         self.assertEqual(result, [])
+
+    def test_validation_deadline_returns_empty(self):
+        async def fake_fetch_sources():
+            return [("socks5", "1.1.1.1", 1080)]
+
+        async def slow_validate(items, limit=10, concurrency=20):
+            await asyncio.sleep(5)
+            return []
+
+        with (
+            mock.patch.object(proxies, "fetch_sources", fake_fetch_sources),
+            mock.patch.object(proxies, "validate_many", slow_validate),
+        ):
+            result = asyncio.run(proxies.get_working_proxies(limit=3, deadline=0.2))
+        self.assertEqual(result, [])
+
+    def test_candidates_deadline_keeps_manual_proxy(self):
+        async def slow_get_working(limit=10, prefer_protocol="socks5", deadline=180.0):
+            await asyncio.sleep(5)
+            return []
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PROXY_ENABLED": "1",
+                    "PROXY_HOST": "1.2.3.4",
+                    "PROXY_PORT": "1080",
+                    "PROXY_TYPE": "http",
+                    "PROXY_AUTO": "1",
+                },
+            ),
+            mock.patch.object(proxies, "get_working_proxies", slow_get_working),
+        ):
+            result = asyncio.run(proxies.get_proxy_candidates(limit=5, deadline=0.2))
+        self.assertEqual(
+            result, [{"proxy_type": "http", "addr": "1.2.3.4", "port": 1080}]
+        )
 
 
 class StateRoundtripTest(BotTestCase):
@@ -1158,7 +1196,13 @@ class StreamToolsTest(BotTestCase):
         self.tool_calls_made = []
 
         async def fake_execute(
-            name, args, chat_id, client=None, stats=None, unrestricted=False
+            name,
+            args,
+            chat_id,
+            client=None,
+            stats=None,
+            unrestricted=False,
+            allowed=None,
         ):
             self.tool_calls_made.append((name, args, chat_id))
             return "TOOLOK"
@@ -1607,11 +1651,23 @@ class VerifyToolCallTest(BotTestCase):
         ok = asyncio.run(userbot.verify_tool_call("run_shell", {"command": "x"}, "m"))
         self.assertFalse(ok)
 
-    def test_small_max_tokens_for_other_tools(self):
+    def test_verifier_budget_fits_a_verdict(self):
         fake_ai = self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW")))
         ok = asyncio.run(userbot.verify_tool_call("fetch_url", {}, "m"))
         self.assertTrue(ok)
-        self.assertEqual(fake_ai.chat.completions.calls[0]["max_tokens"], 8)
+        self.assertGreaterEqual(
+            fake_ai.chat.completions.calls[0]["max_tokens"],
+            userbot.VERIFY_TOKENS_TOOL,
+        )
+        self.assertGreaterEqual(userbot.VERIFY_TOKENS_TOOL, 256)
+
+    def test_verifier_budget_for_shell(self):
+        fake_ai = self.install_ai(NonStreamResponse(NonStreamMessage(content="ALLOW")))
+        asyncio.run(userbot.verify_tool_call("run_shell", {"command": "ls"}, "m"))
+        self.assertEqual(
+            fake_ai.chat.completions.calls[0]["max_tokens"],
+            userbot.VERIFY_TOKENS_SHELL,
+        )
 
 
 class FloodRetryTest(BotTestCase):
@@ -1861,6 +1917,51 @@ class ExtraToolsTest(BotTestCase):
             out = self._run("fetch_url", {"url": "https://93.184.216.34/"})
         self.assertIn("Ошибка инструмента fetch_url", out)
         self.assertIn("connection reset", out)
+
+    def test_execute_tool_enforces_allowed_set(self):
+        allowed = tools_module.tool_names_of(tools_module.BOT_TOOLS)
+        self.assertNotIn("read_file", allowed)
+        out = asyncio.run(
+            tools_module.execute_tool(
+                "read_file", {"path": "x"}, -100, None, None, False, allowed
+            )
+        )
+        self.assertIn("недоступен в этой сессии", out)
+        out = asyncio.run(
+            tools_module.execute_tool("get_time", {}, -100, None, None, False, allowed)
+        )
+        self.assertIn("utc", out)
+
+    def test_tool_names_of_ignores_broken_schema(self):
+        self.assertEqual(tools_module.tool_names_of([{"nope": 1}, "x"]), set())
+
+    def test_memory_and_skill_tools_work_through_threads(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_tools_store_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for mod in (memory, skills):
+            for attr, value in (
+                ("DATA_DIR", tmp),
+                ("DB_PATH", tmp / f"{mod.__name__}.db"),
+            ):
+                patcher = mock.patch.object(mod, attr, value)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+            self.addCleanup(mod._initialized.clear)
+            mod._initialized.clear()
+        created = self._run(
+            "memory_remember", {"key": "k1", "value": "v1", "tags": ["a"]}
+        )
+        self.assertIn("created", created)
+        recalled = self._run("memory_recall", {"key": "k1"})
+        self.assertIn("v1", recalled)
+        listed = self._run("memory_list", {})
+        self.assertIn("k1", listed)
+        self.assertIn("stats", listed)
+        self.assertIn("deleted", self._run("memory_forget", {"key": "k1"}))
+        self.assertIn("created", self._run("save_skill", {"name": "s", "body": "b"}))
+        self.assertIn("s", self._run("load_skill", {"name": "s"}))
+        self.assertIn("s", self._run("list_skills", {}))
+        self.assertIn("deleted", self._run("delete_skill", {"name": "s"}))
 
     def test_execute_tool_unknown_name(self):
         self.assertEqual(self._run("nope", {}), "Неизвестная функция: nope")

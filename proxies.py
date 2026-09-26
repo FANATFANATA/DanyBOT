@@ -289,7 +289,7 @@ def save_proxy_cache(proxies):
     _cache_write(CACHE_FILE, json.dumps(data, indent=2))
 
 
-async def get_working_proxies(limit=10, prefer_protocol="socks5"):
+async def get_working_proxies(limit=10, prefer_protocol="socks5", deadline=180.0):
     cached = load_proxy_cache()
     if cached:
         valid = await validate_many(cached[:30], limit=limit, concurrency=20)
@@ -306,7 +306,14 @@ async def get_working_proxies(limit=10, prefer_protocol="socks5"):
         save_raw_cache(all_proxies[:MAX_CACHED_RAW])
 
     logger.info("Прокси в пуле: %d", len(all_proxies))
-    working = await validate_many(all_proxies[:MAX_CANDIDATES], limit=limit)
+    try:
+        async with asyncio.timeout(deadline):
+            working = await validate_many(all_proxies[:MAX_CANDIDATES], limit=limit)
+    except TimeoutError:
+        logger.warning(
+            "Проверка прокси не уложилась в %.0fs, беру следующий режим", deadline
+        )
+        return []
     if working:
         save_proxy_cache(working)
         return working
@@ -336,7 +343,7 @@ def proxies_enabled():
     return raw.strip().lower() not in ("0", "false", "no", "")
 
 
-async def get_proxy_candidates(limit=40):
+async def get_proxy_candidates(limit=40, deadline=180.0):
     if not proxies_enabled():
         logger.info("Прокси отключены настройкой PROXY_ENABLED")
         return []
@@ -350,7 +357,14 @@ async def get_proxy_candidates(limit=40):
         candidates.append({"proxy_type": proto, "addr": host, "port": int(port)})
 
     if _env_bool("PROXY_AUTO", True):
-        items = await get_working_proxies(limit=limit, prefer_protocol=proto)
+        try:
+            async with asyncio.timeout(deadline):
+                items = await get_working_proxies(
+                    limit=limit, prefer_protocol=proto, deadline=deadline
+                )
+        except TimeoutError:
+            logger.warning("Прокси не собраны за %.0fs, иду напрямую", deadline)
+            return candidates
         for item in items:
             d = proxy_to_telethon(item)
             if d and d not in candidates:

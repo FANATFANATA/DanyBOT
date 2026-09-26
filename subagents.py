@@ -144,6 +144,7 @@ async def run_subagent(
     rounds_limit = max_rounds if max_rounds is not None else _RUNTIME["max_rounds"]
     verifier = cast(Any, _RUNTIME["verifier"])
     tool_stats = stats if stats is not None else _RUNTIME["stats"]
+    allowed = tools_module.tool_names_of(selected_tools)
     logger.debug("Субагент %s: %s", subagent_name, str(task)[:120])
 
     messages = [
@@ -211,7 +212,7 @@ async def run_subagent(
                     continue
             try:
                 output = await tools_module.execute_tool(
-                    name, arguments, chat_id, client, tool_stats
+                    name, arguments, chat_id, client, tool_stats, False, allowed
                 )
             except (OSError, ValueError, TypeError, RuntimeError) as exc:
                 output = f"Ошибка инструмента {name}: {exc}"
