@@ -643,7 +643,11 @@ async def stream_with_tools(
                 result = await execute_tool(
                     slot["name"], args, chat_id, client_override
                 )
-            if slot["name"] == "run_shell" and sanitize_tools and not owner:
+            if (
+                slot["name"] in ("run_shell", "execute_script")
+                and sanitize_tools
+                and not owner
+            ):
                 result = await sanitize_tool_output(result, model)
             return slot, result
 

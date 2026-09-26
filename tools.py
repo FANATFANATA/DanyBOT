@@ -1010,12 +1010,15 @@ async def _tool_run_shell(arguments, chat_id, client, stats):
             return err
         if not workdir.is_dir():
             return f"Каталог не найден: {workdir}"
-    proc = await asyncio.create_subprocess_shell(
-        command,
-        cwd=str(workdir) if workdir else None,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=str(workdir) if workdir else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        return f"Ошибка запуска: {exc}"
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
