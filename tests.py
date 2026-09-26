@@ -2197,12 +2197,13 @@ class ContractPromptTest(BotTestCase):
         userbot.CONTRACT_ENABLED = False
         self.assertEqual(userbot.load_contract(), "")
 
-    def test_contract_in_every_mode(self):
+    def test_contract_only_in_coder_mode(self):
         contract = userbot.load_contract()
         self.assertTrue(contract)
-        for mode in ("userbot", "bot", "coder"):
+        self.assertIn(contract, userbot.system_for(self.CHAT_ID, mode="coder"))
+        for mode in ("userbot", "bot"):
             with self.subTest(mode=mode):
-                self.assertIn(contract, userbot.system_for(self.CHAT_ID, mode=mode))
+                self.assertNotIn(contract, userbot.system_for(self.CHAT_ID, mode=mode))
 
     def test_system_prompt_report_shape(self):
         report = userbot.system_prompt_report(self.CHAT_ID, mode="bot")

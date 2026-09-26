@@ -93,6 +93,7 @@ TRIGGER_RE = core.TRIGGER_RE
 EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
 GROUP_HISTORY_LIMIT = max(2, _env_int("GROUP_HISTORY_LIMIT", 40))
 DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
+LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
 MAX_TOOL_ROUNDS = max(1, _env_int("MAX_TOOL_ROUNDS", 8))
@@ -353,9 +354,10 @@ def system_for(chat_id, mode="userbot"):
     parts = [base]
     if EXTRA_SYSTEM:
         parts.append(EXTRA_SYSTEM)
-    contract = load_contract()
-    if contract:
-        parts.append(contract)
+    if mode == "coder":
+        contract = load_contract()
+        if contract:
+            parts.append(contract)
     return "\n\n".join(parts)
 
 
@@ -689,6 +691,23 @@ async def get_sender_label(event):
     return full or str(event.sender_id)
 
 
+async def fetch_live_messages(chat_id, limit, client=None):
+    cli = client if client is not None else get_client()
+    try:
+        msgs = cast(Any, await cli.get_messages(chat_id, limit=limit))
+    except (RPCError, OSError, ValueError):
+        return []
+    out = []
+    for m in msgs:
+        text = m.message or ""
+        if not text.strip():
+            continue
+        role = "assistant" if getattr(m, "out", False) else "user"
+        out.append({"role": role, "content": text})
+    out.reverse()
+    return out
+
+
 async def safe_reply(event, text):
     return await core.safe_reply(event, text, REPLY_ATTEMPTS, recent_reply_ids)
 
@@ -867,27 +886,17 @@ async def handler(event: Any):
     def system_fn(_cid):
         return system_for(_cid, mode="userbot")
 
-    if is_private:
-        hist, messages = await core.prepare_messages(
-            STORE,
-            chat_id,
-            DM_HISTORY_LIMIT,
-            GROUP_HISTORY_LIMIT,
-            system_fn,
-        )
-    else:
+    limit = DM_HISTORY_LIMIT if is_private else GROUP_HISTORY_LIMIT
+    if not is_private:
         label = await get_sender_label(event)
         user_content = f"{label}: {prompt}" if label else prompt
         await core.append_group_history(
             chat_id, user_content, chat_history, GROUP_HISTORY_LIMIT, ctx_lock
         )
-        hist, messages = await core.prepare_messages(
-            STORE,
-            chat_id,
-            DM_HISTORY_LIMIT,
-            GROUP_HISTORY_LIMIT,
-            system_fn,
-        )
+    async with ctx_lock:
+        hist = chat_history.setdefault(chat_id, deque(maxlen=limit))
+    live = await fetch_live_messages(chat_id, LIVE_HISTORY_LIMIT)
+    messages = [{"role": "system", "content": system_fn(chat_id)}, *live]
 
     if is_self:
         prefix = f"{text}\n\n{model}:\n\n"
