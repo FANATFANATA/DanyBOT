@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -82,7 +83,7 @@ def save_skill(name: str, description: str, body: str, tags: Any = None) -> dict
         return {"ok": False, "error": "Пустое имя."}
     tags_clean = _clean_tags(tags)
     now = _now()
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute("SELECT id FROM skills WHERE name=?", (name,))
         row = cur.fetchone()
         if row:
@@ -107,7 +108,7 @@ def load_skill(name: str, touch: bool = True) -> dict:
     name = (name or "").strip()[:MAX_NAME]
     if not name:
         return {"ok": False, "error": "Пустое имя."}
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute("SELECT * FROM skills WHERE name=?", (name,))
         row = cur.fetchone()
         if not row:
@@ -133,20 +134,24 @@ def list_skills(tag: str = "", query: str = "", limit: int = 50) -> dict:
         params.extend([like, like, like])
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     params.append(limit)
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute(
             f"SELECT * FROM skills {where} ORDER BY uses DESC, updated_at DESC LIMIT ?",
             tuple(params),
         )
         rows = cur.fetchall()
-    return {"ok": True, "count": len(rows), "items": [_row_to_dict(r, with_body=False) for r in rows]}
+    return {
+        "ok": True,
+        "count": len(rows),
+        "items": [_row_to_dict(r, with_body=False) for r in rows],
+    }
 
 
 def delete_skill(name: str) -> dict:
     name = (name or "").strip()[:MAX_NAME]
     if not name:
         return {"ok": False, "error": "Пустое имя."}
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute("DELETE FROM skills WHERE name=?", (name,))
         conn.commit()
         deleted = cur.rowcount
@@ -154,7 +159,7 @@ def delete_skill(name: str) -> dict:
 
 
 def stats() -> dict:
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute("SELECT COUNT(*) AS n FROM skills")
         n = cur.fetchone()["n"]
     return {"ok": True, "count": n, "db": str(DB_PATH)}

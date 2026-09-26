@@ -21,7 +21,9 @@ from telethon.sessions import StringSession
 
 import bot
 import core
+import memory
 import proxies
+import skills
 import subagents
 import tools as tools_module
 import userbot
@@ -35,10 +37,12 @@ PY_FILES = (
     "tools.py",
     "core.py",
     "subagents.py",
+    "memory.py",
+    "skills.py",
     "tests.py",
 )
 WHITELIST_FILE = "vulture_whitelist.py"
-BANDIT_SKIP = "B404,B603"
+BANDIT_SKIP = "B404,B603,B608"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
 _log_lines: list[str] = []
@@ -895,7 +899,14 @@ class RenderResponseTest(BotTestCase):
         self.assertIn("a<b", text)
         self.assertIn("x&y", text)
         self.assertIn("c<d>e", text)
-        for banned in ("<i>", "<b>", "<code>", "\U0001f4ad", "\U0001f527", "\U0001f4ac"):
+        for banned in (
+            "<i>",
+            "<b>",
+            "<code>",
+            "\U0001f4ad",
+            "\U0001f527",
+            "\U0001f4ac",
+        ):
             self.assertNotIn(banned, text)
 
     def test_hide_reasoning_and_tools(self):
@@ -1351,10 +1362,14 @@ class StreamToolsTest(BotTestCase):
             [
                 [
                     make_chunk(
-                        make_delta(tool_calls=[make_tc(tc_id="call1", name="run_shell")])
+                        make_delta(
+                            tool_calls=[make_tc(tc_id="call1", name="run_shell")]
+                        )
                     ),
                     make_chunk(
-                        make_delta(tool_calls=[make_tc(arguments='{"command": "rm -rf /"}')])
+                        make_delta(
+                            tool_calls=[make_tc(arguments='{"command": "rm -rf /"}')]
+                        )
                     ),
                 ],
                 [make_chunk(make_delta(content="отказ"))],
@@ -2144,7 +2159,7 @@ class CoreHelpersTest(BotTestCase):
         store = _StoreStub()
         store.chat_history[1] = deque([{"role": "user", "content": "x"}], maxlen=5)
         _hist, messages = asyncio.run(
-            core.prepare_messages(store, 1, 5, 5, lambda cid: "sys")
+            core.prepare_messages(store, 1, 5, 5, lambda _cid: "sys")
         )
         self.assertEqual(messages[0], {"role": "system", "content": "sys"})
         self.assertEqual(messages[1]["content"], "x")
@@ -2231,33 +2246,58 @@ class CoreHelpersTest(BotTestCase):
 class ContractPromptTest(BotTestCase):
     CHAT_ID = 7591254790
 
-    def test_contract_loaded_from_repo(self):
+    def setUp(self):
+        super().setUp()
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_contract_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "capabilities.md").write_text(
+            "# Capabilities\n\n## Anti-AI traces\n\n//full\n", encoding="utf-8"
+        )
+        (tmp / "contract.md").write_text(
+            "# Контракт\n\n## Команды\n\n//check\n", encoding="utf-8"
+        )
+        self.addCleanup(self._reset_cache)
+        saved_dir = userbot.CONTRACT_DIR
+        userbot.CONTRACT_DIR = tmp
+        self.addCleanup(setattr, userbot, "CONTRACT_DIR", saved_dir)
+        self._reset_cache()
+
+    def _reset_cache(self):
+        userbot._contract_cache["key"] = None
+        userbot._contract_cache["text"] = ""
+
+    def test_contract_loaded_from_dir(self):
         text = userbot.load_contract()
         self.assertIn("# Capabilities", text)
         self.assertIn("# Контракт", text)
         self.assertIn("Anti-AI traces", text)
         self.assertIn("//full", text)
 
+    def test_capabilities_alias_resolved(self):
+        self.assertEqual(
+            userbot._contract_status("capabilities.server.md"), "capabilities.md (ok)"
+        )
+        self.assertEqual(userbot._contract_status("contract.md"), "contract.md (ok)")
+        self.assertEqual(userbot._contract_status("missing.md"), "missing.md (нет)")
+
     def test_contract_cached_until_mtime_changes(self):
         first = userbot.load_contract()
         second = userbot.load_contract()
         self.assertEqual(first, second)
         self.assertIsNotNone(userbot._contract_cache["key"])
-        self.assertEqual(len(first), len(second))
+        target = userbot.CONTRACT_DIR / "contract.md"
+        target.write_text("# Контракт\n\n//fix\n", encoding="utf-8")
+        self.assertIn("//fix", userbot.load_contract())
 
     def test_contract_can_be_disabled(self):
         saved = userbot.CONTRACT_ENABLED
-        userbot.CONTRACT_ENABLED = False
         self.addCleanup(setattr, userbot, "CONTRACT_ENABLED", saved)
-        userbot._contract_cache["key"] = None
-        userbot._contract_cache["text"] = ""
+        userbot.CONTRACT_ENABLED = False
         self.assertEqual(userbot.load_contract(), "")
-        userbot.CONTRACT_ENABLED = saved
-        userbot._contract_cache["key"] = None
-        userbot._contract_cache["text"] = ""
 
     def test_contract_in_every_mode(self):
         contract = userbot.load_contract()
+        self.assertTrue(contract)
         for mode in ("userbot", "bot", "coder"):
             with self.subTest(mode=mode):
                 self.assertIn(contract, userbot.system_for(self.CHAT_ID, mode=mode))
@@ -2266,8 +2306,15 @@ class ContractPromptTest(BotTestCase):
         report = userbot.system_prompt_report(self.CHAT_ID, mode="bot")
         self.assertIn("Режим / Mode: bot", report)
         self.assertIn("Контракт / Contract: включён", report)
-        self.assertIn("capabilities.server.md (ok)", report)
+        self.assertIn("capabilities.md (ok)", report)
         self.assertIn("contract.md (ok)", report)
+        self.assertIn(str(userbot.CONTRACT_DIR), report)
+
+    def test_system_prompt_report_marks_missing_files(self):
+        (userbot.CONTRACT_DIR / "contract.md").unlink()
+        report = userbot.system_prompt_report(self.CHAT_ID, mode="bot")
+        self.assertIn("contract.md (нет)", report)
+        self.assertIn("Контракт / Contract: включён", report)
 
     def test_prompt_aliases_parse(self):
         for text in (".db prompt", ".db промпт", ".db system", ".db система"):
@@ -2283,10 +2330,509 @@ class ContractPromptTest(BotTestCase):
         self.assertIn("settings:prompt", data)
         source = Path("bot.py").read_text(encoding="utf-8")
         menu_block = source[
-            source.index("SetBotCommandsRequest") : source.index("]", source.index("SetBotCommandsRequest"))
+            source.index("SetBotCommandsRequest") : source.index(
+                "]", source.index("SetBotCommandsRequest")
+            )
         ]
         self.assertIn('command="settings"', menu_block)
         self.assertNotIn('command="prompt"', menu_block)
+
+
+class ContractDirTest(BotTestCase):
+    def test_env_dir_wins(self):
+        with mock.patch.dict(os.environ, {"CONTRACT_DIR": "somewhere/cdn"}):
+            self.assertEqual(userbot._resolve_contract_dir(), Path("somewhere/cdn"))
+
+    def test_existing_candidate_is_used(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_cdn_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        candidates = (tmp, *userbot.CONTRACT_DIR_CANDIDATES)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CONTRACT_DIR", None)
+            with mock.patch.object(userbot, "CONTRACT_DIR_CANDIDATES", candidates):
+                self.assertEqual(userbot._resolve_contract_dir(), tmp)
+
+    def test_missing_candidates_keep_first(self):
+        candidates = (Path("/nope/cdn"),)
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CONTRACT_DIR", None)
+            with mock.patch.object(userbot, "CONTRACT_DIR_CANDIDATES", candidates):
+                self.assertEqual(userbot._resolve_contract_dir(), candidates[0])
+
+
+class MemoryStoreTest(unittest.TestCase):
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_memory_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for attr, value in (
+            ("DATA_DIR", tmp),
+            ("DB_PATH", tmp / "memory.db"),
+        ):
+            saved = getattr(memory, attr)
+            self.addCleanup(setattr, memory, attr, saved)
+            setattr(memory, attr, value)
+
+    def test_remember_creates_and_updates(self):
+        created = memory.remember(1, "k", "v", ["a", "a", "b"])
+        self.assertTrue(created["ok"])
+        self.assertEqual(created["action"], "created")
+        updated = memory.remember(1, "k", "v2", "a;b")
+        self.assertEqual(updated["action"], "updated")
+        item = memory.recall(1, "k")["items"][0]
+        self.assertEqual(item["value"], "v2")
+        self.assertEqual(item["tags"], ["a", "b"])
+
+    def test_remember_rejects_empty(self):
+        self.assertFalse(memory.remember(1, "  ", "v")["ok"])
+        self.assertFalse(memory.remember(1, "k", "")["ok"])
+
+    def test_recall_search_and_limit(self):
+        memory.remember(1, "alpha", "hello world", "x")
+        memory.remember(1, "beta", "goodbye", "y")
+        self.assertEqual(memory.recall(1, "missing")["count"], 0)
+        self.assertEqual(memory.recall(1, query="hello")["count"], 1)
+        self.assertEqual(memory.recall(1, query="o")["count"], 2)
+        self.assertEqual(memory.recall(1, limit=1)["count"], 1)
+        self.assertEqual(len(memory.recall(1, limit=0)["items"]), 2)
+        self.assertEqual(len(memory.recall(1, limit=10**6)["items"]), 2)
+
+    def test_recall_is_chat_scoped(self):
+        memory.remember(1, "key", "one")
+        memory.remember(2, "key", "two")
+        self.assertEqual(memory.recall(2, "key")["items"][0]["value"], "two")
+        self.assertEqual(memory.recall(3, "key")["count"], 0)
+
+    def test_forget_by_key_and_id(self):
+        memory.remember(1, "a", "1")
+        second = memory.remember(1, "b", "2")
+        self.assertFalse(memory.forget(1)["ok"])
+        self.assertEqual(memory.forget(1, "a")["deleted"], 1)
+        self.assertEqual(memory.forget(1, mem_id=second["id"])["deleted"], 1)
+        self.assertEqual(memory.list_memories(1)["count"], 0)
+
+    def test_list_and_stats(self):
+        memory.remember(1, "a", "1")
+        memory.remember(2, "b", "2")
+        self.assertEqual(memory.list_memories(1)["count"], 1)
+        self.assertEqual(memory.list_memories(1, limit=1)["count"], 1)
+        stats = memory.stats(1)
+        self.assertEqual(stats["count"], 1)
+        self.assertEqual(stats["chat_id"], 1)
+        self.assertIn("memory.db", stats["db"])
+        self.assertEqual(json.loads(memory.dumps({"a": "б"})), {"a": "б"})
+
+    def test_limits_are_applied(self):
+        memory.remember(1, "k" * 50, "v" * 50)
+        item = memory.list_memories(1)["items"][0]
+        self.assertEqual(len(item["key"]), 50)
+        self.assertEqual(len(item["value"]), 50)
+
+    def test_tags_are_normalized(self):
+        memory.remember(1, "k", "v", ["a", "a", "b"])
+        self.assertEqual(memory.list_memories(1)["items"][0]["tags"], ["a", "b"])
+        self.assertEqual(memory._clean_tags(None), "")
+        self.assertEqual(memory._clean_tags(" a , b ; a "), "a,b")
+        self.assertEqual(memory._tags_list(""), [])
+
+
+class SkillsStoreTest(unittest.TestCase):
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_skills_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for attr, value in (
+            ("DATA_DIR", tmp),
+            ("DB_PATH", tmp / "skills.db"),
+        ):
+            saved = getattr(skills, attr)
+            self.addCleanup(setattr, skills, attr, saved)
+            setattr(skills, attr, value)
+
+    def test_save_creates_and_updates(self):
+        created = skills.save_skill("n", "d", "b", "t")
+        self.assertEqual(created["action"], "created")
+        self.assertEqual(skills.save_skill("n", "d2", "b2")["action"], "updated")
+        skill = skills.load_skill("n", touch=False)["skill"]
+        self.assertEqual(skill["description"], "d2")
+        self.assertEqual(skill["body"], "b2")
+
+    def test_save_rejects_empty_name(self):
+        self.assertFalse(skills.save_skill(" ", "d", "b")["ok"])
+
+    def test_load_missing_and_touch(self):
+        self.assertFalse(skills.load_skill("none")["ok"])
+        self.assertFalse(skills.load_skill("")["ok"])
+        skills.save_skill("n", "d", "b")
+        skills.load_skill("n")
+        self.assertEqual(skills.load_skill("n", touch=False)["skill"]["uses"], 1)
+
+    def test_list_filters(self):
+        skills.save_skill("alpha", "first", "body one", "x")
+        skills.save_skill("beta", "second", "body two", "y")
+        self.assertEqual(skills.list_skills()["count"], 2)
+        self.assertEqual(skills.list_skills(tag="x")["count"], 1)
+        self.assertEqual(skills.list_skills(query="two")["count"], 1)
+        self.assertEqual(skills.list_skills(tag="x", query="two")["count"], 0)
+        self.assertEqual(skills.list_skills(limit=1)["count"], 1)
+        self.assertEqual(skills.list_skills(limit=0)["count"], 2)
+        self.assertNotIn("body", skills.list_skills()["items"][0])
+
+    def test_delete_and_stats(self):
+        skills.save_skill("n", "d", "b")
+        self.assertEqual(skills.stats()["count"], 1)
+        self.assertFalse(skills.delete_skill("")["ok"])
+        self.assertEqual(skills.delete_skill("n")["deleted"], 1)
+        self.assertEqual(skills.delete_skill("n")["deleted"], 0)
+        self.assertIn("skills.db", skills.stats()["db"])
+        self.assertEqual(json.loads(skills.dumps({"a": "б"})), {"a": "б"})
+
+    def test_limits_are_applied(self):
+        skills.save_skill("n", "d" * 20, "b" * 20)
+        skill = skills.load_skill("n", touch=False)["skill"]
+        self.assertEqual(len(skill["description"]), 20)
+        self.assertEqual(len(skill["body"]), 20)
+
+    def test_tags_are_normalized(self):
+        skills.save_skill("n", "d", "b", ["a", "a", "b"])
+        self.assertEqual(
+            skills.load_skill("n", touch=False)["skill"]["tags"], ["a", "b"]
+        )
+        self.assertEqual(skills._clean_tags(None), "")
+        self.assertEqual(skills._clean_tags(" a , b ; a "), "a,b")
+        self.assertEqual(skills._tags_list(""), [])
+
+
+class _FakeMessage:
+    def __init__(self, text, msg_id=1, out=False, is_reply=False, reply_msg=None):
+        self.message = text
+        self.id = msg_id
+        self.out = out
+        self.is_reply = is_reply
+        self._reply_msg = reply_msg
+        self.sender_id = 1
+        self.chat_id = 1
+
+    async def get_reply_message(self):
+        if self._reply_msg is None:
+            raise RPCError(request=None, message="no reply")
+        return self._reply_msg
+
+
+class _FakeHandlerEvent:
+    def __init__(self, message, chat_id=1, sender_id=1, is_private=False):
+        self.message: Any = message
+        self.chat_id: Any = chat_id
+        self.sender_id: Any = sender_id
+        self.is_private = is_private
+        self.sent = []
+        self._next_id = 1000
+
+    async def reply(self, text, buttons=None):
+        self.sent.append(text)
+        self._next_id += 1
+        return SimpleNamespace(id=self._next_id)
+
+    async def get_sender(self):
+        return SimpleNamespace(first_name="Tester", last_name="", username="tester")
+
+
+class _FakeBotClient:
+    def __init__(self):
+        self.typing = []
+
+    def action(self, chat_id, action):
+        self.typing.append((chat_id, action))
+
+        async def _noop():
+            return True
+
+        return _noop
+
+
+class _FakeSaver:
+    def __init__(self):
+        self.dirty = 0
+
+    def mark_dirty(self):
+        self.dirty += 1
+
+
+class BotHandlerTest(BotTestCase):
+    GROUP = -1001
+    OWNER = 5
+
+    def setUp(self):
+        super().setUp()
+        for mod, attr, value in (
+            (bot, "auto_respond", set()),
+            (bot, "ignored_chats", set()),
+            (bot, "ignored_users", set()),
+            (bot, "coder_chats", set()),
+            (bot, "reasoning_hidden", set()),
+            (bot, "tools_hidden", set()),
+            (bot, "recent_reply_ids", set()),
+            (bot, "seen_msg_keys", set()),
+            (bot, "last_chat_activity", {}),
+            (bot, "chat_history", {}),
+        ):
+            saved = getattr(mod, attr)
+            self.addCleanup(setattr, mod, attr, saved)
+            setattr(mod, attr, value)
+        for attr, value in (
+            ("OWNER_IDS", {self.OWNER}),
+            ("ENABLE_USERBOT", False),
+            ("COOLDOWN", 0),
+            ("AUTO_RESPOND_GLOBAL", False),
+        ):
+            saved = getattr(userbot, attr)
+            self.addCleanup(setattr, userbot, attr, saved)
+            setattr(userbot, attr, value)
+        self.saver = _FakeSaver()
+        for attr, value in (("HISTORY_SAVER", self.saver),):
+            saved = getattr(bot, attr)
+            self.addCleanup(setattr, bot, attr, saved)
+            setattr(bot, attr, value)
+        self.client = _FakeBotClient()
+        self.stream_calls = []
+
+        async def fake_stream(*args, **kwargs):
+            self.stream_calls.append(args)
+            return "ответ"
+
+        for target, attr, value in (
+            (core, "stream_answer", fake_stream),
+            (bot, "get_bot_client", lambda: self.client),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, value)
+
+    def _run(self, event):
+        asyncio.run(bot.handler(event))
+        return event
+
+    def _group_event(self, text, **kwargs):
+        chat_id = kwargs.pop("chat_id", self.GROUP)
+        is_private = kwargs.pop("is_private", False)
+        sender_id = kwargs.pop("sender_id", 1)
+        return _FakeHandlerEvent(
+            _FakeMessage(text, **kwargs),
+            chat_id=chat_id,
+            sender_id=sender_id,
+            is_private=is_private,
+        )
+
+    def _prompt(self):
+        return self.stream_calls[0][4][-1]["content"]
+
+    def _model(self):
+        return self.stream_calls[0][5]
+
+    def _prefix(self):
+        return self.stream_calls[0][6]
+
+    def test_empty_message_ignored(self):
+        self._run(self._group_event(""))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_message_without_text_ignored(self):
+        event = self._group_event("привет")
+        event.message = None
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_missing_chat_id_ignored(self):
+        event = self._group_event("привет")
+        event.chat_id = None
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_group_message_needs_trigger(self):
+        self._run(self._group_event("просто текст"))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_group_auto_respond_triggers(self):
+        bot.auto_respond.add(self.GROUP)
+        self._run(self._group_event("просто текст"))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_global_auto_respond_triggers(self):
+        userbot.AUTO_RESPOND_GLOBAL = True
+        self._run(self._group_event("просто текст"))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_db_trigger_without_userbot(self):
+        self._run(self._group_event(".db привет"))
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertIn("привет", self._prompt())
+
+    def test_db_trigger_disabled_with_userbot(self):
+        userbot.ENABLE_USERBOT = True
+        self._run(self._group_event(".db привет"))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_mention_triggers(self):
+        saved_username = bot.bot_username
+        self.addCleanup(setattr, bot, "bot_username", saved_username)
+        bot.bot_username = "danybot"
+        self._run(self._group_event("@danybot привет"))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_reply_to_bot_triggers(self):
+        replied = _FakeMessage("вопрос", msg_id=5, out=True)
+        self._run(self._group_event("ответ", is_reply=True, reply_msg=replied))
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertIn("вопрос", self._prompt())
+
+    def test_reply_without_text_uses_replied_text(self):
+        bot.auto_respond.add(self.GROUP)
+        replied = _FakeMessage("только реплай", msg_id=6)
+        self._run(self._group_event("   ", is_reply=True, reply_msg=replied))
+        self.assertIn("только реплай", self._prompt())
+
+    def test_private_message_triggers(self):
+        event = _FakeHandlerEvent(
+            _FakeMessage("привет"), chat_id=7, sender_id=9, is_private=True
+        )
+        self._run(event)
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_own_message_in_group_stays_quiet(self):
+        self._run(self._group_event("моё сообщение", out=True))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_own_mentioned_message_keeps_prefix(self):
+        saved_username = bot.bot_username
+        self.addCleanup(setattr, bot, "bot_username", saved_username)
+        bot.bot_username = "danybot"
+        self._run(self._group_event("@danybot моё сообщение", out=True, msg_id=21))
+        self.assertEqual(self._prefix(), "@danybot моё сообщение\n\n")
+        self.assertEqual(self.stream_calls[0][7], 21)
+
+    def test_prompt_is_truncated(self):
+        saved_limit = userbot.MAX_REQUEST_LEN
+        self.addCleanup(setattr, userbot, "MAX_REQUEST_LEN", saved_limit)
+        userbot.MAX_REQUEST_LEN = 40
+        self._run(self._group_event(".db " + "я" * 100 + "ХВОСТ"))
+        self.assertNotIn("ХВОСТ", self._prompt())
+
+    def test_mention_only_prompt_returns_early(self):
+        saved_username = bot.bot_username
+        self.addCleanup(setattr, bot, "bot_username", saved_username)
+        bot.bot_username = "danybot"
+        self._run(self._group_event("@danybot"))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_cooldown_blocks_second_message(self):
+        userbot.COOLDOWN = 60
+        event1 = self._group_event(".db первый", msg_id=10)
+        self._run(event1)
+        event2 = self._group_event(".db второй", msg_id=11)
+        self._run(event2)
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_duplicate_message_id_skipped(self):
+        event = self._group_event(".db привет", msg_id=42)
+        self._run(event)
+        bot.recent_reply_ids.add(42)
+        self._run(self._group_event(".db привет", msg_id=42))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_coder_mode_uses_coder_tools(self):
+        bot.coder_chats.add(self.GROUP)
+        self._run(self._group_event(".db привет", sender_id=self.OWNER))
+        self.assertTrue(self.stream_calls)
+        bot.coder_chats.clear()
+
+    def test_model_override_used(self):
+        bot.model_overrides[self.GROUP] = "custom-model"
+        self._run(self._group_event(".db привет"))
+        self.assertEqual(self._model(), "custom-model")
+
+    def test_stream_error_reports_to_user(self):
+        async def failing_stream(*args, **kwargs):
+            raise userbot.OpenAIError("boom")
+
+        saved = core.stream_answer
+        self.addCleanup(setattr, core, "stream_answer", saved)
+        core.stream_answer = failing_stream
+        event = self._group_event(".db привет")
+        self._run(event)
+        self.assertIn("Ошибка", event.sent[0])
+
+    def test_history_saver_marked_dirty(self):
+        self._run(self._group_event(".db привет"))
+        self.assertGreaterEqual(self.saver.dirty, 1)
+
+    def test_help_command_for_owner(self):
+        event = self._group_event("/help", sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("/settings", event.sent[0])
+
+    def test_help_command_works_for_everyone(self):
+        event = self._group_event("/help", sender_id=99)
+        self._run(event)
+        self.assertIn("/settings", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_settings_command_for_owner(self):
+        event = self._group_event("/settings", sender_id=self.OWNER)
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_prompt_command_for_owner(self):
+        event = self._group_event("/prompt", sender_id=self.OWNER)
+        self._run(event)
+        self.assertEqual(
+            event.sent[0], userbot.system_prompt_report(self.GROUP, mode="bot")
+        )
+
+    def test_prompt_command_ignored_without_owner(self):
+        event = self._group_event("/prompt", sender_id=99)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_coder_command_requires_owner(self):
+        event = self._group_event("/coder on", sender_id=99)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertNotIn(self.GROUP, bot.coder_chats)
+
+    def test_coder_command_toggles(self):
+        event = self._group_event("/coder on", sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn(self.GROUP, bot.coder_chats)
+        self.assertIn("ВКЛ", event.sent[0])
+        event = self._group_event("/coder status", sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("ON", event.sent[0])
+        event = self._group_event("/coder off", sender_id=self.OWNER)
+        self._run(event)
+        self.assertNotIn(self.GROUP, bot.coder_chats)
+        self.assertIn("ВЫКЛ", event.sent[0])
+
+    def test_settings_command_ignored_without_owner(self):
+        event = self._group_event("/settings", sender_id=99)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_ignore_command_skipped(self):
+        event = self._group_event("/ignore", sender_id=self.OWNER)
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_visibility_command_for_owner(self):
+        event = self._group_event("/reasoning off", sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn(self.GROUP, bot.reasoning_hidden)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_visibility_command_ignored_without_owner(self):
+        event = self._group_event("/reasoning off", sender_id=99)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertNotIn(self.GROUP, bot.reasoning_hidden)
 
 
 class VisibilityCommandsTest(BotTestCase):
@@ -2468,8 +3014,22 @@ class CoderModeTest(BotTestCase):
 
     def test_bot_handler_uses_coder_tools(self):
         source = Path("bot.py").read_text(encoding="utf-8")
-        self.assertIn("tools_module.CODER_TOOLS if coder_active else userbot.TOOLS", source)
+        self.assertIn(
+            "tools_module.CODER_TOOLS if coder_active else userbot.TOOLS", source
+        )
         self.assertIn('mode = "coder" if coder_active else "bot"', source)
+
+    def test_db_trigger_only_without_userbot(self):
+        saved = userbot.ENABLE_USERBOT
+        self.addCleanup(setattr, userbot, "ENABLE_USERBOT", saved)
+        userbot.ENABLE_USERBOT = True
+        self.assertFalse(bot._db_triggered(".db привет"))
+        self.assertFalse(bot._db_triggered(".danybot привет"))
+        userbot.ENABLE_USERBOT = False
+        self.assertTrue(bot._db_triggered(".db привет"))
+        self.assertTrue(bot._db_triggered("привет .gpt"))
+        self.assertFalse(bot._db_triggered("привет"))
+        self.assertFalse(bot._db_triggered(None))
 
     def test_paths_are_confined_to_root(self):
         inside, err = tools_module._resolve_path("DanyBOT/tools.py")
@@ -2574,7 +3134,59 @@ class CoderModeTest(BotTestCase):
 
     def test_creator_info_exposed(self):
         self.assertIn("Создатель", userbot.CREATOR_INFO)
-        self.assertTrue(userbot.CREATOR_ID)
+        if userbot.CREATOR_ID:
+            self.assertIn(userbot.CREATOR_ID, userbot.CREATOR_INFO)
+        self.assertEqual(userbot.CREATOR_CONFIGURED, bool(userbot.CREATOR_EXTRA))
+
+    def test_creator_info_built_from_settings(self):
+        names = (
+            "CREATOR_NAME",
+            "CREATOR_USERNAME",
+            "CREATOR_ID",
+            "CREATOR_PHONE",
+            "CREATOR_EXTRA",
+        )
+        saved = {name: getattr(userbot, name) for name in names}
+        self.addCleanup(lambda: [setattr(userbot, name, saved[name]) for name in names])
+
+        def apply(**values):
+            for name in names:
+                setattr(userbot, name, values.get(name, ""))
+            return userbot._build_creator_info()
+
+        info = apply(
+            CREATOR_NAME="Danya",
+            CREATOR_USERNAME="tester",
+            CREATOR_ID="42",
+            CREATOR_PHONE="+79990000000",
+            CREATOR_EXTRA="люблю котиков",
+        )
+        self.assertIn("Создатель и владелец: Danya", info)
+        self.assertIn("@tester", info)
+        self.assertIn("id 42", info)
+        self.assertIn("+79990000000", info)
+        self.assertIn("люблю котиков", info)
+        self.assertIn("Создатель", apply(CREATOR_ID="7"))
+        self.assertEqual(apply(), userbot.CREATOR_UNSET_TEXT)
+        self.assertIn("Создатель", apply(CREATOR_EXTRA="приват"))
+
+    def test_creator_prompt_keeps_configured_info(self):
+        names = (
+            "CREATOR_NAME",
+            "CREATOR_USERNAME",
+            "CREATOR_ID",
+            "CREATOR_PHONE",
+            "CREATOR_EXTRA",
+            "CREATOR_CONFIGURED",
+        )
+        saved = {name: getattr(userbot, name) for name in names}
+        self.addCleanup(lambda: [setattr(userbot, name, saved[name]) for name in names])
+        for name in names[:-1]:
+            setattr(userbot, name, "")
+        userbot.CREATOR_CONFIGURED = False
+        self.assertNotIn(userbot.CREATOR_UNSET_TEXT, userbot.system_for(-100))
+        userbot.CREATOR_CONFIGURED = True
+        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(-100))
 
 
 class _CallbackEvent:
@@ -2752,10 +3364,17 @@ class UserbotHelpersTest(BotTestCase):
         self.assertTrue(
             userbot.system_for(1, mode="bot").startswith(userbot.SYSTEM_PROMPT_BOT)
         )
-        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(1))
         self.assertTrue(
             userbot.system_for(1, mode="coder").startswith(userbot.CODER_SYSTEM_PROMPT)
         )
+
+    def test_system_for_creator_block(self):
+        saved = userbot.CREATOR_CONFIGURED
+        self.addCleanup(setattr, userbot, "CREATOR_CONFIGURED", saved)
+        userbot.CREATOR_CONFIGURED = True
+        self.assertIn(userbot.CREATOR_INFO, userbot.system_for(1))
+        userbot.CREATOR_CONFIGURED = False
+        self.assertNotIn(userbot.CREATOR_INFO, userbot.system_for(1))
 
     def test_make_session_plain(self):
         self.assertEqual(userbot.make_session("plain"), "plain")
@@ -3033,7 +3652,7 @@ def build_linters():
                 "--profile",
                 "black",
                 "-p",
-                "main,bot,userbot,proxies,core",
+                "main,bot,userbot,proxies,core,subagents,memory,skills",
                 *PY_FILES,
             ]
         elif name == "radon":
@@ -3074,7 +3693,7 @@ def run_coverage():
         [
             *base,
             "run",
-            "--source=bot,userbot,proxies,tools,core",
+            "--source=bot,userbot,proxies,tools,core,subagents,memory,skills",
             "-m",
             "unittest",
             "discover",

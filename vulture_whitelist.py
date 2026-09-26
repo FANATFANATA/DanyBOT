@@ -45,8 +45,14 @@ tools_hidden
 CONTRACT_ENABLED
 CONTRACT_DIR
 CONTRACT_FILES
+CONTRACT_ALIASES
+CONTRACT_DIR_CANDIDATES
+CREATOR_UNSET_TEXT
+CREATOR_CONFIGURED
 _contract_cache
 _contract_signature
+_contract_file
+_resolve_contract_dir
 load_contract
 system_prompt_report
 MEMORY_TOOL_NAMES
@@ -63,3 +69,4 @@ recall
 forget
 list_memories
 dumps
+row_factory

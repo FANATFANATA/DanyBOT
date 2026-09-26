@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any
 
@@ -79,8 +80,11 @@ def remember(chat_id: int, key: str, value: str, tags: Any = None) -> dict:
         return {"ok": False, "error": "Пустое значение."}
     tags_clean = _clean_tags(tags)
     now = _now()
-    with _connect() as conn:
-        cur = conn.execute("SELECT id, created_at FROM memories WHERE chat_id=? AND key=?", (int(chat_id), key))
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT id, created_at FROM memories WHERE chat_id=? AND key=?",
+            (int(chat_id), key),
+        )
         row = cur.fetchone()
         if row:
             conn.execute(
@@ -104,7 +108,7 @@ def recall(chat_id: int, key: str = "", query: str = "", limit: int = 10) -> dic
     limit = max(1, min(int(limit or 10), MAX_LIMIT))
     key = (key or "").strip()[:MAX_KEY]
     query = (query or "").strip()[:MAX_QUERY]
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         if key:
             cur = conn.execute(
                 "SELECT * FROM memories WHERE chat_id=? AND key=?",
@@ -134,7 +138,7 @@ def forget(chat_id: int, key: str = "", mem_id: int = 0) -> dict:
     key = (key or "").strip()[:MAX_KEY]
     if not key and not mem_id:
         return {"ok": False, "error": "Нужен key или id."}
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         if key:
             cur = conn.execute(
                 "DELETE FROM memories WHERE chat_id=? AND key=?",
@@ -152,7 +156,7 @@ def forget(chat_id: int, key: str = "", mem_id: int = 0) -> dict:
 
 def list_memories(chat_id: int, limit: int = 50) -> dict:
     limit = max(1, min(int(limit or 50), MAX_LIMIT))
-    with _connect() as conn:
+    with closing(_connect()) as conn:
         cur = conn.execute(
             "SELECT * FROM memories WHERE chat_id=? ORDER BY updated_at DESC LIMIT ?",
             (int(chat_id), limit),
@@ -162,8 +166,10 @@ def list_memories(chat_id: int, limit: int = 50) -> dict:
 
 
 def stats(chat_id: int) -> dict:
-    with _connect() as conn:
-        cur = conn.execute("SELECT COUNT(*) AS n FROM memories WHERE chat_id=?", (int(chat_id),))
+    with closing(_connect()) as conn:
+        cur = conn.execute(
+            "SELECT COUNT(*) AS n FROM memories WHERE chat_id=?", (int(chat_id),)
+        )
         n = cur.fetchone()["n"]
     return {"ok": True, "chat_id": int(chat_id), "count": n, "db": str(DB_PATH)}
 

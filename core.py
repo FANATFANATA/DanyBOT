@@ -769,9 +769,7 @@ async def stream_answer(
             )
         final_text = fallback
     if state["edit_id"] is not None:
-        edited = await edit_fn(
-            chat_id, state["edit_id"], final_text, logger=logger
-        )
+        edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
         if not edited and placeholder_id is not None:
             if logger is not None:
                 logger.warning(

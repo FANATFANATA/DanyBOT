@@ -70,8 +70,7 @@ def _select_tools(tool_names):
         _TOOLS_AVAILABLE = [
             item
             for item in tools_module.TOOLS
-            if item["function"]["name"]
-            not in tools_module.SUBAGENT_EXCLUDED_TOOLS
+            if item["function"]["name"] not in tools_module.SUBAGENT_EXCLUDED_TOOLS
         ]
     available = list(_TOOLS_AVAILABLE)
     if not tool_names:

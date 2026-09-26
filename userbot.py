@@ -119,24 +119,36 @@ CREATOR_ID = _env_str("CREATOR_ID", "")
 CREATOR_PHONE = _env_str("CREATOR_PHONE", "")
 CREATOR_EXTRA = _env_str("CREATOR_EXTRA", "")
 
+CREATOR_UNSET_TEXT = (
+    "Создатель и владелец не задан. Задай CREATOR_NAME, CREATOR_USERNAME, "
+    "CREATOR_ID или CREATOR_PHONE в .env."
+)
+
 
 def _build_creator_info():
-    fields = (CREATOR_NAME, CREATOR_USERNAME, CREATOR_ID, CREATOR_PHONE)
-    if not any(fields):
-        return CREATOR_EXTRA
-    label = CREATOR_NAME or CREATOR_USERNAME or "неизвестен"
-    line = f"Создатель и владелец: {label}"
+    parts = []
+    if CREATOR_NAME:
+        parts.append(CREATOR_NAME)
     if CREATOR_USERNAME:
-        line += f", @{CREATOR_USERNAME}"
+        parts.append(f"@{CREATOR_USERNAME}")
     if CREATOR_ID:
-        line += f", id {CREATOR_ID}"
+        parts.append(f"id {CREATOR_ID}")
     if CREATOR_PHONE:
-        line += f", телефон {CREATOR_PHONE}"
-    line += "."
-    return f"{line} {CREATOR_EXTRA}".strip() if CREATOR_EXTRA else line
+        parts.append(f"телефон {CREATOR_PHONE}")
+    if not parts:
+        if not CREATOR_EXTRA:
+            return CREATOR_UNSET_TEXT
+        return f"Создатель и владелец. {CREATOR_EXTRA}"
+    line = "Создатель и владелец: " + ", ".join(parts)
+    if CREATOR_EXTRA:
+        line = f"{line}. {CREATOR_EXTRA}"
+    return f"{line}."
 
 
 CREATOR_INFO = _build_creator_info()
+CREATOR_CONFIGURED = any(
+    (CREATOR_NAME, CREATOR_USERNAME, CREATOR_ID, CREATOR_PHONE, CREATOR_EXTRA)
+)
 
 ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
 ENABLE_BOT = _env_bool("ENABLE_BOT", False)
@@ -285,22 +297,61 @@ def model_for(chat_id):
 
 
 CONTRACT_ENABLED = _env_bool("CONTRACT_ENABLED", True)
-CONTRACT_DIR = Path(_env_str("CONTRACT_DIR", "/root/cdn"))
 CONTRACT_FILES = ("capabilities.server.md", "contract.md")
+CONTRACT_ALIASES = {"capabilities.server.md": ("capabilities.md",)}
+CONTRACT_DIR_CANDIDATES = (
+    Path("/root/cdn"),
+    Path(__file__).resolve().parent.parent / "cdn",
+    Path(__file__).resolve().parent / "cdn",
+)
 
 _contract_cache: dict[str, Any] = {"key": None, "text": ""}
+
+
+def _resolve_contract_dir():
+    raw = _env_str("CONTRACT_DIR", "")
+    if raw:
+        return Path(raw)
+    for candidate in CONTRACT_DIR_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    return CONTRACT_DIR_CANDIDATES[0]
+
+
+CONTRACT_DIR = _resolve_contract_dir()
+
+
+def _contract_file(name):
+    path = CONTRACT_DIR / name
+    if path.is_file():
+        return path
+    for alias in CONTRACT_ALIASES.get(name, ()):
+        alias_path = CONTRACT_DIR / alias
+        if alias_path.is_file():
+            return alias_path
+    return None
+
+
+def _contract_status(name):
+    path = _contract_file(name)
+    if path is None:
+        return f"{name} (нет)"
+    return f"{path.name} (ok)"
 
 
 def _contract_signature():
     signature = []
     for name in CONTRACT_FILES:
-        path = CONTRACT_DIR / name
+        path = _contract_file(name)
+        if path is None:
+            signature.append((name, "", 0, 0))
+            continue
         try:
             stat = path.stat()
         except OSError:
-            signature.append((name, 0, 0))
+            signature.append((name, path.name, 0, 0))
             continue
-        signature.append((name, stat.st_mtime_ns, stat.st_size))
+        signature.append((name, path.name, stat.st_mtime_ns, stat.st_size))
     return tuple(signature)
 
 
@@ -312,7 +363,9 @@ def load_contract():
         return _contract_cache["text"]
     blocks = []
     for name in CONTRACT_FILES:
-        path = CONTRACT_DIR / name
+        path = _contract_file(name)
+        if path is None:
+            continue
         try:
             text = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeDecodeError) as exc:
@@ -334,7 +387,7 @@ def system_for(chat_id, mode="userbot"):
     else:
         base = SYSTEM_PROMPT
     parts = [base]
-    if CREATOR_INFO:
+    if CREATOR_CONFIGURED:
         parts.append(CREATOR_INFO)
     if EXTRA_SYSTEM:
         parts.append(EXTRA_SYSTEM)
@@ -347,10 +400,7 @@ def system_for(chat_id, mode="userbot"):
 def system_prompt_report(chat_id, mode="userbot", limit=3000):
     text = system_for(chat_id, mode=mode)
     contract = load_contract()
-    files = ", ".join(
-        f"{name} ({'ok' if (CONTRACT_DIR / name).is_file() else 'нет'})"
-        for name in CONTRACT_FILES
-    )
+    files = ", ".join(_contract_status(name) for name in CONTRACT_FILES)
     head = (
         f"Режим / Mode: {mode}\n"
         f"Длина / Length: {len(text)} символов\n"
@@ -714,13 +764,11 @@ async def handler(event: Any):
         command = None
 
     if command and command[0] == "creator":
-        await safe_reply(event, CREATOR_INFO or "Создатель не задан.")
+        await safe_reply(event, CREATOR_INFO)
         return
 
     if command and command[0] in ("coder", "coder_status"):
-        await safe_reply(
-            event, "Кодер-режим работает только в боте: /coder on"
-        )
+        await safe_reply(event, "Кодер-режим работает только в боте: /coder on")
         return
 
     if command and command[0] == "prompt":
@@ -837,7 +885,10 @@ async def handler(event: Any):
         prompt = prompt[:MAX_REQUEST_LEN]
 
     model = model_for(chat_id)
-    system_fn = lambda cid: system_for(cid, mode="userbot")
+
+    def system_fn(_cid):
+        return system_for(_cid, mode="userbot")
+
     if is_private:
         hist, messages = await core.prepare_messages(
             STORE,
@@ -877,9 +928,7 @@ async def handler(event: Any):
             model,
             prefix,
             self_edit_id,
-            core.make_render(
-                render_response, reasoning_hidden, tools_hidden, chat_id
-            ),
+            core.make_render(render_response, reasoning_hidden, tools_hidden, chat_id),
             edit_text,
             safe_reply,
             cast(Any, get_client().action(chat_id, "typing")),

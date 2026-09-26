@@ -626,9 +626,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "save_skill",
-            "description": (
-                "Сохранить или обновить скилл: имя, описание, тело, теги"
-            ),
+            "description": ("Сохранить или обновить скилл: имя, описание, тело, теги"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -862,7 +860,9 @@ CODER_TOOL_NAMES = (
 )
 
 CODER_TOOLS: list[dict[str, Any]] = [
-    item for item in [*FILE_TOOLS, *TOOLS] if item["function"]["name"] in CODER_TOOL_NAMES
+    item
+    for item in [*FILE_TOOLS, *TOOLS]
+    if item["function"]["name"] in CODER_TOOL_NAMES
 ]
 
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
@@ -1455,7 +1455,11 @@ async def _tool_list_dir(arguments, chat_id, client, stats):
     rows = []
     for entry in entries[:MAX_LIST_ENTRIES]:
         try:
-            rows.append(f"{entry.name}/" if entry.is_dir() else f"{entry.name} ({entry.stat().st_size})")
+            rows.append(
+                f"{entry.name}/"
+                if entry.is_dir()
+                else f"{entry.name} ({entry.stat().st_size})"
+            )
         except OSError:
             rows.append(entry.name)
     head = f"{path} | элементов {len(entries)}"
@@ -1522,12 +1526,11 @@ async def _tool_execute_script(arguments, chat_id, client, stats):
             return f"Каталог не найден: {workdir}"
     script_path = None
     try:
-        handle = tempfile.NamedTemporaryFile(
+        with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False, encoding="utf-8"
-        )
-        with handle:
+        ) as handle:
             handle.write(code)
-        script_path = Path(handle.name)
+            script_path = Path(handle.name)
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             str(script_path),
@@ -1558,7 +1561,6 @@ async def _tool_execute_script(arguments, chat_id, client, stats):
     if err:
         result += f"\nstderr:\n{err}"
     return _clip(result, MAX_SCRIPT_OUTPUT)
-
 
 
 async def _tool_memory_remember(arguments, chat_id, client, stats):

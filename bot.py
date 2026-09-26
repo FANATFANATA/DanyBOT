@@ -71,6 +71,12 @@ def _strip_mention(text):
     return text
 
 
+def _db_triggered(text):
+    if userbot.ENABLE_USERBOT:
+        return False
+    return bool(core.TRIGGER_RE.search(text or ""))
+
+
 BOT_HELP_TEXT = (
     "DanyBOT - команды / commands:\n"
     "/help /start - справка / help\n"
@@ -78,7 +84,6 @@ BOT_HELP_TEXT = (
     "Модель, авто-ответ, рассуждения, инструменты, кодер-режим, очистка\n"
     "контекста и системный промпт - в меню /settings.\n\n"
     "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
-
 )
 
 
@@ -157,7 +162,7 @@ async def handler(event: Any):
 
     is_private = event.is_private
     userbot.register_sender(sender_id, chat_id)
-    triggered = False
+    triggered = _db_triggered(text)
     mentioned = _is_mentioned(text)
     now = time.monotonic()
 
@@ -331,7 +336,10 @@ async def handler(event: Any):
 
     model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     mode = "coder" if coder_active else "bot"
-    system_fn = lambda cid: userbot.system_for(cid, mode=mode)
+
+    def system_fn(_cid):
+        return userbot.system_for(_cid, mode=mode)
+
     if is_private:
         hist, messages = await core.prepare_messages(
             STORE,
@@ -435,7 +443,7 @@ def _model_rows(chat_id):
     for name in userbot.MODELS[:20]:
         marker = " *" if name == current else ""
         rows.append(
-            [Button.inline(f"{name}{marker}", f"settings:pick:{name}".encode("utf-8"))]
+            [Button.inline(f"{name}{marker}", f"settings:pick:{name}".encode())]
         )
     rows.append([Button.inline("Назад", b"settings:main")])
     return rows
