@@ -214,7 +214,12 @@ async def handler(event: Any):
             await safe_reply(event, "Системный промпт доступен только владельцу.")
             return
         mode = "coder" if coder_active_for(sender_id, chat_id) else "bot"
-        await safe_reply(event, userbot.system_prompt_report(chat_id, mode=mode))
+        await safe_reply(
+            event,
+            userbot.system_prompt_report(
+                chat_id, mode=mode, with_contract=(mode == "coder")
+            ),
+        )
         return
 
     if command and command[0] == "settings":
@@ -325,7 +330,7 @@ async def handler(event: Any):
     mode = "coder" if coder_active else "bot"
 
     def system_fn(_cid):
-        return userbot.system_for(_cid, mode=mode)
+        return userbot.system_for(_cid, mode=mode, with_contract=(mode == "coder"))
 
     if is_private:
         hist, messages = await core.prepare_messages(
@@ -501,7 +506,12 @@ async def callback_handler(event: Any):
         return
     elif action == "prompt":
         mode = "coder" if coder_active_for(event.sender_id, chat_id) else "bot"
-        await safe_reply(event, userbot.system_prompt_report(chat_id, mode=mode))
+        await safe_reply(
+            event,
+            userbot.system_prompt_report(
+                chat_id, mode=mode, with_contract=(mode == "coder")
+            ),
+        )
     else:
         await event.answer("Неизвестное действие.", alert=True)
         return

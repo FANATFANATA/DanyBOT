@@ -2009,10 +2009,25 @@ class ContractPromptTest(BotTestCase):
     def test_contract_only_in_coder_mode(self):
         contract = userbot.load_contract()
         self.assertTrue(contract)
-        self.assertIn(contract, userbot.system_for(self.CHAT_ID, mode="coder"))
-        for mode in ("userbot", "bot"):
+        self.assertIn(
+            contract,
+            userbot.system_for(self.CHAT_ID, mode="coder", with_contract=True),
+        )
+        for mode in ("userbot", "bot", "coder"):
             with self.subTest(mode=mode):
                 self.assertNotIn(contract, userbot.system_for(self.CHAT_ID, mode=mode))
+
+    def test_contract_requires_bot_flag(self):
+        contract = userbot.load_contract()
+        self.assertTrue(contract)
+        self.assertIn(
+            contract,
+            userbot.system_prompt_report(
+                self.CHAT_ID, mode="coder", with_contract=True
+            ),
+        )
+        report = userbot.system_prompt_report(self.CHAT_ID, mode="coder")
+        self.assertNotIn(contract, report)
 
     def test_system_prompt_report_shape(self):
         report = userbot.system_prompt_report(self.CHAT_ID, mode="bot")

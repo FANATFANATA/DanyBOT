@@ -353,7 +353,7 @@ def load_contract():
     return combined
 
 
-def system_for(chat_id, mode="userbot"):
+def system_for(chat_id, mode="userbot", with_contract=False):
     if mode == "coder":
         base = CODER_SYSTEM_PROMPT
     elif mode == "bot":
@@ -363,7 +363,7 @@ def system_for(chat_id, mode="userbot"):
     parts = [base]
     if EXTRA_SYSTEM:
         parts.append(EXTRA_SYSTEM)
-    if mode == "coder":
+    if with_contract and mode == "coder":
         contract = load_contract()
         if contract:
             parts.append(contract)
@@ -388,8 +388,8 @@ def settings_report(chat_id):
     )
 
 
-def system_prompt_report(chat_id, mode="userbot", limit=3000):
-    text = system_for(chat_id, mode=mode)
+def system_prompt_report(chat_id, mode="userbot", limit=3000, with_contract=False):
+    text = system_for(chat_id, mode=mode, with_contract=with_contract)
     contract = load_contract()
     files = ", ".join(_contract_status(name) for name in CONTRACT_FILES)
     head = (
