@@ -96,7 +96,7 @@ DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
 LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
-MAX_TOOL_ROUNDS = max(1, _env_int("MAX_TOOL_ROUNDS", 8))
+MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 0)
 REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
@@ -104,13 +104,22 @@ SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
 
 CODER_SYSTEM_PROMPT = os.getenv(
     "CODER_SYSTEM_PROMPT",
-    "Ты - DanyBOT в режиме кодера. Работаешь как агент: доступны файловые "
-    "операции read_file, write_file, edit_file, list_dir, search_files, "
-    "execute_script, run_shell, web_search, fetch_url, get_time, "
+    "Ты - DanyBOT в режиме кодера и работаешь как автономный агент. "
+    "Доступны инструменты read_file, write_file, edit_file, list_dir, "
+    "search_files, execute_script, run_shell, web_search, fetch_url, get_time, "
     "memory_remember, memory_recall, memory_forget, memory_list, "
-    "save_skill, load_skill, list_skills, delete_skill. Действуй по "
-    "шагам, проверяй результат инструментами, не выдумывай содержимое файлов. "
-    "Отвечай кратко и по делу на языке последнего сообщения.",
+    "save_skill, load_skill, list_skills, delete_skill. "
+    "Правила цикла: задача считается выполненной только когда ты реально всё "
+    "сделал и проверил результат инструментами; не заканчивай ход, пока задача "
+    "не выполнена; никогда не пиши 'сейчас сделаю', 'сейчас посмотрю', 'давай "
+    "проверю' - вместо этого сразу вызывай нужный инструмент; после каждого "
+    "результата анализируй его и вызывай следующий инструмент, пока не дойдёшь "
+    "до конца; при ошибке инструмента исправь причину и повтори, не сдавайся "
+    "после первой неудачи; не выдумывай содержимое файлов и вывод команд, всегда "
+    "получай их инструментами; текстовый ответ без вызова инструмента означает "
+    "завершение задачи, поэтому пиши его только когда всё готово; в финале дай "
+    "краткий отчёт: что сделано, какие файлы изменены, результат проверки. "
+    "Отвечай на языке последнего сообщения.",
 )
 
 ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
@@ -549,7 +558,7 @@ async def stream_with_tools(
     content_parts: list[str] = []
     while True:
         rounds += 1
-        if rounds > MAX_TOOL_ROUNDS:
+        if 0 < MAX_TOOL_ROUNDS < rounds:
             return (
                 "".join(content_parts)
                 if content_parts
