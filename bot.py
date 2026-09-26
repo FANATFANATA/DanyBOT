@@ -112,7 +112,7 @@ def get_bot_client():
 
 
 def load_state():
-    core.load_state_into(STORE, STATE_FILE)
+    core.load_state_into(STORE, STATE_FILE, logger)
 
 
 def save_state():
@@ -121,7 +121,11 @@ def save_state():
 
 def load_history():
     core.load_history_into(
-        STORE, HISTORY_FILE, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
+        STORE,
+        HISTORY_FILE,
+        userbot.DM_HISTORY_LIMIT,
+        userbot.GROUP_HISTORY_LIMIT,
+        logger,
     )
 
 
@@ -558,6 +562,14 @@ async def callback_handler(event: Any):
     await _edit_settings(event, chat_id)
 
 
+async def _proxy_candidates():
+    try:
+        return await proxies.get_proxy_candidates(limit=40)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        logger.warning("Бот: не удалось получить прокси: %r", exc)
+        return []
+
+
 async def start_bot():
     global bot_username, bot_id
     if not userbot.BOT_TOKEN:
@@ -574,7 +586,7 @@ async def start_bot():
     cli.add_event_handler(handler, events.NewMessage(incoming=None))
     cli.add_event_handler(callback_handler, events.CallbackQuery())
 
-    candidates = await proxies.get_proxy_candidates(limit=40)
+    candidates = await _proxy_candidates()
     if not candidates:
         logger.warning("Бот: нет прокси, пробую напрямую")
         candidates = [None]

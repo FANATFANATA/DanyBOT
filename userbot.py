@@ -230,7 +230,7 @@ ai = AsyncOpenAI(
 
 
 def load_state():
-    core.load_state_into(STORE, STATE_FILE)
+    core.load_state_into(STORE, STATE_FILE, logger)
 
 
 def save_state():
@@ -238,7 +238,9 @@ def save_state():
 
 
 def load_history():
-    core.load_history_into(STORE, HISTORY_FILE, DM_HISTORY_LIMIT, GROUP_HISTORY_LIMIT)
+    core.load_history_into(
+        STORE, HISTORY_FILE, DM_HISTORY_LIMIT, GROUP_HISTORY_LIMIT, logger
+    )
 
 
 def save_history():
@@ -953,13 +955,21 @@ async def disconnect_quietly(timeout=10):
         await asyncio.wait_for(cast(Any, client.disconnect()), timeout=timeout)
 
 
+async def _proxy_candidates():
+    try:
+        return await proxies.get_proxy_candidates(limit=40)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        logger.warning("Не удалось получить прокси: %r", exc)
+        return []
+
+
 async def start_userbot():
     if not API_ID or not API_HASH:
         logger.error("ENABLE_USERBOT=1, но API_ID/API_HASH не заданы в .env")
         return
     cli = get_client()
     cli.add_event_handler(handler, events.NewMessage(incoming=None))
-    candidates = await proxies.get_proxy_candidates(limit=40)
+    candidates = await _proxy_candidates()
     if not candidates:
         logger.warning("Нет прокси, пробую напрямую")
         candidates = [None]

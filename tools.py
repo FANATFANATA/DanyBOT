@@ -1056,6 +1056,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
         client=client,
         max_rounds=_opt_int_arg(arguments, "max_rounds", 1, 20),
         verify=not unrestricted,
+        stats=stats,
     )
     return json.dumps(results, ensure_ascii=False)[:8000]
 

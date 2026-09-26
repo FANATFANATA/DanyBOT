@@ -392,9 +392,13 @@ class ModeStore:
             object.__setattr__(self, name, value)
 
 
-def load_state_into(store, state_file):
+def load_state_into(store, state_file, logger=None):
     state = load_state_file(state_file)
     if state is None:
+        if logger is not None and state_file.exists():
+            logger.warning(
+                "Не удалось прочитать %s, состояние сброшено", state_file.name
+            )
         return
     store.model_overrides = state["model_overrides"]
     store.coder_chats = state["coder_chats"]
@@ -415,9 +419,13 @@ def save_state_from(store, state_file, logger):
         logger.warning("Не удалось сохранить %s", state_file.name)
 
 
-def load_history_into(store, history_file, dm_limit, group_limit):
+def load_history_into(store, history_file, dm_limit, group_limit, logger=None):
     history = load_history_file(history_file, dm_limit, group_limit)
     if history is None:
+        if logger is not None and history_file.exists():
+            logger.warning(
+                "Не удалось прочитать %s, история сброшена", history_file.name
+            )
         return
     store.chat_history = history
 
@@ -498,16 +506,16 @@ def check_cooldown(
     cleanup_threshold=10000,
     cleanup_age=3600,
 ):
-    if cooldown > 0:
-        last = last_chat_activity.get(chat_id)
-        if last is not None and (now - last) < cooldown:
-            return True
-    last_chat_activity[chat_id] = now
     if len(last_chat_activity) > cleanup_threshold:
         cutoff = now - cleanup_age
         for k in list(last_chat_activity):
             if last_chat_activity[k] < cutoff:
                 del last_chat_activity[k]
+    if cooldown > 0:
+        last = last_chat_activity.get(chat_id)
+        if last is not None and (now - last) < cooldown:
+            return True
+    last_chat_activity[chat_id] = now
     return False
 
 
