@@ -39,7 +39,7 @@ def _connect():
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     key = str(DB_PATH)
-    if key not in _initialized or not DB_PATH.exists():
+    if key not in _initialized:
         conn.executescript(_SCHEMA)
         _initialized.add(key)
     return conn
@@ -56,11 +56,17 @@ def _clean_tags(raw):
         parts = [str(x).strip() for x in raw]
     else:
         parts = [x.strip() for x in str(raw).replace(";", ",").split(",")]
-    seen = []
+    kept = []
+    used = 0
     for part in parts:
-        if part and part not in seen:
-            seen.append(part)
-    return ",".join(seen)[:MAX_TAGS]
+        if not part or part in kept:
+            continue
+        extra = len(part) + (1 if kept else 0)
+        if extra > MAX_TAGS - used:
+            break
+        kept.append(part)
+        used += extra
+    return ",".join(kept)
 
 
 def _tags_list(raw):
@@ -120,10 +126,14 @@ def load_skill(name: str, touch: bool = True) -> dict:
         row = cur.fetchone()
         if not row:
             return {"ok": False, "error": f"Скилл не найден: {name}"}
+        uses = int(row["uses"] or 0)
         if touch:
-            conn.execute("UPDATE skills SET uses=uses+1 WHERE id=?", (row["id"],))
+            uses += 1
+            conn.execute("UPDATE skills SET uses=? WHERE id=?", (uses, row["id"]))
             conn.commit()
-        return {"ok": True, "skill": _row_to_dict(row)}
+        data = _row_to_dict(row)
+        data["uses"] = uses
+        return {"ok": True, "skill": data}
 
 
 def list_skills(tag: str = "", query: str = "", limit: int = 50) -> dict:

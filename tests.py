@@ -11,13 +11,14 @@ import tempfile
 import time
 import unittest
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 from unittest import mock
 
 from telethon.crypto import AuthKey
-from telethon.errors import FloodWaitError, RPCError
+from telethon.errors import AuthKeyError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
 
 import bot
@@ -46,6 +47,8 @@ WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603,B608"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
+BOT_AUTH_VALUE = "bot-token"
+NO_AUTH = ""
 _log_lines: list[str] = []
 
 
@@ -110,6 +113,8 @@ def patch_paths(testcase):
         (proxies, "RAW_CACHE_FILE", "proxy_cache.txt"),
         (userbot, "STATE_FILE", "state_userbot.json"),
         (userbot, "HISTORY_FILE", "history_userbot.json"),
+        (bot, "STATE_FILE", "state_bot.json"),
+        (bot, "HISTORY_FILE", "history_bot.json"),
     ):
         saved.append((mod, attr, getattr(mod, attr)))
         setattr(mod, attr, tmp / fname)
@@ -122,25 +127,44 @@ def patch_paths(testcase):
     return tmp
 
 
-def snapshot_bot_state():
+_MODE_ATTRS = (
+    "model_overrides",
+    "coder_chats",
+    "reasoning_hidden",
+    "tools_hidden",
+    "chat_history",
+)
+
+
+def _snapshot_module(mod):
+    snap = {}
+    for attr in _MODE_ATTRS:
+        value = getattr(mod, attr)
+        if attr == "chat_history":
+            snap[attr] = {k: deque(v, maxlen=v.maxlen) for k, v in value.items()}
+        elif attr == "model_overrides":
+            snap[attr] = dict(value)
+        else:
+            snap[attr] = set(value)
+    return snap
+
+
+def _restore_module(mod, snap):
+    for attr, value in snap.items():
+        setattr(mod, attr, value)
+
+
+def snapshot_mode_state():
     return {
-        "model_overrides": dict(userbot.model_overrides),
-        "coder_chats": set(userbot.coder_chats),
-        "reasoning_hidden": set(userbot.reasoning_hidden),
-        "tools_hidden": set(userbot.tools_hidden),
-        "chat_history": {
-            k: deque(v, maxlen=v.maxlen) for k, v in userbot.chat_history.items()
-        },
+        "userbot": _snapshot_module(userbot),
+        "bot": _snapshot_module(bot),
         "MODELS": list(userbot.MODELS),
     }
 
 
-def restore_bot_state(snap):
-    userbot.model_overrides = snap["model_overrides"]
-    userbot.coder_chats = snap["coder_chats"]
-    userbot.reasoning_hidden = snap["reasoning_hidden"]
-    userbot.tools_hidden = snap["tools_hidden"]
-    userbot.chat_history = snap["chat_history"]
+def restore_mode_state(snap):
+    _restore_module(userbot, snap["userbot"])
+    _restore_module(bot, snap["bot"])
     userbot.MODELS = snap["MODELS"]
 
 
@@ -160,10 +184,10 @@ def rows_data(rows):
 class BotTestCase(unittest.TestCase):
     def setUp(self):
         patch_paths(self)
-        self._snap = snapshot_bot_state()
+        self._snap = snapshot_mode_state()
 
         def restore_snap():
-            restore_bot_state(self._snap)
+            restore_mode_state(self._snap)
 
         self.addCleanup(restore_snap)
 
@@ -1185,7 +1209,7 @@ class EnvBoolTest(BotTestCase):
         self.assertFalse(userbot._env_bool("DANYBOT_TEST_BOOL", False))
 
     def test_false_values(self):
-        for val in ("0", "false", "no", "False", "NO", " 0 "):
+        for val in ("0", "false", "no", "off", "False", "NO", "OFF", " 0 "):
             with mock.patch.dict(os.environ, {"DANYBOT_TEST_BOOL": val}):
                 self.assertFalse(userbot._env_bool("DANYBOT_TEST_BOOL", True))
 
@@ -1709,6 +1733,8 @@ class FloodRetryTest(BotTestCase):
         attempts = {"n": 0}
 
         class FakeEvent:
+            chat_id = 4242
+
             async def reply(self, text):
                 attempts["n"] += 1
                 behavior = script[min(attempts["n"], len(script)) - 1]
@@ -1726,7 +1752,7 @@ class FloodRetryTest(BotTestCase):
         if sent is None or sent.id != 777:
             self.fail("safe_reply должен вернуть сообщение с id 777")
         self.assertEqual(attempts["n"], 3)
-        self.assertIn(777, userbot.recent_reply_ids)
+        self.assertIn((4242, 777), userbot.recent_reply_ids)
 
     def test_safe_reply_bounded_attempts(self):
         event, attempts = self.make_event(["flood"])
@@ -1785,13 +1811,30 @@ class RichFakeClient(FakeClient):
 
 
 class _FakeResp:
-    def __init__(self, text, status=200):
+    def __init__(self, text, status=200, location=None):
         self.text = text
         self.status_code = status
+        self.headers = {"location": location} if location else {}
 
     def raise_for_status(self):
         if self.status_code >= 400:
             raise OSError("bad status")
+
+    async def aiter_bytes(self):
+        raw = self.text.encode("utf-8")
+        for start in range(0, len(raw), 4096):
+            yield raw[start : start + 4096]
+
+
+class _FakeStream:
+    def __init__(self, resp):
+        self._resp = resp
+
+    async def __aenter__(self):
+        return self._resp
+
+    async def __aexit__(self, *_):
+        return False
 
 
 class _FakeHttpx:
@@ -1799,11 +1842,19 @@ class _FakeHttpx:
         self._text = text
         self._status = status
 
-    async def get(self, url, **kwargs):
+    def _resp(self):
         return _FakeResp(self._text, self._status)
+
+    async def get(self, url, **kwargs):
+        return self._resp()
+
+    def stream(self, _method, url, **kwargs):
+        return _FakeStream(self._resp())
 
 
 class _FakeReplyEvent:
+    chat_id = 5
+
     def __init__(self, fail_times=0):
         self.replies = []
         self._fail = fail_times
@@ -1906,24 +1957,24 @@ class ExtraToolsTest(BotTestCase):
                 self.assertIn("Адрес заблокирован", out)
 
     def test_fetch_url_follows_redirects_safely(self):
-        class _Redirect:
-            def __init__(self, location, text=""):
-                self.text = text
-                self.status_code = 302
-                self.headers = {"location": location}
-
-            def raise_for_status(self):
-                return None
-
         class _RedirectClient:
             def __init__(self):
                 self.urls = []
+                self._last = ""
+
+            def _resp(self):
+                self.urls.append(self._last)
+                if len(self.urls) == 1:
+                    return _FakeResp("", 302, location="http://127.0.0.1:8008/v1")
+                return _FakeResp("secret", 200)
 
             async def get(self, url, **kwargs):
-                self.urls.append(url)
-                if len(self.urls) == 1:
-                    return _Redirect("http://127.0.0.1:8008/v1")
-                return _FakeResp("secret", 200)
+                self._last = url
+                return self._resp()
+
+            def stream(self, _method, url, **kwargs):
+                self._last = url
+                return _FakeStream(self._resp())
 
         client = _RedirectClient()
         with mock.patch.object(tools_module, "_get_httpx_client", lambda: client):
@@ -2155,26 +2206,23 @@ class CoreHelpersTest(BotTestCase):
             asyncio.run(
                 core.stream_answer(
                     store,
-                    None,
-                    1,
-                    False,
-                    [],
-                    "m",
-                    "",
-                    None,
-                    render,
-                    edit_fn,
-                    reply_fn,
-                    _NullAsyncContext(),
-                    stream_fn,
-                    None,
-                    None,
-                    0.0,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
                 )
             )
         self.assertTrue(edited)
         self.assertIn("Ошибка", edited[-1])
-        self.assertNotIn(555, store.recent_reply_ids)
+        self.assertNotIn((1, 555), store.recent_reply_ids)
 
     def test_stream_answer_sends_message_when_placeholder_failed(self):
         store = _StoreStub()
@@ -2195,21 +2243,18 @@ class CoreHelpersTest(BotTestCase):
         answer = asyncio.run(
             core.stream_answer(
                 store,
-                None,
-                1,
-                False,
-                [],
-                "m",
-                "",
-                None,
-                render,
-                edit_fn,
-                reply_fn,
-                _NullAsyncContext(),
-                stream_fn,
-                None,
-                None,
-                0.0,
+                event=None,
+                chat_id=1,
+                is_self=False,
+                messages=[],
+                model="m",
+                prefix="",
+                self_edit_id=None,
+                render_fn=render,
+                edit_fn=edit_fn,
+                reply_fn=reply_fn,
+                action=_NullAsyncContext(),
+                stream_fn=stream_fn,
             )
         )
         self.assertEqual(answer, "итог")
@@ -2223,7 +2268,7 @@ class CoreHelpersTest(BotTestCase):
         if sent is None:
             self.fail("safe_reply returned None")
         self.assertEqual(sent.id, 77)
-        self.assertIn(77, recent)
+        self.assertIn((5, 77), recent)
 
     def test_safe_reply_failure_returns_none(self):
         event = _FakeReplyEvent(fail_times=5)
@@ -2441,21 +2486,18 @@ class CoreHelpersTest(BotTestCase):
         answer = asyncio.run(
             core.stream_answer(
                 store,
-                None,
-                1,
-                True,
-                [],
-                "m",
-                "p:",
-                5,
-                render,
-                edit_fn,
-                reply_fn,
-                _NullAsyncContext(),
-                stream_fn,
-                None,
-                None,
-                0.0,
+                event=None,
+                chat_id=1,
+                is_self=True,
+                messages=[],
+                model="m",
+                prefix="p:",
+                self_edit_id=5,
+                render_fn=render,
+                edit_fn=edit_fn,
+                reply_fn=reply_fn,
+                action=_NullAsyncContext(),
+                stream_fn=stream_fn,
             )
         )
         self.assertEqual(answer, "hi")
@@ -2712,6 +2754,7 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(memory._clean_tags(None), "")
         self.assertEqual(memory._clean_tags(" a , b ; a "), "a,b")
         self.assertEqual(memory._tags_list(""), [])
+        self.assertEqual(memory._clean_tags(["t" * 600]), "")
 
 
 class SkillsStoreTest(unittest.TestCase):
@@ -2743,6 +2786,20 @@ class SkillsStoreTest(unittest.TestCase):
         skills.save_skill("n", "d", "b")
         skills.load_skill("n")
         self.assertEqual(skills.load_skill("n", touch=False)["skill"]["uses"], 1)
+
+    def test_load_reports_incremented_uses(self):
+        skills.save_skill("n", "d", "b")
+        self.assertEqual(skills.load_skill("n")["skill"]["uses"], 1)
+        self.assertEqual(skills.load_skill("n")["skill"]["uses"], 2)
+        self.assertEqual(skills.load_skill("n", touch=False)["skill"]["uses"], 2)
+        self.assertEqual(skills.load_skill("n", touch=False)["skill"]["uses"], 2)
+
+    def test_tags_budget_never_splits_a_tag(self):
+        long_tag = "t" * 600
+        self.assertEqual(skills._clean_tags([long_tag]), "")
+        self.assertEqual(skills._clean_tags(["ab", long_tag]), "ab")
+        self.assertEqual(skills._clean_tags(["ab", "cd", long_tag]), "ab,cd")
+        self.assertEqual(skills._clean_tags(["a" * 499, "b"]), "a" * 499)
 
     def test_list_filters(self):
         skills.save_skill("alpha", "first", "body one", "x")
@@ -2830,9 +2887,13 @@ class _FakeBotClient:
 class _FakeSaver:
     def __init__(self):
         self.dirty = 0
+        self.flushed = 0
 
     def mark_dirty(self):
         self.dirty += 1
+
+    async def flush(self):
+        self.flushed += 1
 
 
 class BotHandlerTest(BotTestCase):
@@ -2873,7 +2934,7 @@ class BotHandlerTest(BotTestCase):
         self.stream_calls = []
 
         async def fake_stream(*args, **kwargs):
-            self.stream_calls.append(args)
+            self.stream_calls.append((args, kwargs))
             return "ответ"
 
         for target, attr, value in (
@@ -2900,13 +2961,13 @@ class BotHandlerTest(BotTestCase):
         )
 
     def _prompt(self):
-        return self.stream_calls[0][4][-1]["content"]
+        return self.stream_calls[0][1]["messages"][-1]["content"]
 
     def _model(self):
-        return self.stream_calls[0][5]
+        return self.stream_calls[0][1]["model"]
 
     def _prefix(self):
-        return self.stream_calls[0][6]
+        return self.stream_calls[0][1]["prefix"]
 
     def test_empty_message_ignored(self):
         self._run(self._group_event(""))
@@ -2970,7 +3031,7 @@ class BotHandlerTest(BotTestCase):
         bot.bot_username = "danybot"
         self._run(self._group_event("@danybot моё сообщение", out=True, msg_id=21))
         self.assertEqual(self._prefix(), "@danybot моё сообщение\n\n")
-        self.assertEqual(self.stream_calls[0][7], 21)
+        self.assertEqual(self.stream_calls[0][1]["self_edit_id"], 21)
 
     def test_prompt_is_truncated(self):
         saved_limit = userbot.MAX_REQUEST_LEN
@@ -2997,7 +3058,7 @@ class BotHandlerTest(BotTestCase):
     def test_duplicate_message_id_skipped(self):
         event = self._group_event("@danybot привет", msg_id=42)
         self._run(event)
-        bot.recent_reply_ids.add(42)
+        bot.recent_reply_ids.add((self.GROUP, 42))
         self._run(self._group_event("@danybot привет", msg_id=42))
         self.assertEqual(len(self.stream_calls), 1)
 
@@ -3906,6 +3967,56 @@ class SubagentsTest(BotTestCase):
         self.assertEqual(result["tools_used"], [])
         self.assertIn("отклонён", self._tool_messages(ai)[0]["content"])
 
+    def test_long_loop_keeps_context_bounded(self):
+        rounds = 30
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call(f"c{index}", "get_time", "{}")])
+                for index in range(rounds)
+            ]
+            + [("готово", None)]
+        )
+        subagents.configure(
+            ai=ai,
+            model="m",
+            verifier=self._allow,
+            enabled=True,
+            max_rounds=rounds + 2,
+        )
+        result = asyncio.run(subagents.run_subagent("долгая задача"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rounds"], rounds + 1)
+        final = ai.seen[-1]
+        self.assertLessEqual(len(final), subagents.MAX_CONTEXT_MESSAGES)
+        self.assertGreater(len(final), subagents.MAX_CONTEXT_MESSAGES // 2)
+        self.assertLess(len([m for m in final if m.get("role") == "tool"]), rounds)
+        self.assertEqual(final[0]["role"], "system")
+        self.assertEqual(final[1]["content"], "долгая задача")
+
+    def test_tool_output_truncation_is_marked(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"1+1"}')]),
+                ("готово", None),
+            ]
+        )
+
+        async def fake_execute(
+            name, arguments, chat_id, client, stats, unrestricted, a
+        ):
+            return "z" * (subagents.MAX_TOOL_RESULT + 500)
+
+        saved = tools_module.execute_tool
+        self.addCleanup(setattr, tools_module, "execute_tool", saved)
+        tools_module.execute_tool = fake_execute
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        asyncio.run(subagents.run_subagent("посчитай"))
+        content = self._tool_messages(ai)[0]["content"]
+        self.assertTrue(content.endswith(subagents.TRUNCATED_MARK))
+        self.assertEqual(
+            len(content), subagents.MAX_TOOL_RESULT + len(subagents.TRUNCATED_MARK)
+        )
+
     def test_failing_worker_does_not_kill_others(self):
         async def explode(spec):
             raise RuntimeError("subagent down")
@@ -3936,6 +4047,835 @@ class SubagentsTest(BotTestCase):
 
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(run())
+
+
+class _FakeTelegramClient:
+    def __init__(
+        self,
+        fail_times=0,
+        error=None,
+        username="danybot",
+        uid=42,
+        command_error=None,
+    ):
+        self.events = []
+        self.proxies = []
+        self.starts = 0
+        self.commands = []
+        self.disconnects = 0
+        self.running = False
+        self._fail = fail_times
+        self._error = error
+        self._username = username
+        self._uid = uid
+        self._command_error = command_error
+
+    def add_event_handler(self, handler, event):
+        self.events.append(event)
+
+    def set_proxy(self, proxy):
+        if self.running:
+            raise RuntimeError("client is connected")
+        self.proxies.append(proxy)
+
+    async def start(self, *args, **kwargs):
+        self.starts += 1
+        if self._error is not None:
+            raise self._error
+        if self._fail > 0:
+            self._fail -= 1
+            raise OSError("connect failed")
+        self.running = True
+        return SimpleNamespace()
+
+    async def get_me(self):
+        return SimpleNamespace(
+            first_name="Me", last_name="M", username=self._username, id=self._uid
+        )
+
+    async def run_until_disconnected(self):
+        self.running = False
+
+    async def disconnect(self):
+        self.running = False
+        self.disconnects += 1
+        return True
+
+    async def __call__(self, request):
+        if self._command_error is not None:
+            raise self._command_error
+        self.commands.append(request)
+        return SimpleNamespace()
+
+
+class UserbotHandlerTest(BotTestCase):
+    DM = 777
+    GROUP = -1002
+    OWNER = 5
+
+    def setUp(self):
+        super().setUp()
+        for attr, value in (
+            ("model_overrides", {}),
+            ("coder_chats", set()),
+            ("reasoning_hidden", set()),
+            ("tools_hidden", set()),
+            ("recent_reply_ids", set()),
+            ("seen_msg_keys", set()),
+            ("last_chat_activity", {}),
+            ("chat_history", {}),
+        ):
+            saved = getattr(userbot, attr)
+            self.addCleanup(setattr, userbot, attr, saved)
+            setattr(userbot, attr, value)
+        self.saver = _FakeSaver()
+        for attr, value in (
+            ("OWNER_IDS", {self.OWNER}),
+            ("COOLDOWN", 0),
+            ("HISTORY_SAVER", self.saver),
+        ):
+            saved = getattr(userbot, attr)
+            self.addCleanup(setattr, userbot, attr, saved)
+            setattr(userbot, attr, value)
+        self.client = FakeClient()
+        self.stream_calls = []
+
+        async def fake_stream(*_args, **kwargs):
+            self.stream_calls.append(kwargs)
+            return "ответ"
+
+        for target, attr, value in (
+            (core, "stream_answer", fake_stream),
+            (userbot, "get_client", lambda: self.client),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, value)
+
+    def _run(self, event):
+        asyncio.run(userbot.handler(event))
+        return event
+
+    def _event(self, text, **kwargs):
+        chat_id = kwargs.pop("chat_id", self.DM)
+        sender_id = kwargs.pop("sender_id", 9)
+        is_private = kwargs.pop("is_private", True)
+        return _FakeHandlerEvent(
+            _FakeMessage(text, **kwargs),
+            chat_id=chat_id,
+            sender_id=sender_id,
+            is_private=is_private,
+        )
+
+    def _group_prompt(self, chat_id=None):
+        entries = [
+            item["content"]
+            for item in userbot.chat_history[chat_id or self.GROUP]
+            if item["role"] == "user"
+        ]
+        return entries[-1] if entries else ""
+
+    def test_empty_message_ignored(self):
+        self._run(self._event(""))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_message_without_object_ignored(self):
+        event = self._event(".db привет")
+        event.message = None
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_missing_chat_id_ignored(self):
+        event = self._event(".db привет")
+        event.chat_id = None
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_own_reply_id_is_skipped(self):
+        userbot.recent_reply_ids.add((self.DM, 3))
+        self._run(self._event(".db привет", msg_id=3))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_same_id_in_another_chat_is_processed(self):
+        userbot.recent_reply_ids.add((self.DM, 3))
+        self._run(
+            self._event(".db привет", msg_id=3, chat_id=self.GROUP, is_private=False)
+        )
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_message_from_bot_is_ignored(self):
+        event = self._event(".db привет")
+
+        async def bot_sender():
+            return SimpleNamespace(
+                first_name="Bot", last_name="", username="b", bot=True
+            )
+
+        event.get_sender = bot_sender
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+
+    def test_group_message_needs_trigger(self):
+        self._run(self._event("просто текст", chat_id=self.GROUP, is_private=False))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_both_aliases_trigger(self):
+        for text, msg_id in ((".db привет", 1), (".ai привет", 2)):
+            self._run(self._event(text, msg_id=msg_id))
+        self.assertEqual(len(self.stream_calls), 2)
+
+    def test_messages_use_live_context(self):
+        self._run(self._event(".db привет", msg_id=4))
+        messages = self.stream_calls[0]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[1]["content"], "t1")
+        self.assertEqual(self.client.history_limits, [userbot.LIVE_HISTORY_LIMIT])
+
+    def test_trigger_is_stripped_from_prompt(self):
+        self._run(
+            self._event(".db  привет", msg_id=40, chat_id=self.GROUP, is_private=False)
+        )
+        self.assertTrue(self._group_prompt().endswith(": привет"))
+
+    def test_replied_text_is_added_to_prompt(self):
+        replied = _FakeMessage("старый вопрос", msg_id=6, out=True)
+        self._run(
+            self._event(
+                ".db ответ",
+                msg_id=5,
+                is_reply=True,
+                reply_msg=replied,
+                chat_id=self.GROUP,
+                is_private=False,
+            )
+        )
+        prompt = self._group_prompt()
+        self.assertIn("старый вопрос", prompt)
+        self.assertIn("ответ", prompt)
+
+    def test_prompt_is_truncated(self):
+        saved = userbot.MAX_REQUEST_LEN
+        self.addCleanup(setattr, userbot, "MAX_REQUEST_LEN", saved)
+        userbot.MAX_REQUEST_LEN = 20
+        self._run(
+            self._event(
+                ".db " + "я" * 200 + "ХВОСТ",
+                msg_id=8,
+                chat_id=self.GROUP,
+                is_private=False,
+            )
+        )
+        self.assertNotIn("ХВОСТ", self._group_prompt())
+
+    def test_trigger_only_message_replies_with_replied_text(self):
+        replied = _FakeMessage("только реплай", msg_id=9, out=True)
+        self._run(
+            self._event(
+                ".db",
+                msg_id=10,
+                is_reply=True,
+                reply_msg=replied,
+                chat_id=self.GROUP,
+                is_private=False,
+            )
+        )
+        self.assertTrue(self._group_prompt().endswith(": только реплай"))
+
+    def test_empty_prompt_without_reply_is_ignored(self):
+        self._run(self._event(".db   ", msg_id=11))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_cooldown_blocks_second_message(self):
+        userbot.COOLDOWN = 60
+        self._run(self._event(".db первый", msg_id=12))
+        self._run(self._event(".db второй", msg_id=13))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_own_message_edits_itself(self):
+        self._run(self._event(".db моё сообщение", msg_id=14, out=True))
+        self.assertEqual(self.stream_calls[0]["self_edit_id"], 14)
+        self.assertEqual(self.stream_calls[0]["is_self"], True)
+        self.assertIn("моё сообщение", self.stream_calls[0]["prefix"])
+
+    def test_model_override_is_used(self):
+        userbot.model_overrides[self.DM] = "custom-model"
+        self._run(self._event(".db привет", msg_id=15))
+        self.assertEqual(self.stream_calls[0]["model"], "custom-model")
+
+    def test_history_is_appended_and_saved(self):
+        self._run(self._event(".db привет", msg_id=16))
+        entries = list(userbot.chat_history[self.DM])
+        self.assertEqual(entries[0]["role"], "user")
+        self.assertEqual(entries[-1]["role"], "assistant")
+        self.assertGreaterEqual(self.saver.dirty, 1)
+
+    def test_group_history_is_saved(self):
+        self._run(self._event(".db привет", chat_id=self.GROUP, is_private=False))
+        self.assertTrue(userbot.chat_history[self.GROUP])
+        self.assertGreaterEqual(self.saver.dirty, 1)
+
+    def test_stream_error_is_reported(self):
+        async def failing(*_args, **_kwargs):
+            raise userbot.OpenAIError("boom")
+
+        saved = core.stream_answer
+        self.addCleanup(setattr, core, "stream_answer", saved)
+        core.stream_answer = failing
+        event = self._event(".db привет", msg_id=17)
+        self._run(event)
+        self.assertIn("Ошибка", event.sent[0])
+
+    def test_coder_command_points_to_bot(self):
+        event = self._event(".db coder on", msg_id=18)
+        self._run(event)
+        self.assertIn("боте", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_coder_status_points_to_bot(self):
+        event = self._event(".db coder", msg_id=19)
+        self._run(event)
+        self.assertIn("боте", event.sent[0])
+
+    def test_prompt_command_is_owner_only(self):
+        event = self._event(".db prompt", msg_id=20, sender_id=9)
+        self._run(event)
+        self.assertIn("только владельцу", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_prompt_command_for_owner(self):
+        event = self._event(".db prompt", msg_id=21, sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("Режим / Mode", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_settings_command_is_owner_only(self):
+        event = self._event(".db settings", msg_id=22, sender_id=9)
+        self._run(event)
+        self.assertIn("только владельцу", event.sent[0])
+
+    def test_settings_command_for_owner(self):
+        event = self._event(".db settings", msg_id=23, sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("Настройки", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_visibility_command_is_owner_only(self):
+        event = self._event(".db reasoning off", msg_id=24, sender_id=9)
+        self._run(event)
+        self.assertIn("только владельцу", event.sent[0])
+        self.assertNotIn(self.DM, userbot.reasoning_hidden)
+
+    def test_visibility_command_toggles_state(self):
+        event = self._event(".db reasoning off", msg_id=25, sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn(self.DM, userbot.reasoning_hidden)
+        status = self._event(".db reasoning", msg_id=26, sender_id=self.OWNER)
+        self._run(status)
+        self.assertIn("скрыты", status.sent[0])
+        show = self._event(".db tools on", msg_id=27, sender_id=self.OWNER)
+        self._run(show)
+        self.assertIn("показаны", show.sent[0])
+
+    def test_model_command_sets_and_shows(self):
+        set_event = self._event(".db model my-model", msg_id=28)
+        self._run(set_event)
+        self.assertIn("my-model", set_event.sent[0])
+        self.assertEqual(userbot.model_overrides[self.DM], "my-model")
+        show = self._event(".db model", msg_id=29)
+        self._run(show)
+        self.assertIn("my-model", show.sent[0])
+
+    def test_models_command_lists_models(self):
+        event = self._event(".db models", msg_id=30)
+        self._run(event)
+        self.assertIn("Доступные модели", event.sent[0])
+
+    def test_clear_command_resets_history(self):
+        userbot.chat_history[self.DM] = deque([{"role": "user", "content": "x"}])
+        event = self._event(".db clear", msg_id=31)
+        self._run(event)
+        self.assertEqual(len(userbot.chat_history[self.DM]), 0)
+        self.assertIn("Контекст очищен", event.sent[0])
+
+    def test_help_command_lists_aliases(self):
+        event = self._event(".db help", msg_id=32)
+        self._run(event)
+        self.assertIn("Trigger aliases", event.sent[0])
+
+    def test_unknown_command_falls_through_to_prompt(self):
+        self._run(
+            self._event(
+                ".db неизвестная команда",
+                msg_id=33,
+                chat_id=self.GROUP,
+                is_private=False,
+            )
+        )
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertIn("неизвестная команда", self._group_prompt())
+
+
+class HardeningTest(BotTestCase):
+    def _state(self, model="m"):
+        return {
+            "model_overrides": {1: model},
+            "coder_chats": set(),
+            "reasoning_hidden": set(),
+            "tools_hidden": set(),
+        }
+
+    def _tmp_dir(self, prefix):
+        tmp = Path(tempfile.mkdtemp(prefix=prefix))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        return tmp
+
+    def test_render_keeps_answer_with_long_prefix(self):
+        text = tools_module.render_response(
+            "я" * 4000 + "\n\nmodel:\n\n", [], [], "ОТВЕТ " * 400
+        )
+        self.assertIn("ОТВЕТ", text)
+        self.assertLessEqual(len(text), tools_module.MAX_RENDER_CHARS)
+
+    def test_render_drops_reasoning_before_answer(self):
+        text = tools_module.render_response(
+            "prefix:\n\n", ["р" * 3000], ["run_shell"], "ОТВЕТ " * 500
+        )
+        self.assertIn("ОТВЕТ", text)
+        self.assertIn("tools: run_shell", text)
+        self.assertNotIn("р" * 100, text)
+        self.assertLessEqual(len(text), tools_module.MAX_RENDER_CHARS)
+
+    def test_read_and_edit_file_reject_huge_files(self):
+        tmp = self._tmp_dir("danybot_big_")
+        (tmp / "big.txt").write_text("x" * 500, encoding="utf-8")
+        for attr, value in (
+            ("CODER_ROOT", tmp),
+            ("MAX_READ_BYTES", 100),
+        ):
+            saved = getattr(tools_module, attr)
+            self.addCleanup(setattr, tools_module, attr, saved)
+            setattr(tools_module, attr, value)
+        read = asyncio.run(
+            tools_module.execute_tool("read_file", {"path": "big.txt"}, 1)
+        )
+        self.assertIn("слишком большой", read)
+        edit = asyncio.run(
+            tools_module.execute_tool(
+                "edit_file",
+                {"path": "big.txt", "old_string": "x", "new_string": "y"},
+                1,
+            )
+        )
+        self.assertIn("слишком большой", edit)
+
+    def test_read_file_works_within_limit(self):
+        tmp = self._tmp_dir("danybot_ok_")
+        (tmp / "a.txt").write_text("one\ntwo\nthree", encoding="utf-8")
+        saved = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
+        tools_module.CODER_ROOT = tmp
+        out = asyncio.run(
+            tools_module.execute_tool("read_file", {"path": "a.txt", "offset": 2}, 1)
+        )
+        self.assertIn("2|two", out)
+        self.assertIn("3|three", out)
+
+    def test_fetch_url_marks_truncated_download(self):
+        payload = "<html><body>" + ("a" * 5000) + "</body></html>"
+        with (
+            mock.patch.object(
+                tools_module, "_get_httpx_client", lambda: _FakeHttpx(payload)
+            ),
+            mock.patch.object(tools_module, "MAX_FETCH_BYTES", 1024),
+        ):
+            out = asyncio.run(
+                tools_module.execute_tool(
+                    "fetch_url", {"url": "https://93.184.216.34/"}, 1
+                )
+            )
+        self.assertIn("загрузка обрезана", out)
+        self.assertLess(len(out), 1200)
+
+    def test_execute_script_cleans_temp_file_on_launch_failure(self):
+        tmp = self._tmp_dir("danybot_tmpdir_")
+        saved_tempdir = tempfile.tempdir
+        self.addCleanup(setattr, tempfile, "tempdir", saved_tempdir)
+        tempfile.tempdir = str(tmp)
+
+        async def broken(*_args, **_kwargs):
+            raise ValueError("no interpreter")
+
+        saved_exec = asyncio.create_subprocess_exec
+        self.addCleanup(setattr, asyncio, "create_subprocess_exec", saved_exec)
+        asyncio.create_subprocess_exec = broken
+        out = asyncio.run(
+            tools_module.execute_tool("execute_script", {"code": "print(1)"}, 1)
+        )
+        self.assertIn("Ошибка инструмента", out)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_async_saver_keeps_dirty_when_write_is_cancelled(self):
+        saver = core.AsyncSaver(lambda: None, delay=0.01)
+        dirty = []
+
+        async def run():
+            async def cancelled_write():
+                raise asyncio.CancelledError
+
+            saver._write = cancelled_write
+            saver.mark_dirty()
+            await asyncio.sleep(0.05)
+            dirty.append(saver._dirty)
+            task = saver._task
+            self.assertIsNotNone(task)
+            self.assertTrue(cast(Any, task).done())
+
+        asyncio.run(run())
+        self.assertEqual(dirty, [True])
+
+    def test_async_saver_flush_waits_for_inflight_write(self):
+        calls = []
+        saver = core.AsyncSaver(lambda: calls.append(1), delay=0.05)
+
+        async def run():
+            saver.mark_dirty()
+            await saver.flush()
+
+        asyncio.run(run())
+        self.assertEqual(calls, [1])
+        self.assertFalse(saver._dirty)
+
+    def test_async_saver_flush_writes_without_task(self):
+        calls = []
+        saver = core.AsyncSaver(lambda: calls.append(1), delay=0.01)
+
+        async def run():
+            saver._dirty = True
+            saver._task = None
+            await saver.flush()
+
+        asyncio.run(run())
+        self.assertEqual(calls, [1])
+
+    def test_atomic_write_survives_parallel_writers(self):
+        tmp = self._tmp_dir("danybot_parallel_")
+        target = tmp / "state.json"
+        self.assertTrue(core.save_state_file(target, self._state()))
+        failed = []
+
+        def writer(index):
+            for _ in range(20):
+                if not core.save_state_file(target, self._state(f"m{index}")):
+                    failed.append(index)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(writer, range(8)))
+        self.assertEqual(failed, [])
+        data = json.loads(target.read_text(encoding="utf-8"))
+        written = next(iter(data["model_overrides"].values()))
+        self.assertIn(written, {f"m{index}" for index in range(8)})
+        self.assertEqual([p.name for p in tmp.iterdir()], ["state.json"])
+
+    def test_trim_tool_history_keeps_tool_pairs(self):
+        messages: list[dict[str, Any]] = [{"role": "system", "content": "s"}]
+        for index in range(5):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": str(index), "type": "function", "function": {}}
+                    ],
+                }
+            )
+            messages.append(
+                {"role": "tool", "tool_call_id": str(index), "content": "r"}
+            )
+        self.assertIs(core.trim_tool_history(messages, 100), messages)
+        trimmed = core.trim_tool_history(messages, 5)
+        self.assertEqual(trimmed[0]["role"], "system")
+        self.assertEqual(trimmed[1]["role"], "assistant")
+        self.assertLessEqual(len(trimmed), 5)
+        self.assertEqual(trimmed[-1]["role"], "tool")
+        self.assertIs(core.trim_tool_history(messages, 1), messages)
+
+    def test_run_subagent_tool_returns_valid_json(self):
+        async def fake_run(tasks, **kwargs):
+            self.assertEqual(tasks, ["task one"])
+            return [
+                {
+                    "name": "a",
+                    "task": "task one",
+                    "ok": True,
+                    "rounds": 2,
+                    "tools_used": ["evaluate"],
+                    "result": "x" * 9000,
+                }
+            ]
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        out = asyncio.run(
+            tools_module.execute_tool("run_subagent", {"task": "task one"}, 1)
+        )
+        data = json.loads(out)
+        self.assertTrue(data[0]["ok"])
+        self.assertEqual(len(data[0]["result"]), tools_module.SUBAGENT_RESULT_CHARS)
+
+    def test_run_subagent_tool_marks_truncated_report(self):
+        async def fake_run(tasks, **kwargs):
+            return [
+                {
+                    "name": f"s{index}",
+                    "task": "t",
+                    "ok": True,
+                    "rounds": 1,
+                    "tools_used": [],
+                    "result": "y" * 2000,
+                }
+                for index in range(10)
+            ]
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        out = asyncio.run(tools_module.execute_tool("run_subagent", {"task": "t"}, 1))
+        self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
+        self.assertTrue(out.endswith("…"))
+
+
+class StartupTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.saved_token = userbot.BOT_TOKEN
+        self.addCleanup(setattr, userbot, "BOT_TOKEN", self.saved_token)
+        self.saved_api = (userbot.API_ID, userbot.API_HASH)
+        self.addCleanup(setattr, userbot, "API_ID", self.saved_api[0])
+        self.addCleanup(setattr, userbot, "API_HASH", self.saved_api[1])
+        userbot.API_ID = 123
+        userbot.API_HASH = "hash"
+        userbot.BOT_TOKEN = NO_AUTH
+
+    def _install_proxies(self, values):
+        async def candidates():
+            return list(values)
+
+        for module in (userbot, bot):
+            self.enterContext(
+                mock.patch.object(module, "_proxy_candidates", candidates)
+            )
+
+    def _install_client(self, mod, factory, attr):
+        saved = getattr(mod, attr)
+        self.addCleanup(setattr, mod, attr, saved)
+        setattr(mod, attr, factory)
+
+    def test_userbot_requires_credentials(self):
+        userbot.API_ID = 0
+        self.assertIsNone(asyncio.run(userbot.start_userbot()))
+
+    def test_bot_requires_token(self):
+        self._install_proxies([])
+        self.assertIsNone(asyncio.run(bot.start_bot()))
+
+    def test_bot_requires_api_credentials(self):
+        userbot.API_ID = 0
+        self._install_proxies([])
+        self.assertIsNone(asyncio.run(bot.start_bot()))
+
+    def test_userbot_connects_through_second_proxy(self):
+        proxy_a = {"proxy_type": "socks5", "addr": "1.1.1.1", "port": 1080}
+        proxy_b = {"proxy_type": "socks5", "addr": "2.2.2.2", "port": 1080}
+        self._install_proxies([proxy_a, proxy_b])
+        client = _FakeTelegramClient(fail_times=1, username="meuser")
+        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, client, "client")
+        asyncio.run(userbot.start_userbot())
+        self.assertEqual(client.starts, 2)
+        self.assertEqual(client.proxies, [proxy_a, proxy_b])
+        self.assertEqual(client.disconnects, 1)
+        self.assertEqual(proxies.load_proxy_cache(), [])
+
+    def test_userbot_without_proxies_uses_direct_connection(self):
+        self._install_proxies([])
+        client = _FakeTelegramClient(username="meuser")
+        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, client, "client")
+        asyncio.run(userbot.start_userbot())
+        self.assertEqual(client.proxies, [])
+        self.assertEqual(client.starts, 1)
+
+    def test_userbot_stops_on_auth_key_error(self):
+        self._install_proxies([{"proxy_type": "socks5", "addr": "3.3.3.3", "port": 1}])
+        client = _FakeTelegramClient(
+            error=AuthKeyError(request=None, message="AUTH_KEY_UNREGISTERED")
+        )
+        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, client, "client")
+        asyncio.run(userbot.start_userbot())
+        self.assertEqual(client.starts, 1)
+        self.assertEqual(client.disconnects, 0)
+
+    def test_userbot_gives_up_after_all_proxies(self):
+        self._install_proxies(
+            [
+                {"proxy_type": "socks5", "addr": "4.4.4.4", "port": 1},
+                {"proxy_type": "http", "addr": "5.5.5.5", "port": 2},
+            ]
+        )
+        client = _FakeTelegramClient(fail_times=5)
+        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, client, "client")
+        asyncio.run(userbot.start_userbot())
+        self.assertEqual(client.starts, 2)
+        self.assertEqual(client.proxies[-1]["addr"], "5.5.5.5")
+
+    def test_userbot_survives_set_proxy_failure(self):
+        self._install_proxies([{"proxy_type": "socks5", "addr": "6.6.6.6", "port": 1}])
+        client = _FakeTelegramClient(username="meuser")
+        client.set_proxy = mock.Mock(side_effect=RuntimeError("still connected"))
+        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, client, "client")
+        asyncio.run(userbot.start_userbot())
+        self.assertEqual(client.starts, 0)
+
+    def test_bot_connects_and_sets_commands(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        self._install_proxies([None])
+        client = _FakeTelegramClient(username="danybot_bot", uid=77)
+        self._install_client(bot, lambda: client, "get_bot_client")
+        saved_username = bot.bot_username
+        saved_id = bot.bot_id
+        self.addCleanup(setattr, bot, "bot_username", saved_username)
+        self.addCleanup(setattr, bot, "bot_id", saved_id)
+        asyncio.run(bot.start_bot())
+        self.assertEqual(bot.bot_username, "danybot_bot")
+        self.assertEqual(bot.bot_id, 77)
+        self.assertEqual(len(client.commands), 1)
+        self.assertFalse(client.running)
+
+    def test_bot_survives_command_registration_error(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        self._install_proxies([None])
+        client = _FakeTelegramClient(
+            username="danybot_bot",
+            uid=5,
+            command_error=RPCError(None, "no commands", 400),
+        )
+        self._install_client(bot, lambda: client, "get_bot_client")
+        asyncio.run(bot.start_bot())
+        self.assertEqual(bot.bot_username, "danybot_bot")
+
+    def test_bot_stops_on_invalid_token(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        self._install_proxies([None])
+        client = _FakeTelegramClient(
+            error=AuthKeyError(request=None, message="AUTH_KEY_UNREGISTERED")
+        )
+        self._install_client(bot, lambda: client, "get_bot_client")
+        asyncio.run(bot.start_bot())
+        self.assertEqual(client.starts, 1)
+
+
+class MainRunTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        import main as main_module
+
+        self.main = main_module
+        runtime = dict(subagents._RUNTIME)
+        self.addCleanup(subagents._RUNTIME.update, runtime)
+        for mod, attr, value in (
+            (userbot, "ENABLE_USERBOT", True),
+            (userbot, "ENABLE_BOT", True),
+        ):
+            saved = getattr(mod, attr)
+            self.addCleanup(setattr, mod, attr, saved)
+            setattr(mod, attr, value)
+        for target, attr in (
+            (userbot, "load_state"),
+            (userbot, "load_history"),
+            (userbot, "refresh_models"),
+            (userbot, "disconnect_quietly"),
+            (userbot, "close_ai"),
+            (bot, "disconnect_quietly"),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+
+            async def noop(*_args, **_kwargs):
+                return None
+
+            setattr(target, attr, noop)
+        for target, attr in (
+            (userbot, "HISTORY_SAVER"),
+            (bot, "HISTORY_SAVER"),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, _FakeSaver())
+        saved_close = tools_module.close_httpx_client
+        self.addCleanup(setattr, tools_module, "close_httpx_client", saved_close)
+
+        async def close_client():
+            pass
+
+        tools_module.close_httpx_client = close_client
+
+    def test_run_reports_each_mode_once(self):
+        async def instant():
+            pass
+
+        async def slow():
+            await asyncio.sleep(0.05)
+
+        for target, attr, value in (
+            (userbot, "start_userbot", instant),
+            (bot, "start_bot", slow),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, value)
+        with self.assertLogs("danybot.main", level="WARNING") as logs:
+            asyncio.run(self.main.run())
+        stopped = [
+            rec for rec in logs.records if "Режим завершился" in rec.getMessage()
+        ]
+        self.assertEqual(len(stopped), 2)
+
+    def test_run_reports_mode_error_once(self):
+        async def broken():
+            raise RuntimeError("mode down")
+
+        async def slow():
+            await asyncio.sleep(0.05)
+
+        for target, attr, value in (
+            (userbot, "start_userbot", broken),
+            (bot, "start_bot", slow),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, value)
+        with self.assertLogs("danybot.main", level="WARNING") as logs:
+            asyncio.run(self.main.run())
+        errors = [rec for rec in logs.records if "ошибкой" in rec.getMessage()]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("mode down", errors[0].getMessage())
+
+    def test_run_stops_when_no_mode_enabled(self):
+        userbot.ENABLE_USERBOT = False
+        userbot.ENABLE_BOT = False
+        asyncio.run(self.main.run())
 
 
 def run_unit_tests():

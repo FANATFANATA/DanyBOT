@@ -22,6 +22,8 @@ async def _flush_savers():
         await bot.HISTORY_SAVER.flush()
     with contextlib.suppress(Exception):
         await tools.close_httpx_client()
+    with contextlib.suppress(Exception):
+        await userbot.close_ai()
 
 
 async def run():
@@ -67,20 +69,24 @@ async def run():
     all_tasks = [*tasks, stop_task]
 
     try:
-        while True:
-            done, _pending = await asyncio.wait(
-                all_tasks, return_when=asyncio.FIRST_COMPLETED
+        pending = set(all_tasks)
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
             )
             if stop_task in done:
                 break
-            mode_tasks = [t for t in tasks if t in done]
-            for task in mode_tasks:
+            for task in [t for t in done if t in tasks]:
+                tasks.remove(task)
+                if task.cancelled():
+                    logger.warning("Режим прерван: %s", task.get_name())
+                    continue
                 exc = task.exception()
                 if exc is not None:
                     logger.error("Режим завершился с ошибкой: %r", exc)
                 else:
                     logger.warning("Режим завершился: %s", task.get_name())
-            if all(t.done() for t in tasks):
+            if not tasks:
                 break
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
@@ -94,8 +100,6 @@ async def run():
             await userbot.disconnect_quietly()
         with contextlib.suppress(Exception):
             await bot.disconnect_quietly()
-        with contextlib.suppress(Exception):
-            await tools.close_httpx_client()
         await _flush_savers()
         logger.info("Завершено / Stopped.")
 

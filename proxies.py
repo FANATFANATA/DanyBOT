@@ -277,7 +277,10 @@ async def validate_many(items, limit=10, concurrency=20):
         for t in tasks:
             t.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            with contextlib.suppress(Exception, asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*tasks, return_exceptions=True), timeout=5
+                )
     return working
 
 

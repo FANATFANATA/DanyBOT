@@ -27,7 +27,6 @@ SAFE_FUNCS = {
     "round": round,
     "min": min,
     "max": max,
-    "pow": pow,
     "sqrt": math.sqrt,
     "floor": math.floor,
     "ceil": math.ceil,
@@ -44,6 +43,7 @@ SAFE_CONSTS = {
 }
 
 CODER_ROOT = Path(os.getenv("CODER_ROOT", "/root")).expanduser().resolve()
+MAX_READ_BYTES = 2_000_000
 MAX_WRITE_BYTES = 500_000
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
@@ -58,6 +58,7 @@ MAX_EVAL_EXPONENT = 1000
 MAX_EVAL_STEPS = 5000
 MAX_EVAL_BITS = 40000
 MAX_FETCH_REDIRECTS = 3
+MAX_FETCH_BYTES = 2_000_000
 FETCH_TIMEOUT = 25
 
 TOOL_ERRORS: tuple[type[BaseException], ...] = (
@@ -201,10 +202,26 @@ def _str_arg(arguments, key, default=""):
     return str(arguments.get(key, default)).strip()
 
 
+def _too_big(path):
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return ""
+    if size > MAX_READ_BYTES:
+        return f"Файл слишком большой: {size} байт, максимум {MAX_READ_BYTES}."
+    return ""
+
+
 def _opt_int_arg(arguments, key, lo, hi):
     if arguments.get(key) is None:
         return None
     return _int_arg(arguments, key, lo, lo, hi)
+
+
+MAX_RENDER_CHARS = 4000
+MAX_PREFIX_CHARS = 800
+REASONING_CHARS = 3000
+ANSWER_CHARS = 3000
 
 
 def render_response(
@@ -215,8 +232,13 @@ def render_response(
     show_reasoning=True,
     show_tools=True,
 ):
-    reasoning = _clip("".join(reasoning_parts), 3000) if show_reasoning else ""
-    answer = _clip(full_answer, 3000)
+    prefix = (
+        prefix if len(prefix) <= MAX_PREFIX_CHARS else prefix[:MAX_PREFIX_CHARS] + "…"
+    )
+    reasoning = (
+        _clip("".join(reasoning_parts), REASONING_CHARS) if show_reasoning else ""
+    )
+    answer = _clip(full_answer, ANSWER_CHARS)
     parts = []
     if reasoning:
         parts.append(f"reasoning:\n{reasoning}")
@@ -230,16 +252,16 @@ def render_response(
     if answer:
         parts.append(answer)
     text = prefix + "\n\n".join(parts)
-    if len(text) > 4000:
+    if len(text) > MAX_RENDER_CHARS:
         for drop in (0, 1):
             if drop < len(parts):
                 kept = [p for i, p in enumerate(parts) if i != drop]
                 candidate = prefix + "\n\n".join(kept)
-                if len(candidate) <= 4000:
+                if len(candidate) <= MAX_RENDER_CHARS:
                     text = candidate
                     break
-    if len(text) > 4000:
-        text = text[:3997] + "…"
+    if len(text) > MAX_RENDER_CHARS:
+        text = text[: MAX_RENDER_CHARS - 1] + "…"
     return text
 
 
@@ -780,16 +802,26 @@ async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str,
     err = _OutputSink(cap)
     drain = asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
     try:
-        await asyncio.wait_for(drain, timeout=timeout)
-    except asyncio.TimeoutError:
-        await _kill_process(proc)
-        return -1, out.text(), err.text(), f"Таймаут {timeout}s: команда прервана."
+        try:
+            await asyncio.wait_for(drain, timeout=timeout)
+        except asyncio.TimeoutError:
+            await _kill_process(proc)
+            return -1, out.text(), err.text(), f"Таймаут {timeout}s: команда прервана."
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        note = ""
+        if out.truncated or err.truncated:
+            note = "Вывод обрезан."
+        return _exit_code(proc), out.text(), err.text(), note
+    finally:
+        await _ensure_stopped(proc)
+
+
+async def _ensure_stopped(proc) -> None:
+    if proc.returncode is not None:
+        return
     with contextlib.suppress(Exception):
-        await asyncio.wait_for(proc.wait(), timeout=5)
-    note = ""
-    if out.truncated or err.truncated:
-        note = "Вывод обрезан."
-    return _exit_code(proc), out.text(), err.text(), note
+        await asyncio.wait_for(_kill_process(proc), timeout=5)
 
 
 def _format_process_result(rc: int, out: str, err: str) -> str:
@@ -920,6 +952,9 @@ def _parse_ddg(text, limit):
     return results
 
 
+SEARCH_ENGINES = ((BRAVE_SEARCH_URL, _parse_brave), (DDG_SEARCH_URL, _parse_ddg))
+
+
 async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False):
     query = _str_arg(arguments, "query")
     if not query:
@@ -927,7 +962,7 @@ async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False
     limit = _int_arg(arguments, "limit", 5, 1, 10)
     hc = _get_httpx_client()
     errors = []
-    for url, parser in ((BRAVE_SEARCH_URL, _parse_brave), (DDG_SEARCH_URL, _parse_ddg)):
+    for url, parser in SEARCH_ENGINES:
         try:
             resp = await hc.get(url, params={"q": query}, timeout=20)
             resp.raise_for_status()
@@ -939,7 +974,9 @@ async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False
             return "\n\n".join(results)
         errors.append(f"{url}: пустая выдача")
     logger.warning("web_search без результатов: %s", "; ".join(errors))
-    if len(errors) == 2 and all("пустая выдача" not in e for e in errors):
+    if len(errors) == len(SEARCH_ENGINES) and all(
+        "пустая выдача" not in e for e in errors
+    ):
         return f"Ошибка поиска: {errors[0]}"
     return "Ничего не найдено."
 
@@ -996,22 +1033,20 @@ async def _tool_fetch_url(arguments, chat_id, client, stats, unrestricted=False)
                 if guard:
                     return guard
                 try:
-                    resp = await hc.get(current, follow_redirects=False, timeout=20)
-                    resp.raise_for_status()
+                    status, location, raw, truncated = await _fetch_once(hc, current)
                 except (httpx.HTTPError, OSError, ValueError) as exc:
                     return f"Ошибка загрузки: {exc}"
-                location = (getattr(resp, "headers", {}) or {}).get("location", "")
-                if 300 <= getattr(resp, "status_code", 200) < 400 and location:
-                    current = urllib.parse.urljoin(current, str(location))
+                if 300 <= status < 400 and location:
+                    current = urllib.parse.urljoin(current, location)
                     continue
-                raw = resp.text
                 break
             else:
                 return "Слишком много перенаправлений."
     except TimeoutError:
         return f"Таймаут {FETCH_TIMEOUT}s: загрузка прервана."
+    page = raw.decode("utf-8", errors="replace")
     cleaned = re.sub(
-        r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE
+        r"<script[^>]*>.*?</script>", " ", page, flags=re.DOTALL | re.IGNORECASE
     )
     cleaned = re.sub(
         r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE
@@ -1019,7 +1054,37 @@ async def _tool_fetch_url(arguments, chat_id, client, stats, unrestricted=False)
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = html.unescape(cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    return cleaned[:max_chars]
+    text = cleaned[:max_chars]
+    if truncated:
+        text += "\n… (загрузка обрезана)"
+    return text
+
+
+async def _read_capped(resp, cap: int) -> tuple[bytes, bool]:
+    buf = bytearray()
+    truncated = False
+    async for chunk in resp.aiter_bytes():
+        room = cap - len(buf)
+        if room <= 0:
+            truncated = True
+            break
+        if len(chunk) >= room:
+            buf.extend(chunk[:room])
+            truncated = True
+            break
+        buf.extend(chunk)
+    return bytes(buf), truncated
+
+
+async def _fetch_once(hc, url: str) -> tuple[int, str, bytes, bool]:
+    async with hc.stream("GET", url, follow_redirects=False, timeout=20) as resp:
+        resp.raise_for_status()
+        status = int(getattr(resp, "status_code", 200) or 200)
+        location = (getattr(resp, "headers", {}) or {}).get("location", "") or ""
+        if 300 <= status < 400 and location:
+            return status, str(location), b"", False
+        body, truncated = await _read_capped(resp, MAX_FETCH_BYTES)
+        return status, str(location), body, truncated
 
 
 async def _tool_get_time(arguments, chat_id, client, stats, unrestricted=False):
@@ -1052,6 +1117,28 @@ async def _tool_get_bot_stats(arguments, chat_id, client, stats, unrestricted=Fa
     return json.dumps(data, ensure_ascii=False)
 
 
+SUBAGENT_RESULT_CHARS = 1500
+SUBAGENT_REPORT_CHARS = 8000
+
+
+def _subagent_report(results) -> str:
+    payload = [
+        {
+            "name": item.get("name", "universal"),
+            "task": item.get("task", ""),
+            "ok": bool(item.get("ok")),
+            "rounds": item.get("rounds", 0),
+            "tools_used": item.get("tools_used", []),
+            "result": str(item.get("result", ""))[:SUBAGENT_RESULT_CHARS],
+        }
+        for item in results
+    ]
+    text = json.dumps(payload, ensure_ascii=False)
+    if len(text) <= SUBAGENT_REPORT_CHARS:
+        return text
+    return text[: SUBAGENT_REPORT_CHARS - 1] + "…"
+
+
 async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=False):
     import subagents
 
@@ -1075,7 +1162,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
         verify=not unrestricted,
         stats=stats,
     )
-    return json.dumps(results, ensure_ascii=False)[:8000]
+    return _subagent_report(results)
 
 
 async def _tool_read_file(arguments, chat_id, client, stats, unrestricted=False):
@@ -1086,6 +1173,9 @@ async def _tool_read_file(arguments, chat_id, client, stats, unrestricted=False)
         return f"Файл не найден: {path}"
     if path.is_dir():
         return f"Это каталог: {path}. Используй list_dir."
+    too_big = _too_big(path)
+    if too_big:
+        return too_big
     offset = _int_arg(arguments, "offset", 1, 1, 10**9)
     limit = _int_arg(arguments, "limit", 400, 1, 5000)
     try:
@@ -1108,8 +1198,9 @@ async def _tool_write_file(arguments, chat_id, client, stats, unrestricted=False
     if err or path is None:
         return err
     content = str(arguments.get("content", ""))
-    if len(content.encode("utf-8")) > MAX_WRITE_BYTES:
-        return f"Слишком большой объём: {len(content.encode('utf-8'))} байт"
+    size = len(content.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        return f"Слишком большой объём: {size} байт"
     if path.is_dir():
         return f"Это каталог: {path}"
     existed = path.exists()
@@ -1128,6 +1219,9 @@ async def _tool_edit_file(arguments, chat_id, client, stats, unrestricted=False)
         return err
     if not path.is_file():
         return f"Файл не найден: {path}"
+    too_big = _too_big(path)
+    if too_big:
+        return too_big
     old = str(arguments.get("old_string", ""))
     new = str(arguments.get("new_string", ""))
     if not old:
@@ -1241,6 +1335,7 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
     if err:
         return err
     script_path = None
+    proc = None
     try:
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False, encoding="utf-8"
@@ -1255,10 +1350,11 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
-        if script_path is not None:
+        return f"Ошибка запуска: {exc}"
+    finally:
+        if proc is None and script_path is not None:
             with contextlib.suppress(OSError):
                 script_path.unlink()
-        return f"Ошибка запуска: {exc}"
     try:
         rc, out, err_out, note = await _collect_process(
             proc, timeout, MAX_PROCESS_BYTES

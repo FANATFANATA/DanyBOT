@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Any, cast
 
+import core
+
 logger = logging.getLogger("danybot.subagents")
 
 SUBAGENT_SYSTEM = (
@@ -14,7 +16,10 @@ SUBAGENT_SYSTEM = (
 
 MAX_TASKS = 16
 MAX_TOOL_RESULT = 6000
+MAX_CONTEXT_MESSAGES = 40
 REQUEST_TIMEOUT = 120.0
+
+TRUNCATED_MARK = "\n… (вывод обрезан)"
 
 _RUNTIME: dict[str, Any] = {
     "ai": None,
@@ -117,7 +122,10 @@ async def _call_tool(
         )
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         output = f"Ошибка инструмента {name}: {exc}"
-    return name, str(output)[:MAX_TOOL_RESULT], True
+    text = str(output)
+    if len(text) > MAX_TOOL_RESULT:
+        text = text[:MAX_TOOL_RESULT] + TRUNCATED_MARK
+    return name, text, True
 
 
 def _assistant_message(content, tool_calls):
@@ -184,6 +192,10 @@ async def run_subagent(
     while rounds_limit is None or round_index < rounds_limit:
         round_index += 1
         result["rounds"] = round_index
+        if round_index > 1:
+            messages = core.trim_tool_history(
+                messages, MAX_CONTEXT_MESSAGES, head_size=2
+            )
         try:
             raw = await asyncio.wait_for(
                 ai.chat.completions.create(

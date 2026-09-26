@@ -34,7 +34,7 @@ tools_hidden: set[int] = set()
 
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
-recent_reply_ids: set[int] = set()
+recent_reply_ids: set[tuple[int, int]] = set()
 seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
 
@@ -176,7 +176,7 @@ async def handler(event: Any):
     sender_id = event.sender_id
     is_self = bool(message.out)
 
-    if msg_id in recent_reply_ids:
+    if (chat_id, msg_id) in recent_reply_ids:
         return
 
     is_private = event.is_private
@@ -367,6 +367,7 @@ async def handler(event: Any):
             userbot.GROUP_HISTORY_LIMIT,
             ctx_lock,
         )
+        HISTORY_SAVER.mark_dirty()
         hist, messages = await core.prepare_messages(
             STORE,
             chat_id,
@@ -385,36 +386,32 @@ async def handler(event: Any):
     try:
         full_answer = await core.stream_answer(
             STORE,
-            event,
-            chat_id,
-            is_self,
-            messages,
-            model,
-            prefix,
-            self_edit_id,
-            core.make_render(
+            event=event,
+            chat_id=chat_id,
+            is_self=is_self,
+            messages=messages,
+            model=model,
+            prefix=prefix,
+            self_edit_id=self_edit_id,
+            render_fn=core.make_render(
                 userbot.render_response, reasoning_hidden, tools_hidden, chat_id
             ),
-            edit_text,
-            safe_reply,
-            cast(Any, get_bot_client().action(chat_id, "typing")),
-            userbot.stream_with_tools,
-            get_bot_client(),
-            tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS,
-            userbot.EDIT_INTERVAL,
-            sender_id,
-            logger,
-            _bot_stats,
+            edit_fn=edit_text,
+            reply_fn=safe_reply,
+            action=cast(Any, get_bot_client().action(chat_id, "typing")),
+            stream_fn=userbot.stream_with_tools,
+            tool_client=get_bot_client(),
+            tools=tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS,
+            edit_interval=userbot.EDIT_INTERVAL,
+            owner_id=sender_id,
+            logger=logger,
+            stats=_bot_stats,
         )
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
         HISTORY_SAVER.mark_dirty()
-
-        if len(recent_reply_ids) > 5000:
-            recent_reply_ids.clear()
-
-    except (userbot.OpenAIError, RPCError, OSError, ValueError, TypeError):
+    except userbot.HANDLER_ERRORS:
         logger.exception("Бот: ошибка генерации ответа")
         await safe_reply(
             event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
@@ -612,8 +609,9 @@ async def start_bot():
     for idx, proxy in enumerate(candidates):
         if proxy:
             logger.info("Бот: пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-            cli.set_proxy(proxy)
         try:
+            if proxy:
+                cli.set_proxy(proxy)
             start_coro = cast(Any, cli.start(bot_token=userbot.BOT_TOKEN))
             await asyncio.wait_for(start_coro, timeout=25)
             me = await cli.get_me()

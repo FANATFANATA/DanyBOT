@@ -98,6 +98,7 @@ LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
 MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 0)
+TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 60))
 REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
@@ -128,7 +129,7 @@ ENABLE_BOT = _env_bool("ENABLE_BOT", False)
 BOT_TOKEN = _env_str("BOT_TOKEN", "")
 
 
-def _env_pos_int(name):
+def _env_pos_int(name: str) -> int | None:
     raw = _env_str(name, "")
     try:
         value = int(raw)
@@ -143,7 +144,7 @@ SUBAGENT_MAX_ROUNDS = _env_pos_int("SUBAGENT_MAX_ROUNDS")
 SUBAGENT_CONCURRENCY = _env_pos_int("SUBAGENT_CONCURRENCY")
 
 
-def _env_id_set(name):
+def _env_id_set(name: str) -> set[int]:
     raw = _env_str(name, "")
     ids = set()
     for part in raw.replace(";", ",").split(","):
@@ -160,6 +161,12 @@ def _env_id_set(name):
 OWNER_IDS = _env_id_set("OWNER_IDS")
 
 REPLY_ATTEMPTS = 3
+
+HANDLER_ERRORS: tuple[type[BaseException], ...] = (
+    *core.STREAM_ERRORS,
+    RPCError,
+    OpenAIError,
+)
 
 SANITIZED_TOOLS = ("run_shell", "execute_script")
 
@@ -188,7 +195,7 @@ tools_hidden: set[int] = set()
 
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
-recent_reply_ids: set[int] = set()
+recent_reply_ids: set[tuple[int, int]] = set()
 seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
 START_TIME = time.monotonic()
@@ -570,6 +577,7 @@ async def stream_with_tools(
                 if all_parts
                 else "Достигнут лимит циклов инструментов."
             )
+        working = core.trim_tool_history(working, TOOL_CONTEXT_MESSAGES)
         tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
         raw_stream = await asyncio.wait_for(
@@ -795,7 +803,7 @@ async def handler(event: Any):
     sender_id = event.sender_id
     is_self = bool(message.out)
 
-    if msg_id in recent_reply_ids:
+    if (chat_id, msg_id) in recent_reply_ids:
         return
 
     is_private = event.is_private
@@ -922,6 +930,7 @@ async def handler(event: Any):
         await core.append_group_history(
             chat_id, user_content, chat_history, GROUP_HISTORY_LIMIT, ctx_lock
         )
+        HISTORY_SAVER.mark_dirty()
     async with ctx_lock:
         hist = chat_history.setdefault(chat_id, deque(maxlen=limit))
     live = await fetch_live_messages(chat_id, LIVE_HISTORY_LIMIT)
@@ -937,34 +946,32 @@ async def handler(event: Any):
     try:
         full_answer = await core.stream_answer(
             STORE,
-            event,
-            chat_id,
-            is_self,
-            messages,
-            model,
-            prefix,
-            self_edit_id,
-            core.make_render(render_response, reasoning_hidden, tools_hidden, chat_id),
-            edit_text,
-            safe_reply,
-            cast(Any, get_client().action(chat_id, "typing")),
-            stream_with_tools,
-            None,
-            TOOLS,
-            EDIT_INTERVAL,
-            sender_id,
-            logger,
-            _bot_stats,
+            event=event,
+            chat_id=chat_id,
+            is_self=is_self,
+            messages=messages,
+            model=model,
+            prefix=prefix,
+            self_edit_id=self_edit_id,
+            render_fn=core.make_render(
+                render_response, reasoning_hidden, tools_hidden, chat_id
+            ),
+            edit_fn=edit_text,
+            reply_fn=safe_reply,
+            action=cast(Any, get_client().action(chat_id, "typing")),
+            stream_fn=stream_with_tools,
+            tool_client=None,
+            tools=TOOLS,
+            edit_interval=EDIT_INTERVAL,
+            owner_id=sender_id,
+            logger=logger,
+            stats=_bot_stats,
         )
 
         async with ctx_lock:
             hist.append({"role": "assistant", "content": full_answer})
         HISTORY_SAVER.mark_dirty()
-
-        if len(recent_reply_ids) > 5000:
-            recent_reply_ids.clear()
-
-    except (OpenAIError, RPCError, OSError, ValueError, TypeError):
+    except HANDLER_ERRORS:
         logger.exception("Ошибка генерации ответа")
         await safe_reply(
             event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
@@ -978,6 +985,11 @@ async def disconnect_quietly(timeout=10):
         return
     with contextlib.suppress(Exception):
         await asyncio.wait_for(cast(Any, client.disconnect()), timeout=timeout)
+
+
+async def close_ai():
+    with contextlib.suppress(Exception):
+        await cast(Any, ai.close())
 
 
 async def _proxy_candidates():
@@ -1002,8 +1014,9 @@ async def start_userbot():
     for idx, proxy in enumerate(candidates):
         if proxy:
             logger.info("Пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-            cli.set_proxy(proxy)
         try:
+            if proxy:
+                cli.set_proxy(proxy)
             start_coro = cast(Any, cli.start())
             await asyncio.wait_for(start_coro, timeout=25)
             me = await cli.get_me()

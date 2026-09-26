@@ -4,6 +4,8 @@ import json
 import os
 import re
 import stat
+import tempfile
+import threading
 import time
 from collections import deque
 from collections.abc import Callable
@@ -13,6 +15,14 @@ from dotenv import load_dotenv
 from telethon.errors import FloodWaitError, RPCError
 
 load_dotenv()
+
+TRIGGER_ALIASES = (
+    ".db",
+    ".ai",
+)
+
+AUTO_ON_WORDS = ("on", "1", "true", "yes")
+AUTO_OFF_WORDS = ("off", "0", "false", "no")
 
 
 def _env_str(name: str, default: str) -> str:
@@ -40,16 +50,7 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = _env_str(name, "")
     if not raw:
         return default
-    return raw.lower() not in ("0", "false", "no")
-
-
-TRIGGER_ALIASES = (
-    ".db",
-    ".ai",
-)
-
-AUTO_ON_WORDS = ("on", "1", "true", "yes")
-AUTO_OFF_WORDS = ("off", "0", "false", "no")
+    return raw.lower() not in AUTO_OFF_WORDS
 
 
 def _bool_command(name, arg):
@@ -245,18 +246,55 @@ def load_state_file(path):
         return None
 
 
+_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+_REPLACE_ATTEMPTS = 5
+_REPLACE_DELAY = 0.05
+
+
+def _write_lock(path) -> threading.Lock:
+    key = str(path)
+    with _WRITE_LOCKS_GUARD:
+        lock = _WRITE_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _WRITE_LOCKS[key] = lock
+        return lock
+
+
+def _replace_with_retry(tmp_name, path) -> None:
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(tmp_name, path)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_DELAY)
+
+
 def _write_text_atomic(path, text) -> bool:
-    tmp = path.with_name(f"{path.name}.tmp")
+    tmp_name = None
     try:
-        tmp.write_text(text, encoding="utf-8")
-        if path.is_file():
-            os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
-        os.replace(tmp, path)
+        with _write_lock(path):
+            handle, tmp_name = tempfile.mkstemp(
+                dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
+            )
+            os.close(handle)
+            with open(tmp_name, "w", encoding="utf-8") as stream:
+                stream.write(text)
+            if path.is_file():
+                os.chmod(tmp_name, stat.S_IMODE(path.stat().st_mode))
+            _replace_with_retry(tmp_name, path)
+            tmp_name = None
         return True
     except (OSError, TypeError, ValueError):
-        with contextlib.suppress(OSError):
-            tmp.unlink()
         return False
+    finally:
+        if tmp_name is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
 
 
 def save_state_file(path, state):
@@ -364,22 +402,34 @@ class AsyncSaver:
             except asyncio.CancelledError:
                 return
             self._dirty = False
-            if not await self._write():
+            try:
+                written = await self._write()
+            except asyncio.CancelledError:
+                self._dirty = True
+                raise
+            if not written:
                 self._dirty = True
                 return
             if not self._dirty:
                 return
 
+    async def _write_dirty(self) -> None:
+        if not self._dirty:
+            return
+        self._dirty = False
+        if not await self._write():
+            self._dirty = True
+
     async def flush(self):
         task = self._task
         if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        if self._dirty:
-            self._dirty = False
-            if not await self._write():
-                self._dirty = True
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), timeout=self._delay + 10)
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        await self._write_dirty()
 
 
 class ModeStore:
@@ -455,7 +505,7 @@ async def safe_reply(event, text, attempts, recent_ids):
         except (RPCError, OSError, ValueError, TypeError):
             return None
         if sent:
-            recent_ids.add(sent.id)
+            recent_ids.add((getattr(event, "chat_id", None), sent.id))
             if len(recent_ids) > 5000:
                 recent_ids.clear()
         return sent
@@ -654,8 +704,21 @@ async def prepare_messages(store, chat_id, dm_limit, group_limit, system_fn):
         return hist, [{"role": "system", "content": sysp}, *list(hist)]
 
 
+def trim_tool_history(messages, max_messages, head_size=1):
+    if max_messages < 2 or len(messages) <= max_messages:
+        return messages
+    head = messages[:head_size]
+    tail = messages[len(messages) - (max_messages - head_size) :]
+    while tail and tail[0].get("role") == "tool":
+        tail = tail[1:]
+    if not tail or tail[0].get("role") != "assistant":
+        return messages
+    return [*head, *tail]
+
+
 async def stream_answer(
     store,
+    *,
     event,
     chat_id,
     is_self,
@@ -668,9 +731,9 @@ async def stream_answer(
     reply_fn,
     action,
     stream_fn,
-    tool_client,
-    tools,
-    edit_interval,
+    tool_client=None,
+    tools=None,
+    edit_interval=1.0,
     owner_id=None,
     logger=None,
     stats=None,
@@ -695,7 +758,7 @@ async def stream_answer(
                     if placeholder:
                         placeholder_id = placeholder.id
                         state["edit_id"] = placeholder.id
-                        store.recent_reply_ids.add(placeholder.id)
+                        store.recent_reply_ids.add((chat_id, placeholder.id))
                 result = await stream_fn(
                     messages,
                     model,
@@ -713,16 +776,7 @@ async def stream_answer(
         except caught as exc:
             error = exc
         full_answer = result or "".join(state["answer_parts"])
-        final_text = render()
-        if not final_text.strip() or final_text.strip() == "…":
-            fallback = full_answer.strip()
-            if not fallback:
-                fallback = (
-                    "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-                    if error is not None
-                    else "(пустой ответ / empty answer)"
-                )
-            final_text = fallback
+        final_text = _final_text(state, render, full_answer, error)
         if state["edit_id"] is not None:
             edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
             if not edited and placeholder_id is not None:
@@ -735,7 +789,21 @@ async def stream_answer(
             await reply_fn(event, final_text)
     finally:
         if placeholder_id is not None:
-            store.recent_reply_ids.discard(placeholder_id)
+            store.recent_reply_ids.discard((chat_id, placeholder_id))
     if error is not None:
         raise error
     return full_answer
+
+
+def _final_text(state, render, full_answer, error):
+    final_text = render()
+    stripped = final_text.strip()
+    if stripped and stripped != "…":
+        return final_text
+    if full_answer.strip():
+        return full_answer
+    if state["reasoning_parts"] or state["tool_parts"]:
+        return final_text
+    if error is not None:
+        return "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+    return "(пустой ответ / empty answer)"
