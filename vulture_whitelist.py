@@ -1,7 +1,5 @@
 handler
 get_proxy
-get_history_for
-auth_key
 ENABLE_BOT
 ENABLE_USERBOT
 refresh_models
@@ -25,12 +23,6 @@ CODER_ROOT
 CODER_TOOLS
 CODER_TOOL_NAMES
 SUBAGENT_EXCLUDED_TOOLS
-CREATOR_INFO
-CREATOR_NAME
-CREATOR_USERNAME
-CREATOR_ID
-CREATOR_PHONE
-CREATOR_EXTRA
 CODER_SYSTEM_PROMPT
 coder_chats
 is_coder
@@ -47,8 +39,6 @@ CONTRACT_DIR
 CONTRACT_FILES
 CONTRACT_ALIASES
 CONTRACT_DIR_CANDIDATES
-CREATOR_UNSET_TEXT
-CREATOR_CONFIGURED
 _contract_cache
 _contract_signature
 _contract_file
@@ -70,3 +60,4 @@ forget
 list_memories
 dumps
 row_factory
+auth_key

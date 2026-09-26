@@ -24,6 +24,7 @@ handle_bot_commands = core.handle_bot_commands
 
 STATE_FILE = Path(__file__).parent / "state_bot.json"
 HISTORY_FILE = Path(__file__).parent / "history_bot.json"
+CALLBACK_MAX_BYTES = 64
 
 model_overrides: dict[int, str] = {}
 coder_chats: set[int] = set()
@@ -84,6 +85,15 @@ BOT_HELP_TEXT = (
 
 
 bot_client = None
+START_TIME = time.monotonic()
+
+
+def _bot_stats(chat_id):
+    return {
+        "uptime_seconds": round(time.monotonic() - START_TIME, 1),
+        "context_messages": len(chat_history.get(chat_id, deque())),
+        "model": model_overrides.get(chat_id, userbot.DANYAPI_MODEL),
+    }
 
 
 def get_bot_client():
@@ -130,6 +140,14 @@ def coder_active_for(sender_id, chat_id):
     return chat_id in coder_chats and sender_id in userbot.OWNER_IDS
 
 
+async def _toggle(chat_id, target) -> None:
+    async with ctx_lock:
+        if chat_id in target:
+            target.discard(chat_id)
+        else:
+            target.add(chat_id)
+
+
 async def safe_reply(event, text):
     return await core.safe_reply(event, text, userbot.REPLY_ATTEMPTS, recent_reply_ids)
 
@@ -157,7 +175,6 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    userbot.register_sender(sender_id, chat_id)
     triggered = _db_triggered(text)
     mentioned = _is_mentioned(text)
     now = time.monotonic()
@@ -284,18 +301,13 @@ async def handler(event: Any):
 
     coder_active = coder_active_for(sender_id, chat_id)
 
-    if (
+    if not (
         triggered
         or coder_active
         or mentioned
         or reply_to_bot
         or (is_private and not is_self)
     ):
-        effective_trigger = True
-    else:
-        effective_trigger = False
-
-    if not effective_trigger:
         return
 
     if (
@@ -387,6 +399,7 @@ async def handler(event: Any):
             userbot.EDIT_INTERVAL,
             sender_id,
             logger,
+            _bot_stats,
         )
 
         async with ctx_lock:
@@ -404,21 +417,24 @@ async def handler(event: Any):
 
 
 def _settings_rows(chat_id):
-    reasoning_state = "видно"
-    if chat_id in reasoning_hidden:
-        reasoning_state = "скрыто"
-    tools_state = "видно"
-    if chat_id in tools_hidden:
-        tools_state = "скрыто"
-    coder_state = "выкл"
-    if is_coder(chat_id):
-        coder_state = "вкл"
-    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     rows = [
-        [Button.inline(f"Модель: {current}", b"settings:model")],
-        [Button.inline(f"Рассуждения: {reasoning_state}", b"settings:reasoning")],
-        [Button.inline(f"Инструменты: {tools_state}", b"settings:tools")],
-        [Button.inline(f"Кодер-режим: {coder_state}", b"settings:coder")],
+        [Button.inline(f"Модель: {_current_model_label(chat_id)}", b"settings:model")],
+        [
+            Button.inline(
+                f"Рассуждения: {_state_label(chat_id, reasoning_hidden)}",
+                b"settings:reasoning",
+            )
+        ],
+        [
+            Button.inline(
+                f"Инструменты: {_state_label(chat_id, tools_hidden)}", b"settings:tools"
+            )
+        ],
+        [
+            Button.inline(
+                f"Кодер-режим: {_state_label(chat_id, coder_chats)}", b"settings:coder"
+            )
+        ],
         [Button.inline("Очистить контекст", b"settings:clear")],
         [Button.inline("Системный промпт", b"settings:prompt")],
     ]
@@ -430,21 +446,57 @@ def _model_rows(chat_id):
     rows = []
     for name in userbot.MODELS[:20]:
         marker = " *" if name == current else ""
-        rows.append(
-            [Button.inline(f"{name}{marker}", f"settings:pick:{name}".encode())]
-        )
+        rows.append([Button.inline(f"{name}{marker}", _pick_data(name))])
     rows.append([Button.inline("Назад", b"settings:main")])
     return rows
 
 
+def _pick_data(name: str) -> bytes:
+    return f"settings:pick:{name}".encode()[:CALLBACK_MAX_BYTES]
+
+
+def _resolve_picked_model(arg: str) -> str:
+    for name in userbot.MODELS:
+        if name == arg or name.startswith(arg):
+            return name
+    return arg
+
+
+def _current_model_label(chat_id):
+    return model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+
+
+def _state_label(chat_id, hidden) -> str:
+    return "скрыто" if chat_id in hidden else "видно"
+
+
 def _settings_text(chat_id):
-    current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
+    limit = userbot.DM_HISTORY_LIMIT if chat_id > 0 else userbot.GROUP_HISTORY_LIMIT
     ctx_len = len(chat_history.get(chat_id, deque()))
     return (
         "Настройки / Settings\n"
-        f"Модель / Model: {current}\n"
-        f"Контекст / Context: {ctx_len}"
+        f"Модель / Model: {_current_model_label(chat_id)}\n"
+        f"Рассуждения / Reasoning: {_state_label(chat_id, reasoning_hidden)}\n"
+        f"Инструменты / Tools: {_state_label(chat_id, tools_hidden)}\n"
+        f"Кодер-режим / Coder: "
+        f"{'вкл' if is_coder(chat_id) else 'выкл'}\n"
+        f"Контекст / Context: {ctx_len}/{limit}"
     )
+
+
+async def _answer(event, text=None, alert=False) -> None:
+    with contextlib.suppress(RPCError, OSError, ValueError, TypeError, OverflowError):
+        await event.answer(text, alert=alert)
+
+
+async def _edit_settings(event, chat_id, text=None, buttons=None) -> None:
+    try:
+        await event.edit(
+            text if text is not None else _settings_text(chat_id),
+            buttons=buttons if buttons is not None else _settings_rows(chat_id),
+        )
+    except (RPCError, OSError, ValueError, TypeError, OverflowError) as exc:
+        logger.debug("Не удалось обновить меню настроек: %r", exc)
 
 
 async def callback_handler(event: Any):
@@ -452,32 +504,22 @@ async def callback_handler(event: Any):
     if chat_id is None:
         return
     if event.sender_id not in userbot.OWNER_IDS:
-        await event.answer("Настройки доступны только владельцу.", alert=True)
+        await _answer(event, "Настройки доступны только владельцу.", alert=True)
         return
-    raw = (event.data or b"").decode("utf-8", errors="replace")
-    parts = raw.split(":", 2)
+    data = event.data
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", errors="replace")
+    parts = str(data or "").split(":", 2)
     action = parts[1].strip() if len(parts) > 1 else ""
     arg = parts[2].strip() if len(parts) > 2 else ""
     if action == "reasoning":
-        async with ctx_lock:
-            if chat_id in reasoning_hidden:
-                reasoning_hidden.discard(chat_id)
-            else:
-                reasoning_hidden.add(chat_id)
+        await _toggle(chat_id, reasoning_hidden)
         save_state()
     elif action == "tools":
-        async with ctx_lock:
-            if chat_id in tools_hidden:
-                tools_hidden.discard(chat_id)
-            else:
-                tools_hidden.add(chat_id)
+        await _toggle(chat_id, tools_hidden)
         save_state()
     elif action == "coder":
-        async with ctx_lock:
-            if chat_id in coder_chats:
-                coder_chats.discard(chat_id)
-            else:
-                coder_chats.add(chat_id)
+        await _toggle(chat_id, coder_chats)
         save_state()
     elif action == "clear":
         limit = userbot.GROUP_HISTORY_LIMIT
@@ -488,21 +530,18 @@ async def callback_handler(event: Any):
         save_history()
     elif action == "pick" and arg:
         async with ctx_lock:
-            model_overrides[chat_id] = arg
+            model_overrides[chat_id] = _resolve_picked_model(arg)
         save_state()
-        await event.answer("Модель обновлена.")
-        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
-            await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+        await _answer(event, "Модель обновлена.")
+        await _edit_settings(event, chat_id)
         return
     elif action == "model":
-        await event.answer("Выбор модели.")
-        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
-            await event.edit("Модель / Model:", buttons=_model_rows(chat_id))
+        await _answer(event, "Выбор модели.")
+        await _edit_settings(event, chat_id, "Модель / Model:", _model_rows(chat_id))
         return
     elif action == "main":
-        await event.answer()
-        with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
-            await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+        await _answer(event)
+        await _edit_settings(event, chat_id)
         return
     elif action == "prompt":
         mode = "coder" if coder_active_for(event.sender_id, chat_id) else "bot"
@@ -513,11 +552,10 @@ async def callback_handler(event: Any):
             ),
         )
     else:
-        await event.answer("Неизвестное действие.", alert=True)
+        await _answer(event, "Неизвестное действие.", alert=True)
         return
-    await event.answer("Готово.")
-    with contextlib.suppress(RPCError, OSError, ValueError, TypeError):
-        await event.edit(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+    await _answer(event, "Готово.")
+    await _edit_settings(event, chat_id)
 
 
 async def start_bot():

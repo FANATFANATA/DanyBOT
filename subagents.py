@@ -81,8 +81,7 @@ def _select_tools(tool_names):
     if not tool_names:
         return available
     wanted = {str(name).strip() for name in tool_names if str(name).strip()}
-    selected = [item for item in available if item["function"]["name"] in wanted]
-    return selected or available
+    return [item for item in available if item["function"]["name"] in wanted]
 
 
 def _loads(raw):

@@ -123,7 +123,7 @@ _SUB_LOOKUP = {
     alias: name for name, aliases in SUB_ALIASES.items() for alias in aliases
 }
 
-_ALL_ALIASES = tuple(sorted(dict.fromkeys(TRIGGER_ALIASES), key=len, reverse=True))
+_ALL_ALIASES = tuple(sorted(TRIGGER_ALIASES, key=len, reverse=True))
 
 
 def _strip_alias_prefix(low):
@@ -137,12 +137,11 @@ def _strip_alias_prefix(low):
 
 
 def handle_commands(text) -> tuple[str, Any] | None:
-    low = text.strip()
-    lowlower = low.lower()
+    low = text.strip().lower()
     if not low.startswith("."):
         return None
 
-    rest, alias = _strip_alias_prefix(lowlower)
+    rest, alias = _strip_alias_prefix(low)
     if alias is None or not rest:
         return None
 
@@ -243,6 +242,18 @@ def load_state_file(path):
         return None
 
 
+def _write_text_atomic(path, text) -> bool:
+    tmp = path.with_name(f"{path.name}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+        return True
+    except (OSError, TypeError, ValueError):
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        return False
+
+
 def save_state_file(path, state):
     data = {
         "model_overrides": {str(k): v for k, v in state["model_overrides"].items()},
@@ -250,14 +261,9 @@ def save_state_file(path, state):
         "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
         "tools_hidden": sorted(state.get("tools_hidden", [])),
     }
-    try:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        return True
-    except (OSError, TypeError):
-        return False
+    return _write_text_atomic(
+        path, json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 def load_history_file(path, dm_limit, group_limit):
@@ -280,14 +286,9 @@ def load_history_file(path, dm_limit, group_limit):
 
 def save_history_file(path, history):
     data = {str(k): list(v) for k, v in history.items()}
-    try:
-        path.write_text(
-            json.dumps(data, ensure_ascii=False, separators=(",", ":")),
-            encoding="utf-8",
-        )
-        return True
-    except (OSError, TypeError):
-        return False
+    return _write_text_atomic(
+        path, json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    )
 
 
 _MODE_KEYS = (
@@ -300,6 +301,26 @@ _MODE_KEYS = (
     "recent_reply_ids",
     "last_chat_activity",
     "seen_msg_keys",
+)
+
+SAVER_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    TypeError,
+    RuntimeError,
+    KeyError,
+)
+
+STREAM_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    AttributeError,
+    RuntimeError,
+    RecursionError,
+    MemoryError,
 )
 
 
@@ -319,6 +340,15 @@ class AsyncSaver:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
 
+    async def _write(self) -> bool:
+        try:
+            await asyncio.to_thread(self._writer)
+        except SAVER_ERRORS as exc:
+            if self._logger:
+                self._logger.warning("AsyncSaver write failed: %r", exc)
+            return False
+        return True
+
     async def _run(self):
         while True:
             try:
@@ -326,11 +356,9 @@ class AsyncSaver:
             except asyncio.CancelledError:
                 return
             self._dirty = False
-            try:
-                await asyncio.to_thread(self._writer)
-            except (OSError, ValueError, TypeError) as exc:
-                if self._logger:
-                    self._logger.warning("AsyncSaver write failed: %r", exc)
+            if not await self._write():
+                self._dirty = True
+                return
             if not self._dirty:
                 return
 
@@ -342,7 +370,8 @@ class AsyncSaver:
                 await task
         if self._dirty:
             self._dirty = False
-            await asyncio.to_thread(self._writer)
+            if not await self._write():
+                self._dirty = True
 
 
 class ModeStore:
@@ -473,9 +502,9 @@ def check_cooldown(
         last = last_chat_activity.get(chat_id)
         if last is not None and (now - last) < cooldown:
             return True
-    last_chat_activity[chat_id] = time.monotonic()
+    last_chat_activity[chat_id] = now
     if len(last_chat_activity) > cleanup_threshold:
-        cutoff = time.monotonic() - cleanup_age
+        cutoff = now - cleanup_age
         for k in list(last_chat_activity):
             if last_chat_activity[k] < cutoff:
                 del last_chat_activity[k]
@@ -514,13 +543,10 @@ def handle_command_state(
     return None
 
 
-def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
-    async def _do():
-        async with ctx_lock:
-            hist = chat_history.setdefault(chat_id, deque(maxlen=group_limit))
-            hist.append({"role": "user", "content": content})
-
-    return _do()
+async def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
+    async with ctx_lock:
+        hist = chat_history.setdefault(chat_id, deque(maxlen=group_limit))
+        hist.append({"role": "user", "content": content})
 
 
 def make_stream_callbacks(
@@ -631,6 +657,7 @@ async def stream_answer(
     edit_interval,
     owner_id=None,
     logger=None,
+    stats=None,
 ):
     import userbot as userbot_module
 
@@ -643,56 +670,56 @@ async def stream_answer(
         state["edit_id"] = self_edit_id
     error = None
     result = None
+    caught = (*STREAM_ERRORS, userbot_module.OpenAIError, RPCError)
     try:
-        async with action:
-            if not is_self:
-                placeholder = await reply_fn(event, "…")
-                if placeholder:
-                    placeholder_id = placeholder.id
-                    state["edit_id"] = placeholder.id
-                    store.recent_reply_ids.add(placeholder.id)
-            result = await stream_fn(
-                messages,
-                model,
-                chat_id,
-                on_delta,
-                on_reasoning,
-                on_tool,
-                client_override=tool_client,
-                tools=tools,
-                verify_tools=not unrestricted,
-                sanitize_tools=not unrestricted,
-                unrestricted=unrestricted,
-            )
-    except (
-        userbot_module.OpenAIError,
-        RPCError,
-        OSError,
-        ValueError,
-        TypeError,
-    ) as exc:
-        error = exc
-    full_answer = result or "".join(state["answer_parts"])
-    final_text = render()
-    if not final_text.strip() or final_text.strip() == "…":
-        fallback = full_answer.strip()
-        if not fallback:
-            fallback = (
-                "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-                if error is not None
-                else "(пустой ответ / empty answer)"
-            )
-        final_text = fallback
-    if state["edit_id"] is not None:
-        edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
-        if not edited and placeholder_id is not None:
-            if logger is not None:
-                logger.warning(
-                    "финальный edit не удался, отправляю ответ новым сообщением"
+        try:
+            async with action:
+                if not is_self:
+                    placeholder = await reply_fn(event, "…")
+                    if placeholder:
+                        placeholder_id = placeholder.id
+                        state["edit_id"] = placeholder.id
+                        store.recent_reply_ids.add(placeholder.id)
+                result = await stream_fn(
+                    messages,
+                    model,
+                    chat_id,
+                    on_delta,
+                    on_reasoning,
+                    on_tool,
+                    client_override=tool_client,
+                    tools=tools,
+                    verify_tools=not unrestricted,
+                    sanitize_tools=not unrestricted,
+                    unrestricted=unrestricted,
+                    stats=stats,
                 )
+        except caught as exc:
+            error = exc
+        full_answer = result or "".join(state["answer_parts"])
+        final_text = render()
+        if not final_text.strip() or final_text.strip() == "…":
+            fallback = full_answer.strip()
+            if not fallback:
+                fallback = (
+                    "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+                    if error is not None
+                    else "(пустой ответ / empty answer)"
+                )
+            final_text = fallback
+        if state["edit_id"] is not None:
+            edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
+            if not edited and placeholder_id is not None:
+                if logger is not None:
+                    logger.warning(
+                        "финальный edit не удался, отправляю ответ новым сообщением"
+                    )
+                await reply_fn(event, final_text)
+        elif not is_self:
             await reply_fn(event, final_text)
-    if placeholder_id is not None:
-        store.recent_reply_ids.discard(placeholder_id)
+    finally:
+        if placeholder_id is not None:
+            store.recent_reply_ids.discard(placeholder_id)
     if error is not None:
         raise error
     return full_answer

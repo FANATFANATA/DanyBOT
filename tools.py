@@ -3,11 +3,14 @@ import asyncio
 import contextlib
 import datetime
 import html
+import ipaddress
 import json
 import logging
 import math
 import os
 import re
+import socket
+import sqlite3
 import sys
 import tempfile
 import urllib.parse
@@ -45,8 +48,30 @@ MAX_WRITE_BYTES = 500_000
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILES = 4000
+MAX_SEARCH_FILE_BYTES = 2_000_000
+MAX_SEARCH_PATTERN = 250
 MAX_SCRIPT_BYTES = 200_000
 MAX_SCRIPT_OUTPUT = 4000
+MAX_SHELL_OUTPUT = 4000
+MAX_PROCESS_BYTES = 1_000_000
+MAX_EVAL_EXPONENT = 1000
+MAX_EVAL_STEPS = 5000
+MAX_EVAL_BITS = 40000
+MAX_FETCH_REDIRECTS = 3
+FETCH_TIMEOUT = 25
+
+TOOL_ERRORS: tuple[type[BaseException], ...] = (
+    OSError,
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+    AttributeError,
+    RuntimeError,
+    RecursionError,
+    MemoryError,
+    sqlite3.Error,
+)
 
 
 def _resolve_path(raw, root=None):
@@ -69,7 +94,34 @@ def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit] + "…"
 
 
+_EVAL_STEPS = 0
+
+
+def _eval_guard() -> None:
+    global _EVAL_STEPS
+    _EVAL_STEPS += 1
+    if _EVAL_STEPS > MAX_EVAL_STEPS:
+        raise ValueError("Слишком сложное выражение")
+
+
+def _eval_pow(left, right):
+    if abs(right) > MAX_EVAL_EXPONENT:
+        raise ValueError("Слишком большая степень")
+    if (
+        isinstance(left, int)
+        and isinstance(right, int)
+        and right > 0
+        and left.bit_length() * right > MAX_EVAL_BITS
+    ):
+        raise ValueError("Слишком большое число")
+    return left**right
+
+
+SAFE_FUNCS["pow"] = _eval_pow
+
+
 def _eval_node(node):
+    _eval_guard()
     if isinstance(node, ast.Expression):
         return _eval_node(node.body)
     if isinstance(node, ast.Constant):
@@ -93,7 +145,7 @@ def _eval_node(node):
         if op is ast.Mod:
             return left % right
         if op is ast.Pow:
-            return left**right
+            return _eval_pow(left, right)
         raise ValueError("Недопустимый оператор")
     if isinstance(node, ast.UnaryOp):
         operand = _eval_node(node.operand)
@@ -116,6 +168,8 @@ def _eval_node(node):
 
 
 def safe_eval(expression: str) -> str:
+    global _EVAL_STEPS
+    _EVAL_STEPS = 0
     try:
         tree = ast.parse(expression.strip(), mode="eval")
         return str(_eval_node(tree))
@@ -126,6 +180,8 @@ def safe_eval(expression: str) -> str:
         OverflowError,
         TypeError,
         KeyError,
+        RecursionError,
+        MemoryError,
     ) as exc:
         return f"Ошибка вычисления: {exc}"
 
@@ -140,6 +196,12 @@ def _int_arg(arguments, key, default, lo, hi):
 
 def _str_arg(arguments, key, default=""):
     return str(arguments.get(key, default)).strip()
+
+
+def _opt_int_arg(arguments, key, lo, hi):
+    if arguments.get(key) is None:
+        return None
+    return _int_arg(arguments, key, lo, lo, hi)
 
 
 def render_response(
@@ -605,15 +667,15 @@ CODER_TOOLS: list[dict[str, Any]] = [
 BOT_TOOLS: list[dict[str, Any]] = list(TOOLS)
 
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
-    {"run_subagent", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
+    {"run_subagent", "run_shell", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
 )
 
 
-async def _tool_evaluate(arguments, chat_id, client, stats):
+async def _tool_evaluate(arguments, chat_id, client, stats, unrestricted=False):
     return safe_eval(_str_arg(arguments, "expression"))
 
 
-async def _tool_get_chat_info(arguments, chat_id, client, stats):
+async def _tool_get_chat_info(arguments, chat_id, client, stats, unrestricted=False):
     try:
         entity = await client.get_entity(chat_id)
     except (RPCError, OSError, ValueError) as exc:
@@ -629,7 +691,7 @@ async def _tool_get_chat_info(arguments, chat_id, client, stats):
     )
 
 
-async def _tool_get_user_info(arguments, chat_id, client, stats):
+async def _tool_get_user_info(arguments, chat_id, client, stats, unrestricted=False):
     handle = _str_arg(arguments, "handle")
     if not handle:
         return "Пустой handle."
@@ -650,7 +712,7 @@ async def _tool_get_user_info(arguments, chat_id, client, stats):
     )
 
 
-async def _tool_get_profile(arguments, chat_id, client, stats):
+async def _tool_get_profile(arguments, chat_id, client, stats, unrestricted=False):
     try:
         me = await client.get_me()
     except (RPCError, OSError, ValueError) as exc:
@@ -668,42 +730,93 @@ async def _tool_get_profile(arguments, chat_id, client, stats):
     )
 
 
-async def _tool_run_shell(arguments, chat_id, client, stats):
+async def _kill_process(proc) -> None:
+    with contextlib.suppress(ProcessLookupError, OSError):
+        proc.kill()
+    with contextlib.suppress(Exception):
+        await proc.wait()
+
+
+async def _read_capped(reader, cap: int) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    total = 0
+    while total < cap:
+        chunk = await reader.read(min(65536, cap - total))
+        if not chunk:
+            return b"".join(chunks), False
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks), True
+
+
+async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str, str]:
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(
+                _read_capped(proc.stdout, cap),
+                _read_capped(proc.stderr, cap),
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        await _kill_process(proc)
+        return -1, "", "", f"Таймаут {timeout}s: команда прервана."
+    (out, out_cut), (err, err_cut) = results
+    note = ""
+    if out_cut or err_cut:
+        await _kill_process(proc)
+        note = "Вывод обрезан."
+    else:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+    rc = proc.returncode if proc.returncode is not None else -1
+    return (
+        rc,
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
+        note,
+    )
+
+
+def _format_process_result(rc: int, out: str, err: str) -> str:
+    result = f"rc={rc}\nstdout:\n{out}"
+    if err:
+        result += f"\nstderr:\n{err}"
+    return result
+
+
+def _resolve_workdir(raw_cwd):
+    if not raw_cwd:
+        return CODER_ROOT, ""
+    workdir, err = _resolve_path(raw_cwd)
+    if err or workdir is None:
+        return None, err
+    if not workdir.is_dir():
+        return None, f"Каталог не найден: {workdir}"
+    return workdir, ""
+
+
+async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False):
     command = _str_arg(arguments, "command")
     if not command:
         return "Пустая команда."
     timeout = _int_arg(arguments, "timeout", 30, 1, 120)
-    workdir = None
-    raw_cwd = _str_arg(arguments, "cwd")
-    if raw_cwd:
-        workdir, err = _resolve_path(raw_cwd)
-        if err or workdir is None:
-            return err
-        if not workdir.is_dir():
-            return f"Каталог не найден: {workdir}"
+    workdir, err = _resolve_workdir(_str_arg(arguments, "cwd"))
+    if err:
+        return err
     try:
         proc = await asyncio.create_subprocess_shell(
             command,
-            cwd=str(workdir) if workdir else None,
+            cwd=str(workdir),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
     except OSError as exc:
         return f"Ошибка запуска: {exc}"
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return f"Таймаут {timeout}s: команда прервана."
-    out = stdout.decode("utf-8", errors="replace")
-    err = stderr.decode("utf-8", errors="replace")
-    result = f"rc={proc.returncode}\nstdout:\n{out}"
-    if err:
-        result += f"\nstderr:\n{err}"
-    return result[:4000]
+    rc, out, err_out, note = await _collect_process(proc, timeout, MAX_PROCESS_BYTES)
+    if note:
+        return note
+    return _format_process_result(rc, out, err_out)[:MAX_SHELL_OUTPUT]
 
 
 _httpx_singleton = None
@@ -725,6 +838,16 @@ def _get_httpx_client():
             limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
         )
     return _httpx_singleton
+
+
+async def close_httpx_client() -> None:
+    global _httpx_singleton
+    client = _httpx_singleton
+    _httpx_singleton = None
+    if client is None:
+        return
+    with contextlib.suppress(Exception):
+        await client.aclose()
 
 
 BRAVE_SEARCH_URL = "https://search.brave.com/search"
@@ -784,7 +907,7 @@ def _parse_ddg(text, limit):
     return results
 
 
-async def _tool_web_search(arguments, chat_id, client, stats):
+async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False):
     query = _str_arg(arguments, "query")
     if not query:
         return "Пустой запрос."
@@ -808,20 +931,68 @@ async def _tool_web_search(arguments, chat_id, client, stats):
     return "Ничего не найдено."
 
 
-async def _tool_fetch_url(arguments, chat_id, client, stats):
+async def _resolve_addrs(host, port):
+    loop = asyncio.get_running_loop()
+    infos = await loop.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    return [info[4][0] for info in infos]
+
+
+def _is_public_addr(addr) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip.is_global
+
+
+async def _check_public_url(url: str) -> str:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname
+    if not host:
+        return "URL без хоста."
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        addrs = await _resolve_addrs(host, port)
+    except (OSError, ValueError, UnicodeError) as exc:
+        return f"Не удалось разрешить хост {host}: {exc}"
+    if not addrs:
+        return f"Не удалось разрешить хост {host}."
+    for addr in addrs:
+        if not _is_public_addr(addr):
+            return f"Адрес заблокирован: {host} -> {addr}"
+    return ""
+
+
+async def _tool_fetch_url(arguments, chat_id, client, stats, unrestricted=False):
     url = _str_arg(arguments, "url")
     if not url:
         return "Пустой URL."
     if not url.startswith(("http://", "https://")):
         return "URL должен начинаться с http:// или https://"
     max_chars = _int_arg(arguments, "max_chars", 5000, 100, 20000)
+    hc = _get_httpx_client()
+    current = url
     try:
-        hc = _get_httpx_client()
-        resp = await hc.get(url, timeout=25)
-        resp.raise_for_status()
-        raw = resp.text
-    except (httpx.HTTPError, OSError, ValueError) as exc:
-        return f"Ошибка загрузки: {exc}"
+        async with asyncio.timeout(FETCH_TIMEOUT + 5):
+            for _hop in range(MAX_FETCH_REDIRECTS + 1):
+                guard = await _check_public_url(current)
+                if guard:
+                    return guard
+                try:
+                    resp = await hc.get(current, follow_redirects=False, timeout=20)
+                    resp.raise_for_status()
+                except (httpx.HTTPError, OSError, ValueError) as exc:
+                    return f"Ошибка загрузки: {exc}"
+                location = (getattr(resp, "headers", {}) or {}).get("location", "")
+                if 300 <= getattr(resp, "status_code", 200) < 400 and location:
+                    current = urllib.parse.urljoin(current, str(location))
+                    continue
+                raw = resp.text
+                break
+            else:
+                return "Слишком много перенаправлений."
+    except TimeoutError:
+        return f"Таймаут {FETCH_TIMEOUT}s: загрузка прервана."
     cleaned = re.sub(
         r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE
     )
@@ -834,7 +1005,7 @@ async def _tool_fetch_url(arguments, chat_id, client, stats):
     return cleaned[:max_chars]
 
 
-async def _tool_get_time(arguments, chat_id, client, stats):
+async def _tool_get_time(arguments, chat_id, client, stats, unrestricted=False):
     utc = datetime.datetime.now(datetime.timezone.utc)
     return json.dumps(
         {
@@ -846,7 +1017,7 @@ async def _tool_get_time(arguments, chat_id, client, stats):
     )
 
 
-async def _tool_text_stats(arguments, chat_id, client, stats):
+async def _tool_text_stats(arguments, chat_id, client, stats, unrestricted=False):
     text = str(arguments.get("text", ""))
     return json.dumps(
         {
@@ -859,14 +1030,13 @@ async def _tool_text_stats(arguments, chat_id, client, stats):
     )
 
 
-async def _tool_get_bot_stats(arguments, chat_id, client, stats):
+async def _tool_get_bot_stats(arguments, chat_id, client, stats, unrestricted=False):
     data = stats(chat_id) if stats is not None else {}
     return json.dumps(data, ensure_ascii=False)
 
 
-async def _tool_run_subagent(arguments, chat_id, client, stats):
+async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=False):
     import subagents
-    import userbot as userbot_module
 
     if not subagents.is_configured():
         return "Субагенты недоступны."
@@ -878,19 +1048,19 @@ async def _tool_run_subagent(arguments, chat_id, client, stats):
         return "Нужна задача: task или tasks."
     results = await subagents.run_subagents(
         tasks,
-        concurrency=arguments.get("concurrency"),
+        concurrency=_opt_int_arg(arguments, "concurrency", 1, 16),
         system=_str_arg(arguments, "system") or None,
         model=_str_arg(arguments, "model") or None,
         tool_names=arguments.get("tools"),
         chat_id=chat_id,
         client=client,
-        max_rounds=arguments.get("max_rounds"),
-        verify=not userbot_module.is_unrestricted(chat_id),
+        max_rounds=_opt_int_arg(arguments, "max_rounds", 1, 20),
+        verify=not unrestricted,
     )
     return json.dumps(results, ensure_ascii=False)[:8000]
 
 
-async def _tool_read_file(arguments, chat_id, client, stats):
+async def _tool_read_file(arguments, chat_id, client, stats, unrestricted=False):
     path, err = _resolve_path(arguments.get("path"))
     if err or path is None:
         return err
@@ -915,7 +1085,7 @@ async def _tool_read_file(arguments, chat_id, client, stats):
     return f"{head}\n{body}"
 
 
-async def _tool_write_file(arguments, chat_id, client, stats):
+async def _tool_write_file(arguments, chat_id, client, stats, unrestricted=False):
     path, err = _resolve_path(arguments.get("path"))
     if err or path is None:
         return err
@@ -934,7 +1104,7 @@ async def _tool_write_file(arguments, chat_id, client, stats):
     return f"{action}: {path} ({len(content)} символов)"
 
 
-async def _tool_edit_file(arguments, chat_id, client, stats):
+async def _tool_edit_file(arguments, chat_id, client, stats, unrestricted=False):
     path, err = _resolve_path(arguments.get("path"))
     if err or path is None:
         return err
@@ -964,7 +1134,7 @@ async def _tool_edit_file(arguments, chat_id, client, stats):
     return f"Изменён: {path} (замен {count if replace_all else 1})"
 
 
-async def _tool_list_dir(arguments, chat_id, client, stats):
+async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
     path, err = _resolve_path(arguments.get("path", "."))
     if err or path is None:
         return err
@@ -994,10 +1164,36 @@ async def _tool_list_dir(arguments, chat_id, client, stats):
     return head + "\n" + "\n".join(rows)
 
 
-async def _tool_search_files(arguments, chat_id, client, stats):
+def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
+    matches: list[str] = []
+    scanned = 0
+    candidates = [root] if root.is_file() else root.rglob(glob_pat)
+    for item in candidates:
+        if len(matches) >= limit or scanned >= MAX_SEARCH_FILES:
+            break
+        if not item.is_file():
+            continue
+        try:
+            if item.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                continue
+            scanned += 1
+            text = item.read_text(encoding="utf-8", errors="ignore")
+        except (OSError, ValueError):
+            continue
+        for idx, line in enumerate(text.splitlines(), start=1):
+            if rx.search(line):
+                matches.append(f"{item}:{idx}: {line.strip()[:200]}")
+                if len(matches) >= limit:
+                    break
+    return matches
+
+
+async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=False):
     pattern = _str_arg(arguments, "pattern")
     if not pattern:
         return "Пустой pattern."
+    if len(pattern) > MAX_SEARCH_PATTERN:
+        return f"Слишком длинный pattern: максимум {MAX_SEARCH_PATTERN} символов."
     path, err = _resolve_path(arguments.get("path", "."))
     if err or path is None:
         return err
@@ -1009,30 +1205,13 @@ async def _tool_search_files(arguments, chat_id, client, stats):
         rx = re.compile(pattern)
     except re.error as exc:
         return f"Некорректное выражение: {exc}"
-    candidates = [path] if path.is_file() else sorted(path.rglob(glob_pat))
-    matches = []
-    scanned = 0
-    for item in candidates:
-        if len(matches) >= limit or scanned >= MAX_SEARCH_FILES:
-            break
-        if not item.is_file():
-            continue
-        scanned += 1
-        try:
-            text = item.read_text(encoding="utf-8", errors="ignore")
-        except (OSError, ValueError):
-            continue
-        for idx, line in enumerate(text.splitlines(), start=1):
-            if rx.search(line):
-                matches.append(f"{item}:{idx}: {line.strip()[:200]}")
-                if len(matches) >= limit:
-                    break
+    matches = await asyncio.to_thread(_scan_files, path, glob_pat, rx, limit)
     if not matches:
         return "Совпадений не найдено."
     return "\n".join(matches)
 
 
-async def _tool_execute_script(arguments, chat_id, client, stats):
+async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=False):
     code = str(arguments.get("code", ""))
     if not code.strip():
         return "Пустой код."
@@ -1040,14 +1219,9 @@ async def _tool_execute_script(arguments, chat_id, client, stats):
     if len(encoded) > MAX_SCRIPT_BYTES:
         return f"Слишком большой объём: {len(encoded)} байт"
     timeout = _int_arg(arguments, "timeout", 30, 1, 120)
-    workdir = CODER_ROOT
-    raw_cwd = _str_arg(arguments, "cwd")
-    if raw_cwd:
-        workdir, err = _resolve_path(raw_cwd)
-        if err or workdir is None:
-            return err
-        if not workdir.is_dir():
-            return f"Каталог не найден: {workdir}"
+    workdir, err = _resolve_workdir(_str_arg(arguments, "cwd"))
+    if err:
+        return err
     script_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -1068,26 +1242,19 @@ async def _tool_execute_script(arguments, chat_id, client, stats):
                 script_path.unlink()
         return f"Ошибка запуска: {exc}"
     try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        with contextlib.suppress(Exception):
-            await proc.wait()
-        return f"Таймаут {timeout}s: скрипт прерван."
+        rc, out, err_out, note = await _collect_process(
+            proc, timeout, MAX_PROCESS_BYTES
+        )
     finally:
         if script_path is not None:
             with contextlib.suppress(OSError):
                 script_path.unlink()
-    out = stdout.decode("utf-8", errors="replace")
-    err = stderr.decode("utf-8", errors="replace")
-    result = f"rc={proc.returncode}\nstdout:\n{out}"
-    if err:
-        result += f"\nstderr:\n{err}"
-    return _clip(result, MAX_SCRIPT_OUTPUT)
+    if note:
+        return note
+    return _clip(_format_process_result(rc, out, err_out), MAX_SCRIPT_OUTPUT)
 
 
-async def _tool_memory_remember(arguments, chat_id, client, stats):
+async def _tool_memory_remember(arguments, chat_id, client, stats, unrestricted=False):
     import memory
 
     key = _str_arg(arguments, "key")
@@ -1097,7 +1264,7 @@ async def _tool_memory_remember(arguments, chat_id, client, stats):
     return memory.dumps(result)
 
 
-async def _tool_memory_recall(arguments, chat_id, client, stats):
+async def _tool_memory_recall(arguments, chat_id, client, stats, unrestricted=False):
     import memory
 
     key = _str_arg(arguments, "key")
@@ -1107,7 +1274,7 @@ async def _tool_memory_recall(arguments, chat_id, client, stats):
     return memory.dumps(result)
 
 
-async def _tool_memory_forget(arguments, chat_id, client, stats):
+async def _tool_memory_forget(arguments, chat_id, client, stats, unrestricted=False):
     import memory
 
     key = _str_arg(arguments, "key")
@@ -1116,7 +1283,7 @@ async def _tool_memory_forget(arguments, chat_id, client, stats):
     return memory.dumps(result)
 
 
-async def _tool_memory_list(arguments, chat_id, client, stats):
+async def _tool_memory_list(arguments, chat_id, client, stats, unrestricted=False):
     import memory
 
     limit = _int_arg(arguments, "limit", 50, 1, 200)
@@ -1125,7 +1292,7 @@ async def _tool_memory_list(arguments, chat_id, client, stats):
     return memory.dumps(result)
 
 
-async def _tool_save_skill(arguments, chat_id, client, stats):
+async def _tool_save_skill(arguments, chat_id, client, stats, unrestricted=False):
     import skills
 
     name = _str_arg(arguments, "name")
@@ -1136,7 +1303,7 @@ async def _tool_save_skill(arguments, chat_id, client, stats):
     return skills.dumps(result)
 
 
-async def _tool_load_skill(arguments, chat_id, client, stats):
+async def _tool_load_skill(arguments, chat_id, client, stats, unrestricted=False):
     import skills
 
     name = _str_arg(arguments, "name")
@@ -1144,7 +1311,7 @@ async def _tool_load_skill(arguments, chat_id, client, stats):
     return skills.dumps(result)
 
 
-async def _tool_list_skills(arguments, chat_id, client, stats):
+async def _tool_list_skills(arguments, chat_id, client, stats, unrestricted=False):
     import skills
 
     tag = _str_arg(arguments, "tag")
@@ -1155,7 +1322,7 @@ async def _tool_list_skills(arguments, chat_id, client, stats):
     return skills.dumps(result)
 
 
-async def _tool_delete_skill(arguments, chat_id, client, stats):
+async def _tool_delete_skill(arguments, chat_id, client, stats, unrestricted=False):
     import skills
 
     name = _str_arg(arguments, "name")
@@ -1192,8 +1359,14 @@ _HANDLERS = {
 }
 
 
-async def execute_tool(name, arguments, chat_id, client=None, stats=None):
+async def execute_tool(
+    name, arguments, chat_id, client=None, stats=None, unrestricted=False
+):
     handler = _HANDLERS.get(name)
     if handler is None:
         return f"Неизвестная функция: {name}"
-    return await handler(arguments, chat_id, client, stats)
+    try:
+        return await handler(arguments, chat_id, client, stats, unrestricted)
+    except TOOL_ERRORS as exc:
+        logger.exception("Инструмент %s упал", name)
+        return f"Ошибка инструмента {name}: {type(exc).__name__}: {exc}"

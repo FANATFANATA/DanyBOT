@@ -5,6 +5,7 @@ import signal
 
 import bot
 import subagents
+import tools
 import userbot
 
 logging.basicConfig(
@@ -19,6 +20,8 @@ async def _flush_savers():
         await userbot.HISTORY_SAVER.flush()
     with contextlib.suppress(Exception):
         await bot.HISTORY_SAVER.flush()
+    with contextlib.suppress(Exception):
+        await tools.close_httpx_client()
 
 
 async def run():
@@ -91,6 +94,8 @@ async def run():
             await userbot.disconnect_quietly()
         with contextlib.suppress(Exception):
             await bot.disconnect_quietly()
+        with contextlib.suppress(Exception):
+            await tools.close_httpx_client()
         await _flush_savers()
         logger.info("Завершено / Stopped.")
 

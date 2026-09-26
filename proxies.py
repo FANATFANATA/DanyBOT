@@ -90,6 +90,18 @@ SOURCES = [
 
 IPPORT_RE = re.compile(r"(\d{1,3}(?:\.\d{1,3}){3}):(\d{2,5})")
 
+MAX_CANDIDATES = 400
+MAX_CACHED_RAW = 5000
+
+
+def _cache_write(path, text) -> bool:
+    try:
+        path.write_text(text, encoding="utf-8")
+        return True
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("Не удалось записать кэш %s: %s", path.name, exc)
+        return False
+
 
 def parse_proxy_lines(text: str, protocol: str):
     result = []
@@ -108,12 +120,12 @@ def parse_proxy_lines(text: str, protocol: str):
 
 
 def load_raw_cache():
-    if not RAW_CACHE_FILE.exists():
+    try:
+        raw = RAW_CACHE_FILE.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
         return []
     proxies = []
-    for line in RAW_CACHE_FILE.read_text(
-        encoding="utf-8", errors="ignore"
-    ).splitlines():
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -127,7 +139,7 @@ def load_raw_cache():
 
 def save_raw_cache(proxies):
     lines = [f"{p} {h} {port}" for p, h, port in proxies]
-    RAW_CACHE_FILE.write_text("\n".join(lines), encoding="utf-8")
+    _cache_write(RAW_CACHE_FILE, "\n".join(lines))
 
 
 async def fetch_sources():
@@ -239,7 +251,9 @@ async def validate_many(items, limit=10, concurrency=20):
         while tasks:
             done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for finished in done:
-                res = cast(Any, finished.result())
+                res = None
+                if not finished.cancelled() and finished.exception() is None:
+                    res = cast(Any, finished.result())
                 if res:
                     working.append(res)
                     logger.info("Рабочий прокси: %s %s:%s", *res)
@@ -263,8 +277,6 @@ async def validate_many(items, limit=10, concurrency=20):
 
 
 def load_proxy_cache():
-    if not CACHE_FILE.exists():
-        return []
     try:
         data = json.loads(CACHE_FILE.read_text(encoding="utf-8"))
         return [(p["protocol"], p["host"], p["port"]) for p in data]
@@ -274,7 +286,7 @@ def load_proxy_cache():
 
 def save_proxy_cache(proxies):
     data = [{"protocol": p, "host": h, "port": port} for p, h, port in proxies]
-    CACHE_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    _cache_write(CACHE_FILE, json.dumps(data, indent=2))
 
 
 async def get_working_proxies(limit=10, prefer_protocol="socks5"):
@@ -291,10 +303,10 @@ async def get_working_proxies(limit=10, prefer_protocol="socks5"):
     if prefer_protocol:
         all_proxies.sort(key=lambda p: p[0] != prefer_protocol)
     if all_proxies:
-        save_raw_cache(all_proxies[:5000])
+        save_raw_cache(all_proxies[:MAX_CACHED_RAW])
 
     logger.info("Прокси в пуле: %d", len(all_proxies))
-    working = await validate_many(all_proxies, limit=limit)
+    working = await validate_many(all_proxies[:MAX_CANDIDATES], limit=limit)
     if working:
         save_proxy_cache(working)
         return working

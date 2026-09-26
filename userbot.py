@@ -158,24 +158,6 @@ def _env_id_set(name):
 
 OWNER_IDS = _env_id_set("OWNER_IDS")
 
-_restricted_chats: dict[int, tuple[bool, int | None]] = {}
-
-
-def register_sender(sender_id, chat_id):
-    if sender_id is None:
-        return False
-    unrestricted = sender_id in OWNER_IDS
-    if len(_restricted_chats) > 10000:
-        _restricted_chats.clear()
-    _restricted_chats[chat_id] = (unrestricted, sender_id)
-    return unrestricted
-
-
-def is_unrestricted(chat_id):
-    entry = _restricted_chats.get(chat_id)
-    return bool(entry and entry[0])
-
-
 REPLY_ATTEMPTS = 3
 
 
@@ -194,7 +176,7 @@ EXTRA_SYSTEM = _read_extra_system(SYSTEM_PROMPT_FILE)
 STATE_FILE = Path(__file__).parent / "state_userbot.json"
 HISTORY_FILE = Path(__file__).parent / "history_userbot.json"
 
-MODELS: list[str] = ["deepseek-v4-flash"]
+MODELS: list[str] = [DANYAPI_MODEL]
 
 model_overrides: dict[int, str] = {}
 coder_chats: set[int] = set()
@@ -420,10 +402,14 @@ def _bot_stats(chat_id):
     }
 
 
-async def execute_tool(name: str, arguments: dict, chat_id, client=None):
+async def execute_tool(
+    name: str, arguments: dict, chat_id, client=None, stats=None, unrestricted=False
+):
     if client is None:
         client = globals()["client"]
-    return await tools_module.execute_tool(name, arguments, chat_id, client, _bot_stats)
+    return await tools_module.execute_tool(
+        name, arguments, chat_id, client, stats or _bot_stats, unrestricted
+    )
 
 
 def _last_decision(text: str) -> str:
@@ -468,11 +454,13 @@ async def verify_tool_call(
             ),
             timeout=REQUEST_TIMEOUT,
         )
-    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError):
+    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError) as exc:
+        logger.warning("Верификация %s недоступна: %r", name, exc)
         return False
     try:
         message = resp.choices[0].message
-    except (AttributeError, IndexError, TypeError):
+    except (AttributeError, IndexError, TypeError) as exc:
+        logger.warning("Верификация %s: пустой ответ: %r", name, exc)
         return False
 
     raw_content = getattr(message, "content", None)
@@ -519,21 +507,19 @@ async def sanitize_tool_output(
             ),
             timeout=REQUEST_TIMEOUT,
         )
-    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError):
+    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError) as exc:
+        logger.warning("Санитайзер недоступен: %r", exc)
         return "[вывод скрыт: ошибка санитайзера]"
     try:
         message = resp.choices[0].message
-    except (AttributeError, IndexError, TypeError):
+    except (AttributeError, IndexError, TypeError) as exc:
+        logger.warning("Санитайзер: пустой ответ: %r", exc)
         return "[вывод скрыт: пустой ответ санитайзера]"
     raw_content = getattr(message, "content", None)
-    raw_reasoning = getattr(message, "reasoning_content", None)
     if isinstance(raw_content, list):
         content = "".join(str(x) for x in raw_content).strip()
     else:
         content = (raw_content or "").strip()
-    reasoning = (raw_reasoning or "").strip()
-    if reasoning:
-        content = f"{reasoning}\n{content}".strip()
     content = content.strip()
     if not content:
         return "[вывод скрыт: пустой ответ санитайзера]"
@@ -552,16 +538,18 @@ async def stream_with_tools(
     verify_tools=False,
     sanitize_tools=True,
     unrestricted=False,
+    stats=None,
 ):
     working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
+    all_parts: list[str] = []
     content_parts: list[str] = []
     while True:
         rounds += 1
         if 0 < MAX_TOOL_ROUNDS < rounds:
             return (
-                "".join(content_parts)
-                if content_parts
+                "".join(all_parts)
+                if all_parts
                 else "Достигнут лимит циклов инструментов."
             )
         tool_calls: dict[int, dict[str, str]] = {}
@@ -579,43 +567,44 @@ async def stream_with_tools(
         )
         stream = cast(Any, raw_stream)
         stream_iter = stream.__aiter__()
-        while True:
-            try:
-                chunk = await asyncio.wait_for(
-                    stream_iter.__anext__(), timeout=REQUEST_TIMEOUT
-                )
-            except StopAsyncIteration:
-                break
-            except asyncio.TimeoutError:
-                with contextlib.suppress(Exception):
-                    await cast(Any, stream.close())
-                raise
-            if not chunk.choices:
-                continue
-            delta = chunk.choices[0].delta
-            if delta:
-                reasoning = getattr(delta, "reasoning_content", None)
-                if not reasoning:
-                    reasoning = getattr(delta, "reasoning", None)
-                if reasoning:
-                    await on_reasoning(reasoning)
-            if delta and delta.content:
-                content_parts.append(delta.content)
-                await on_delta(delta.content)
-            if delta and delta.tool_calls:
-                for tc in delta.tool_calls:
-                    slot = tool_calls.setdefault(
-                        tc.index, {"id": "", "name": "", "arguments": ""}
+        try:
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        stream_iter.__anext__(), timeout=REQUEST_TIMEOUT
                     )
-                    if tc.id:
-                        slot["id"] = tc.id
-                    if tc.function:
-                        if tc.function.name:
-                            slot["name"] += tc.function.name
-                        if tc.function.arguments:
-                            slot["arguments"] += tc.function.arguments
+                except StopAsyncIteration:
+                    break
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta:
+                    reasoning = getattr(delta, "reasoning_content", None)
+                    if not reasoning:
+                        reasoning = getattr(delta, "reasoning", None)
+                    if reasoning:
+                        await on_reasoning(reasoning)
+                if delta and delta.content:
+                    content_parts.append(delta.content)
+                    all_parts.append(delta.content)
+                    await on_delta(delta.content)
+                if delta and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        slot = tool_calls.setdefault(
+                            tc.index, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if tc.id:
+                            slot["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                slot["name"] += tc.function.name
+                            if tc.function.arguments:
+                                slot["arguments"] += tc.function.arguments
+        finally:
+            with contextlib.suppress(Exception):
+                await stream.close()
         if not tool_calls:
-            return "".join(content_parts)
+            return "".join(all_parts)
         working.append(
             {
                 "role": "assistant",
@@ -640,24 +629,20 @@ async def stream_with_tools(
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError):
                 args = {}
-            owner = unrestricted or is_unrestricted(chat_id)
             verify_model = TOOL_VERIFY_MODEL or model
             if (
                 verify_tools
-                and not owner
+                and not unrestricted
                 and not await verify_tool_call(slot["name"], args, verify_model)
             ):
                 return slot, None
-            if client_override is None:
-                result = await execute_tool(slot["name"], args, chat_id)
-            else:
-                result = await execute_tool(
-                    slot["name"], args, chat_id, client_override
-                )
+            result = await execute_tool(
+                slot["name"], args, chat_id, client_override, stats, unrestricted
+            )
             if (
-                slot["name"] in ("run_shell", "execute_script")
+                slot["name"] in ("run_shell", "execute_script", "run_subagent")
                 and sanitize_tools
-                and not owner
+                and not unrestricted
             ):
                 result = await sanitize_tool_output(result, model)
             return slot, result
@@ -684,11 +669,20 @@ async def stream_with_tools(
             )
 
 
-async def get_sender_label(event):
+async def _get_sender(event):
     try:
-        sender = await event.get_sender()
-    except (RPCError, OSError, ValueError):
-        sender = None
+        return await event.get_sender()
+    except (RPCError, OSError, ValueError, TypeError, AttributeError) as exc:
+        logger.debug("Не удалось получить отправителя: %r", exc)
+        return None
+
+
+async def _sender_is_bot(event) -> bool:
+    return bool(getattr(await _get_sender(event), "bot", False))
+
+
+async def get_sender_label(event):
+    sender = await _get_sender(event)
     if not sender:
         return str(event.sender_id)
     first = getattr(sender, "first_name", "") or ""
@@ -778,8 +772,7 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    register_sender(sender_id, chat_id)
-    if is_private and getattr(await event.get_sender(), "bot", False):
+    if is_private and await _sender_is_bot(event):
         return
     triggered = bool(TRIGGER_RE.search(text))
     now = time.monotonic()
@@ -934,6 +927,7 @@ async def handler(event: Any):
             EDIT_INTERVAL,
             sender_id,
             logger,
+            _bot_stats,
         )
 
         async with ctx_lock:
