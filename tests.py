@@ -2921,6 +2921,15 @@ class VisibilityCommandsTest(BotTestCase):
 class CoderModeTest(BotTestCase):
     CHAT_ID = 7591254790
 
+    def setUp(self):
+        super().setUp()
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_coder_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        saved = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
+        tools_module.CODER_ROOT = tmp
+        (tmp / "DanyBOT").mkdir(parents=True, exist_ok=True)
+
     def test_aliases_parse(self):
         self.assertEqual(userbot.handle_commands(".db coder on"), ("coder", True))
         self.assertEqual(userbot.handle_commands(".db кодер выкл"), ("coder", False))
