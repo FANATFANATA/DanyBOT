@@ -14,6 +14,7 @@ SUBAGENT_SYSTEM = (
 
 MAX_TASKS = 16
 MAX_TOOL_RESULT = 6000
+REQUEST_TIMEOUT = 120.0
 
 _RUNTIME: dict[str, Any] = {
     "ai": None,
@@ -24,6 +25,7 @@ _RUNTIME: dict[str, Any] = {
     "max_tokens": 4096,
     "concurrency": None,
     "enabled": True,
+    "timeout": REQUEST_TIMEOUT,
 }
 
 
@@ -36,6 +38,7 @@ def configure(
     max_tokens=None,
     concurrency=None,
     enabled=None,
+    timeout=None,
 ):
     if ai is not None:
         _RUNTIME["ai"] = ai
@@ -53,6 +56,8 @@ def configure(
         _RUNTIME["concurrency"] = max(1, int(concurrency))
     if enabled is not None:
         _RUNTIME["enabled"] = bool(enabled)
+    if timeout is not None:
+        _RUNTIME["timeout"] = max(1.0, float(timeout))
 
 
 def is_configured() -> bool:
@@ -150,16 +155,26 @@ async def run_subagent(
         round_index += 1
         result["rounds"] = round_index
         try:
-            raw = await ai.chat.completions.create(
-                model=use_model,
-                messages=cast(Any, messages),
-                temperature=0.7,
-                max_tokens=_RUNTIME["max_tokens"],
-                stream=False,
-                tools=cast(Any, selected_tools),
+            raw = await asyncio.wait_for(
+                ai.chat.completions.create(
+                    model=use_model,
+                    messages=cast(Any, messages),
+                    temperature=0.7,
+                    max_tokens=_RUNTIME["max_tokens"],
+                    stream=False,
+                    tools=cast(Any, selected_tools),
+                ),
+                timeout=_RUNTIME["timeout"],
             )
             message = raw.choices[0].message
-        except (OSError, ValueError, TypeError, AttributeError, IndexError) as exc:
+        except (
+            OSError,
+            ValueError,
+            TypeError,
+            AttributeError,
+            IndexError,
+            asyncio.TimeoutError,
+        ) as exc:
             logger.warning("Субагент %s: ошибка: %s", subagent_name, exc)
             result["result"] = f"Ошибка субагента: {exc}"
             return result

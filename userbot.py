@@ -96,6 +96,7 @@ DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
 MAX_TOOL_ROUNDS = max(1, _env_int("MAX_TOOL_ROUNDS", 8))
+REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
 SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
@@ -228,7 +229,12 @@ def get_client():
     return client
 
 
-ai = AsyncOpenAI(base_url=DANYAPI_URL, api_key=DANYAPI_KEY)
+ai = AsyncOpenAI(
+    base_url=DANYAPI_URL,
+    api_key=DANYAPI_KEY,
+    timeout=REQUEST_TIMEOUT,
+    max_retries=1,
+)
 
 
 def load_state():
@@ -435,20 +441,23 @@ async def verify_tool_call(
         use_model = model
         max_tokens = 8
     try:
-        resp = await ai.chat.completions.create(
-            model=use_model,
-            messages=cast(
-                Any,
-                [
-                    {"role": "system", "content": prompt},
-                    {"role": "user", "content": payload},
-                ],
+        resp = await asyncio.wait_for(
+            ai.chat.completions.create(
+                model=use_model,
+                messages=cast(
+                    Any,
+                    [
+                        {"role": "system", "content": prompt},
+                        {"role": "user", "content": payload},
+                    ],
+                ),
+                temperature=0,
+                max_tokens=max_tokens,
+                stream=False,
             ),
-            temperature=0,
-            max_tokens=max_tokens,
-            stream=False,
+            timeout=REQUEST_TIMEOUT,
         )
-    except (OpenAIError, OSError, ValueError, TypeError):
+    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError):
         return False
     try:
         message = resp.choices[0].message
@@ -483,20 +492,23 @@ async def sanitize_tool_output(
         return output
     use_model = SANITIZE_MODEL or model
     try:
-        resp = await ai.chat.completions.create(
-            model=use_model,
-            messages=cast(
-                Any,
-                [
-                    {"role": "system", "content": SANITIZE_PROMPT},
-                    {"role": "user", "content": output},
-                ],
+        resp = await asyncio.wait_for(
+            ai.chat.completions.create(
+                model=use_model,
+                messages=cast(
+                    Any,
+                    [
+                        {"role": "system", "content": SANITIZE_PROMPT},
+                        {"role": "user", "content": output},
+                    ],
+                ),
+                temperature=0,
+                max_tokens=MAX_TOKENS,
+                stream=False,
             ),
-            temperature=0,
-            max_tokens=MAX_TOKENS,
-            stream=False,
+            timeout=REQUEST_TIMEOUT,
         )
-    except (OpenAIError, OSError, ValueError, TypeError):
+    except (OpenAIError, OSError, ValueError, TypeError, asyncio.TimeoutError):
         return "[вывод скрыт: ошибка санитайзера]"
     try:
         message = resp.choices[0].message
@@ -543,16 +555,30 @@ async def stream_with_tools(
             )
         tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
-        raw_stream = await ai.chat.completions.create(
-            model=model,
-            messages=cast(Any, working),
-            temperature=0.7,
-            max_tokens=MAX_TOKENS,
-            stream=True,
-            tools=cast(Any, tools if tools is not None else TOOLS),
+        raw_stream = await asyncio.wait_for(
+            ai.chat.completions.create(
+                model=model,
+                messages=cast(Any, working),
+                temperature=0.7,
+                max_tokens=MAX_TOKENS,
+                stream=True,
+                tools=cast(Any, tools if tools is not None else TOOLS),
+            ),
+            timeout=REQUEST_TIMEOUT,
         )
         stream = cast(Any, raw_stream)
-        async for chunk in stream:
+        stream_iter = stream.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    stream_iter.__anext__(), timeout=REQUEST_TIMEOUT
+                )
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                with contextlib.suppress(Exception):
+                    await cast(Any, stream.close())
+                raise
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -681,12 +707,12 @@ def models_text(chat_id) -> str:
 async def refresh_models():
     global MODELS
     try:
-        models = await ai.models.list()
+        models = await asyncio.wait_for(ai.models.list(), timeout=REQUEST_TIMEOUT)
         ids = [m.id for m in models.data if getattr(m, "id", None)]
         if ids:
             MODELS = ids
             logger.info("Загружено %d моделей из DanyAPI", len(ids))
-    except (OpenAIError, OSError, ValueError) as exc:
+    except (OpenAIError, OSError, ValueError, asyncio.TimeoutError) as exc:
         logger.warning("Не удалось загрузить модели из DanyAPI: %s", exc)
 
 

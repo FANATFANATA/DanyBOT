@@ -35,6 +35,7 @@ async def run():
         max_tokens=userbot.MAX_TOKENS,
         concurrency=userbot.SUBAGENT_CONCURRENCY,
         enabled=userbot.SUBAGENT_ENABLED,
+        timeout=userbot.REQUEST_TIMEOUT,
     )
 
     tasks = []
@@ -63,26 +64,34 @@ async def run():
     all_tasks = [*tasks, stop_task]
 
     try:
-        _done, pending = await asyncio.wait(
-            all_tasks, return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.gather(*pending, return_exceptions=True)
+        while True:
+            done, _pending = await asyncio.wait(
+                all_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
+            if stop_task in done:
+                break
+            mode_tasks = [t for t in tasks if t in done]
+            for task in mode_tasks:
+                exc = task.exception()
+                if exc is not None:
+                    logger.error("Режим завершился с ошибкой: %r", exc)
+                else:
+                    logger.warning("Режим завершился: %s", task.get_name())
+            if all(t.done() for t in tasks):
+                break
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
-        with contextlib.suppress(Exception):
-            await userbot.disconnect_quietly()
-        with contextlib.suppress(Exception):
-            await bot.disconnect_quietly()
-        await _flush_savers()
         for task in all_tasks:
             if not task.done():
                 task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await asyncio.gather(*all_tasks, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await userbot.disconnect_quietly()
+        with contextlib.suppress(Exception):
+            await bot.disconnect_quietly()
+        await _flush_savers()
         logger.info("Завершено / Stopped.")
 
 
