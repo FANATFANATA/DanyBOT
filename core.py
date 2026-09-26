@@ -469,8 +469,8 @@ def check_cooldown(
     cleanup_age=3600,
 ):
     if cooldown > 0:
-        last = last_chat_activity.get(chat_id, 0)
-        if (now - last) < cooldown:
+        last = last_chat_activity.get(chat_id)
+        if last is not None and (now - last) < cooldown:
             return True
     last_chat_activity[chat_id] = time.monotonic()
     if len(last_chat_activity) > cleanup_threshold:

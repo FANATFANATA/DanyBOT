@@ -1928,6 +1928,11 @@ class CoreHelpersTest(BotTestCase):
         last = activity[1]
         self.assertTrue(core.check_cooldown(1, last + 5.0, 10.0, activity))
 
+    def test_check_cooldown_allows_first_message_on_fresh_clock(self):
+        activity = {}
+        self.assertFalse(core.check_cooldown(1, 0.5, 60.0, activity))
+        self.assertIn(1, activity)
+
     def test_check_cooldown_disabled(self):
         self.assertFalse(core.check_cooldown(1, 100.0, 0.0, {}))
 
