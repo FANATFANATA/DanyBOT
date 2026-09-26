@@ -69,18 +69,17 @@ def _strip_mention(text):
 
 
 def _db_triggered(text):
-    if userbot.ENABLE_USERBOT:
-        return False
-    return bool(core.TRIGGER_RE.search(text or ""))
+    return False
 
 
 BOT_HELP_TEXT = (
     "DanyBOT - команды / commands:\n"
     "/help /start - справка / help\n"
+    "/clear - очистить контекст / clear context\n"
     "/settings - настройки, инлайн-меню / settings, inline menu\n\n"
-    "Модель, рассуждения, инструменты, кодер-режим, очистка\n"
-    "контекста и системный промпт - в меню /settings.\n\n"
-    "Также работает / Also works: @упоминание, реплай боту, .db-триггеры."
+    "Модель, рассуждения, инструменты, кодер-режим и системный\n"
+    "промпт - в меню /settings.\n\n"
+    "Также работает / Also works: @упоминание, реплай боту."
 )
 
 
@@ -379,7 +378,7 @@ async def handler(event: Any):
             cast(Any, get_bot_client().action(chat_id, "typing")),
             userbot.stream_with_tools,
             get_bot_client(),
-            tools_module.CODER_TOOLS if coder_active else userbot.TOOLS,
+            tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS,
             userbot.EDIT_INTERVAL,
             sender_id,
             logger,
@@ -551,6 +550,10 @@ async def start_bot():
                         commands=[
                             types.BotCommand(
                                 command="help", description="Справка / Help"
+                            ),
+                            types.BotCommand(
+                                command="clear",
+                                description="Очистить контекст / Clear context",
                             ),
                             types.BotCommand(
                                 command="settings",

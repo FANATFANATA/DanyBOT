@@ -865,6 +865,23 @@ CODER_TOOLS: list[dict[str, Any]] = [
     if item["function"]["name"] in CODER_TOOL_NAMES
 ]
 
+
+BOT_RESTRICTED_TOOLS = frozenset(
+    {
+        "get_chat_history",
+        "get_chat_history_in",
+        "list_chats",
+        "get_last_messages",
+        "search_messages",
+        "get_pinned_messages",
+    }
+)
+
+BOT_TOOLS: list[dict[str, Any]] = [
+    item for item in TOOLS if item["function"]["name"] not in BOT_RESTRICTED_TOOLS
+]
+
+
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
     {"run_subagent", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
 )

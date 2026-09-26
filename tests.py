@@ -2484,6 +2484,9 @@ class BotHandlerTest(BotTestCase):
             saved = getattr(userbot, attr)
             self.addCleanup(setattr, userbot, attr, saved)
             setattr(userbot, attr, value)
+        saved_username = bot.bot_username
+        self.addCleanup(setattr, bot, "bot_username", saved_username)
+        bot.bot_username = "danybot"
         self.saver = _FakeSaver()
         for attr, value in (("HISTORY_SAVER", self.saver),):
             saved = getattr(bot, attr)
@@ -2548,14 +2551,11 @@ class BotHandlerTest(BotTestCase):
         self._run(self._group_event("просто текст"))
         self.assertEqual(self.stream_calls, [])
 
-    def test_db_trigger_without_userbot(self):
+    def test_db_trigger_never_active(self):
         self._run(self._group_event(".db привет"))
-        self.assertEqual(len(self.stream_calls), 1)
-        self.assertIn("привет", self._prompt())
-
-    def test_db_trigger_disabled_with_userbot(self):
+        self.assertEqual(self.stream_calls, [])
         userbot.ENABLE_USERBOT = True
-        self._run(self._group_event(".db привет"))
+        self._run(self._group_event(".db привет", msg_id=91))
         self.assertEqual(self.stream_calls, [])
 
     def test_mention_triggers(self):
@@ -2599,7 +2599,7 @@ class BotHandlerTest(BotTestCase):
         saved_limit = userbot.MAX_REQUEST_LEN
         self.addCleanup(setattr, userbot, "MAX_REQUEST_LEN", saved_limit)
         userbot.MAX_REQUEST_LEN = 40
-        self._run(self._group_event(".db " + "я" * 100 + "ХВОСТ"))
+        self._run(self._group_event("@danybot " + "я" * 100 + "ХВОСТ"))
         self.assertNotIn("ХВОСТ", self._prompt())
 
     def test_mention_only_prompt_returns_early(self):
@@ -2611,28 +2611,28 @@ class BotHandlerTest(BotTestCase):
 
     def test_cooldown_blocks_second_message(self):
         userbot.COOLDOWN = 60
-        event1 = self._group_event(".db первый", msg_id=10)
+        event1 = self._group_event("@danybot первый", msg_id=10)
         self._run(event1)
-        event2 = self._group_event(".db второй", msg_id=11)
+        event2 = self._group_event("@danybot второй", msg_id=11)
         self._run(event2)
         self.assertEqual(len(self.stream_calls), 1)
 
     def test_duplicate_message_id_skipped(self):
-        event = self._group_event(".db привет", msg_id=42)
+        event = self._group_event("@danybot привет", msg_id=42)
         self._run(event)
         bot.recent_reply_ids.add(42)
-        self._run(self._group_event(".db привет", msg_id=42))
+        self._run(self._group_event("@danybot привет", msg_id=42))
         self.assertEqual(len(self.stream_calls), 1)
 
     def test_coder_mode_uses_coder_tools(self):
         bot.coder_chats.add(self.GROUP)
-        self._run(self._group_event(".db привет", sender_id=self.OWNER))
+        self._run(self._group_event("@danybot привет", sender_id=self.OWNER))
         self.assertTrue(self.stream_calls)
         bot.coder_chats.clear()
 
     def test_model_override_used(self):
         bot.model_overrides[self.GROUP] = "custom-model"
-        self._run(self._group_event(".db привет"))
+        self._run(self._group_event("@danybot привет"))
         self.assertEqual(self._model(), "custom-model")
 
     def test_stream_error_reports_to_user(self):
@@ -2642,12 +2642,12 @@ class BotHandlerTest(BotTestCase):
         saved = core.stream_answer
         self.addCleanup(setattr, core, "stream_answer", saved)
         core.stream_answer = failing_stream
-        event = self._group_event(".db привет")
+        event = self._group_event("@danybot привет")
         self._run(event)
         self.assertIn("Ошибка", event.sent[0])
 
     def test_history_saver_marked_dirty(self):
-        self._run(self._group_event(".db привет"))
+        self._run(self._group_event("@danybot привет"))
         self.assertGreaterEqual(self.saver.dirty, 1)
 
     def test_help_command_for_owner(self):
@@ -2901,19 +2901,20 @@ class CoderModeTest(BotTestCase):
     def test_bot_handler_uses_coder_tools(self):
         source = Path("bot.py").read_text(encoding="utf-8")
         self.assertIn(
-            "tools_module.CODER_TOOLS if coder_active else userbot.TOOLS", source
+            "tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS",
+            source,
         )
         self.assertIn('mode = "coder" if coder_active else "bot"', source)
 
-    def test_db_trigger_only_without_userbot(self):
+    def test_db_trigger_never_active(self):
         saved = userbot.ENABLE_USERBOT
         self.addCleanup(setattr, userbot, "ENABLE_USERBOT", saved)
         userbot.ENABLE_USERBOT = True
         self.assertFalse(bot._db_triggered(".db привет"))
         self.assertFalse(bot._db_triggered(".ai привет"))
         userbot.ENABLE_USERBOT = False
-        self.assertTrue(bot._db_triggered(".db привет"))
-        self.assertTrue(bot._db_triggered("привет .ai"))
+        self.assertFalse(bot._db_triggered(".db привет"))
+        self.assertFalse(bot._db_triggered("привет .ai"))
         self.assertFalse(bot._db_triggered("привет"))
         self.assertFalse(bot._db_triggered(None))
 
