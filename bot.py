@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import hashlib
 import logging
 import re
 import time
@@ -456,12 +457,25 @@ def _model_rows(chat_id):
 
 
 def _pick_data(name: str) -> bytes:
-    return f"settings:pick:{name}".encode()[:CALLBACK_MAX_BYTES]
+    raw = f"settings:pick:{name}".encode()
+    if len(raw) <= CALLBACK_MAX_BYTES:
+        return raw
+    return f"settings:pick:#{_model_digest(name)}".encode()
+
+
+def _model_digest(name: str) -> str:
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
 def _resolve_picked_model(arg: str) -> str:
+    if arg.startswith("#"):
+        digest = arg[1:]
+        for name in userbot.MODELS:
+            if _model_digest(name).startswith(digest):
+                return name
+        return arg
     for name in userbot.MODELS:
-        if name == arg or name.startswith(arg):
+        if name == arg:
             return name
     return arg
 

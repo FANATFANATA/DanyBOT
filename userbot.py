@@ -160,6 +160,8 @@ OWNER_IDS = _env_id_set("OWNER_IDS")
 
 REPLY_ATTEMPTS = 3
 
+SANITIZED_TOOLS = ("run_shell", "execute_script")
+
 
 def _read_extra_system(path):
     if not path:
@@ -641,11 +643,7 @@ async def stream_with_tools(
             result = await execute_tool(
                 slot["name"], args, chat_id, client_override, stats, unrestricted
             )
-            if (
-                slot["name"] in ("run_shell", "execute_script", "run_subagent")
-                and sanitize_tools
-                and not unrestricted
-            ):
+            if slot["name"] in SANITIZED_TOOLS and sanitize_tools and not unrestricted:
                 result = await sanitize_tool_output(result, model)
             return slot, result
 

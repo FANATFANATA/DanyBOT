@@ -70,7 +70,10 @@ TOOL_ERRORS: tuple[type[BaseException], ...] = (
     RuntimeError,
     RecursionError,
     MemoryError,
+    OverflowError,
+    EOFError,
     sqlite3.Error,
+    httpx.HTTPError,
 )
 
 
@@ -737,45 +740,56 @@ async def _kill_process(proc) -> None:
         await proc.wait()
 
 
-async def _read_capped(reader, cap: int) -> tuple[bytes, bool]:
-    chunks: list[bytes] = []
-    total = 0
-    while total < cap:
-        chunk = await reader.read(min(65536, cap - total))
+class _OutputSink:
+    def __init__(self, cap: int):
+        self.cap = cap
+        self.size = 0
+        self.truncated = False
+        self.parts: list[bytes] = []
+
+    def feed(self, chunk: bytes) -> None:
+        if self.truncated:
+            return
+        room = self.cap - self.size
+        if len(chunk) >= room:
+            self.parts.append(chunk[:room])
+            self.size = self.cap
+            self.truncated = True
+            return
+        self.parts.append(chunk)
+        self.size += len(chunk)
+
+    def text(self) -> str:
+        return b"".join(self.parts).decode("utf-8", errors="replace")
+
+
+async def _drain(reader, sink: _OutputSink) -> None:
+    while True:
+        chunk = await reader.read(65536)
         if not chunk:
-            return b"".join(chunks), False
-        chunks.append(chunk)
-        total += len(chunk)
-    return b"".join(chunks), True
+            return
+        sink.feed(chunk)
+
+
+def _exit_code(proc) -> int:
+    return proc.returncode if proc.returncode is not None else -1
 
 
 async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str, str]:
+    out = _OutputSink(cap)
+    err = _OutputSink(cap)
+    drain = asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
     try:
-        results = await asyncio.wait_for(
-            asyncio.gather(
-                _read_capped(proc.stdout, cap),
-                _read_capped(proc.stderr, cap),
-            ),
-            timeout=timeout,
-        )
+        await asyncio.wait_for(drain, timeout=timeout)
     except asyncio.TimeoutError:
         await _kill_process(proc)
-        return -1, "", "", f"Таймаут {timeout}s: команда прервана."
-    (out, out_cut), (err, err_cut) = results
+        return -1, out.text(), err.text(), f"Таймаут {timeout}s: команда прервана."
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), timeout=5)
     note = ""
-    if out_cut or err_cut:
-        await _kill_process(proc)
+    if out.truncated or err.truncated:
         note = "Вывод обрезан."
-    else:
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(proc.wait(), timeout=5)
-    rc = proc.returncode if proc.returncode is not None else -1
-    return (
-        rc,
-        out.decode("utf-8", errors="replace"),
-        err.decode("utf-8", errors="replace"),
-        note,
-    )
+    return _exit_code(proc), out.text(), err.text(), note
 
 
 def _format_process_result(rc: int, out: str, err: str) -> str:
@@ -814,9 +828,8 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
     except OSError as exc:
         return f"Ошибка запуска: {exc}"
     rc, out, err_out, note = await _collect_process(proc, timeout, MAX_PROCESS_BYTES)
-    if note:
-        return note
-    return _format_process_result(rc, out, err_out)[:MAX_SHELL_OUTPUT]
+    result = _format_process_result(rc, out, err_out)[:MAX_SHELL_OUTPUT]
+    return f"{result}\n{note}" if note else result
 
 
 _httpx_singleton = None
@@ -1250,9 +1263,8 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
         if script_path is not None:
             with contextlib.suppress(OSError):
                 script_path.unlink()
-    if note:
-        return note
-    return _clip(_format_process_result(rc, out, err_out), MAX_SCRIPT_OUTPUT)
+    result = _clip(_format_process_result(rc, out, err_out), MAX_SCRIPT_OUTPUT)
+    return f"{result}\n{note}" if note else result
 
 
 async def _tool_memory_remember(arguments, chat_id, client, stats, unrestricted=False):

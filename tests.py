@@ -222,20 +222,27 @@ class FakeClient:
 class StreamIter:
     def __init__(self, chunks):
         self._chunks = chunks
+        self.closed = 0
 
     async def __aiter__(self):
         for c in self._chunks:
             yield c
+
+    async def close(self):
+        self.closed += 1
 
 
 class FakeCompletions:
     def __init__(self, rounds):
         self._rounds = [list(r) for r in rounds]
         self.calls = []
+        self.streams = []
 
     async def create(self, **kwargs):
         self.calls.append(kwargs)
-        return StreamIter(self._rounds.pop(0))
+        stream = StreamIter(self._rounds.pop(0))
+        self.streams.append(stream)
+        return stream
 
 
 class FakeAI:
@@ -1421,6 +1428,40 @@ class StreamToolsTest(BotTestCase):
         )
         self.assertEqual(answer, "первый второй")
 
+    def test_stream_is_closed_after_completion(self):
+        fake_ai = self.install_ai([[make_chunk(make_delta(content="ok"))]])
+        asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        streams = fake_ai.chat.completions.streams
+        self.assertTrue(streams)
+        self.assertTrue(all(s.closed >= 1 for s in streams))
+
+    def test_stream_is_closed_after_error(self):
+        fake_ai = self.install_ai([[make_chunk(make_delta(content="ok"))]])
+
+        async def boom(_p):
+            raise RuntimeError("edit failed")
+
+        with self.assertRaises(RuntimeError):
+            asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    boom,
+                    lambda p: self.collect([], p),
+                )
+            )
+        streams = fake_ai.chat.completions.streams
+        self.assertTrue(all(s.closed >= 1 for s in streams))
+
 
 class LastDecisionTest(BotTestCase):
     def test_empty_text(self):
@@ -1810,6 +1851,17 @@ class ExtraToolsTest(BotTestCase):
         self.assertIn("Ошибка инструмента evaluate", out)
         self.assertIn("tool down", out)
 
+    def test_execute_tool_captures_network_error(self):
+        import httpx
+
+        async def boom(arguments, chat_id, client, stats, unrestricted=False):
+            raise httpx.HTTPError("connection reset")
+
+        with mock.patch.dict(tools_module._HANDLERS, {"fetch_url": boom}):
+            out = self._run("fetch_url", {"url": "https://93.184.216.34/"})
+        self.assertIn("Ошибка инструмента fetch_url", out)
+        self.assertIn("connection reset", out)
+
     def test_execute_tool_unknown_name(self):
         self.assertEqual(self._run("nope", {}), "Неизвестная функция: nope")
 
@@ -1825,6 +1877,39 @@ class ExtraToolsTest(BotTestCase):
     def test_search_files_rejects_long_pattern(self):
         out = self._run("search_files", {"pattern": "a" * 500})
         self.assertIn("Слишком длинный pattern", out)
+
+    def test_output_over_cap_is_drained_and_marked(self):
+        with mock.patch.object(tools_module, "MAX_PROCESS_BYTES", 64):
+            out = self._run(
+                "run_shell",
+                {"command": f'"{sys.executable}" -c "print(chr(65)*4096)"'},
+            )
+        self.assertIn("rc=0", out)
+        self.assertIn("A" * 60, out)
+        self.assertIn("Вывод обрезан.", out)
+
+    def test_output_over_cap_keeps_exit_code(self):
+        with mock.patch.object(tools_module, "MAX_PROCESS_BYTES", 64):
+            out = self._run(
+                "execute_script",
+                {"code": "print('B' * 4096)\nraise SystemExit(3)"},
+            )
+        self.assertIn("Вывод обрезан.", out)
+        self.assertTrue(out.startswith("rc=3") or "\nrc=3" in out)
+
+    def test_timeout_returns_partial_output(self):
+        out = self._run(
+            "run_shell",
+            {
+                "command": (
+                    f'"{sys.executable}" -u -c "print(chr(67)*200);import time;'
+                    'time.sleep(30)"'
+                ),
+                "timeout": 1,
+            },
+        )
+        self.assertIn("C" * 100, out)
+        self.assertIn("Таймаут 1s", out)
 
 
 class CoreHelpersTest(BotTestCase):
