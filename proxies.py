@@ -43,6 +43,8 @@ VALIDATION_ERRORS = (
     struct.error,
 )
 
+_credentials_warned = False
+
 SOURCES = [
     (
         "socks5",
@@ -187,10 +189,13 @@ def telethon_to_item(proxy_dict):
 
 
 async def validate_one_mtproto(proxy_dict, timeout=12):
+    global _credentials_warned
     if not VALIDATE_API_ID or not VALIDATE_API_HASH:
-        logger.warning(
-            "Пропускаю проверку прокси: не заданы VALIDATE_API_ID/VALIDATE_API_HASH"
-        )
+        if not _credentials_warned:
+            _credentials_warned = True
+            logger.warning(
+                "Пропускаю проверку прокси: не заданы VALIDATE_API_ID/VALIDATE_API_HASH"
+            )
         return False
     tmp = TelegramClient(
         MemorySession(),

@@ -34,7 +34,8 @@ _initialized: set[str] = set()
 
 
 def _connect():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if not DATA_DIR.is_dir():
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     key = str(DB_PATH)

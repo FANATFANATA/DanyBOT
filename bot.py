@@ -437,7 +437,8 @@ def _settings_rows(chat_id):
         ],
         [
             Button.inline(
-                f"Кодер-режим: {_state_label(chat_id, coder_chats)}", b"settings:coder"
+                f"Кодер-режим: {_on_off_label(chat_id, coder_chats)}",
+                b"settings:coder",
             )
         ],
         [Button.inline("Очистить контекст", b"settings:clear")],
@@ -488,6 +489,10 @@ def _state_label(chat_id, hidden) -> str:
     return "скрыто" if chat_id in hidden else "видно"
 
 
+def _on_off_label(chat_id, active) -> str:
+    return "вкл" if chat_id in active else "выкл"
+
+
 def _settings_text(chat_id):
     limit = userbot.DM_HISTORY_LIMIT if chat_id > 0 else userbot.GROUP_HISTORY_LIMIT
     ctx_len = len(chat_history.get(chat_id, deque()))
@@ -496,8 +501,7 @@ def _settings_text(chat_id):
         f"Модель / Model: {_current_model_label(chat_id)}\n"
         f"Рассуждения / Reasoning: {_state_label(chat_id, reasoning_hidden)}\n"
         f"Инструменты / Tools: {_state_label(chat_id, tools_hidden)}\n"
-        f"Кодер-режим / Coder: "
-        f"{'вкл' if is_coder(chat_id) else 'выкл'}\n"
+        f"Кодер-режим / Coder: {_on_off_label(chat_id, coder_chats)}\n"
         f"Контекст / Context: {ctx_len}/{limit}"
     )
 
@@ -670,6 +674,8 @@ async def start_bot():
 
 
 async def disconnect_quietly(timeout=10):
+    with contextlib.suppress(Exception):
+        await HISTORY_SAVER.flush()
     if bot_client is None:
         return
     with contextlib.suppress(Exception):

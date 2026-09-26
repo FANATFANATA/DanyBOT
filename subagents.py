@@ -92,6 +92,34 @@ def _loads(raw):
     return value if isinstance(value, dict) else {}
 
 
+async def _call_tool(
+    tools_module,
+    verifier,
+    name,
+    arguments,
+    use_model,
+    chat_id,
+    client,
+    stats,
+    allowed,
+    verify,
+):
+    if verifier is not None and verify:
+        try:
+            approved = await verifier(name, arguments, use_model)
+        except (OSError, ValueError, TypeError):
+            approved = False
+        if not approved:
+            return name, "Вызов отклонён проверкой безопасности.", False
+    try:
+        output = await tools_module.execute_tool(
+            name, arguments, chat_id, client, stats, False, allowed
+        )
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        output = f"Ошибка инструмента {name}: {exc}"
+    return name, str(output)[:MAX_TOOL_RESULT], True
+
+
 def _assistant_message(content, tool_calls):
     calls = []
     for tc in tool_calls:
@@ -189,44 +217,83 @@ async def run_subagent(
             return result
 
         messages.append(_assistant_message(content, tool_calls))
+        calls = []
         for tc in tool_calls:
             function = getattr(tc, "function", None)
-            name = getattr(function, "name", "") or ""
-            arguments = _loads(getattr(function, "arguments", ""))
-            call_id = getattr(tc, "id", "") or ""
-            if verifier is not None:
-                allowed = True
-                if verify:
-                    try:
-                        allowed = await verifier(name, arguments, use_model)
-                    except (OSError, ValueError, TypeError):
-                        allowed = False
-                if not allowed:
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": "Вызов отклонён проверкой безопасности.",
-                        }
-                    )
-                    continue
-            try:
-                output = await tools_module.execute_tool(
-                    name, arguments, chat_id, client, tool_stats, False, allowed
+            calls.append(
+                (
+                    getattr(tc, "id", "") or "",
+                    getattr(function, "name", "") or "",
+                    _loads(getattr(function, "arguments", "")),
                 )
-            except (OSError, ValueError, TypeError, RuntimeError) as exc:
-                output = f"Ошибка инструмента {name}: {exc}"
-            result["tools_used"].append(name)
+            )
+        outcomes = await asyncio.gather(
+            *(
+                _call_tool(
+                    tools_module,
+                    verifier,
+                    name,
+                    arguments,
+                    use_model,
+                    chat_id,
+                    client,
+                    tool_stats,
+                    allowed,
+                    verify,
+                )
+                for _call_id, name, arguments in calls
+            ),
+            return_exceptions=True,
+        )
+        for (call_id, name, _arguments), outcome in zip(calls, outcomes):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if isinstance(outcome, BaseException):
+                logger.warning(
+                    "Субагент %s: сбой инструмента %s: %r", subagent_name, name, outcome
+                )
+                content_text = f"Ошибка инструмента {name}: {outcome}"
+            else:
+                name, content_text, ran = outcome
+                if ran:
+                    result["tools_used"].append(name)
             messages.append(
                 {
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": str(output)[:MAX_TOOL_RESULT],
+                    "content": content_text,
                 }
             )
 
     result["result"] = content.strip() or "Достигнут лимит шагов субагента."
     return result
+
+
+async def _gather_workers(fn, specs):
+    results = await asyncio.gather(
+        *(fn(spec) for spec in specs), return_exceptions=True
+    )
+    out = []
+    for spec, outcome in zip(specs, results):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "Субагент %s провалился: %r", spec.get("name", "universal"), outcome
+            )
+            out.append(
+                {
+                    "name": spec.get("name", "universal"),
+                    "task": spec.get("task", ""),
+                    "ok": False,
+                    "result": f"Ошибка субагента: {outcome}",
+                    "rounds": 0,
+                    "tools_used": [],
+                }
+            )
+            continue
+        out.append(outcome)
+    return out
 
 
 async def run_subagents(
@@ -272,7 +339,7 @@ async def run_subagents(
         )
 
     if limit is None:
-        return await asyncio.gather(*(worker(spec) for spec in specs))
+        return await _gather_workers(worker, specs)
 
     semaphore = asyncio.Semaphore(max(1, int(limit)))
 
@@ -280,4 +347,4 @@ async def run_subagents(
         async with semaphore:
             return await worker(spec)
 
-    return await asyncio.gather(*(gated(spec) for spec in specs))
+    return await _gather_workers(gated, specs)

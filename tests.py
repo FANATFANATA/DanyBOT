@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -697,6 +698,18 @@ class ValidateOneMtprotoTest(BotTestCase):
             ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
         self.assertFalse(ok)
 
+    def test_missing_credentials_warn_once(self):
+        saved = proxies._credentials_warned
+        proxies._credentials_warned = False
+        self.addCleanup(setattr, proxies, "_credentials_warned", saved)
+        proxies.VALIDATE_API_ID = 0
+        proxies.VALIDATE_API_HASH = ""
+        with self.assertLogs("danybot.proxy", level="WARNING") as captured:
+            for _ in range(3):
+                asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
+        marks = [line for line in captured.output if "VALIDATE_API_ID" in line]
+        self.assertEqual(len(marks), 1)
+
     @staticmethod
     def broken_client_factory(exc):
         class BrokenClient:
@@ -908,6 +921,27 @@ class HistoryRoundtripTest(BotTestCase):
         userbot.chat_history = {}
         userbot.load_history()
         self.assertEqual(userbot.chat_history, {})
+
+    def test_non_list_values_skipped(self):
+        userbot.HISTORY_FILE.write_text(
+            json.dumps(
+                {
+                    "1": 5,
+                    "2": "abc",
+                    "3": [{"role": "user", "content": "x"}],
+                    "4": None,
+                }
+            ),
+            encoding="utf-8",
+        )
+        userbot.chat_history = {}
+        userbot.load_history()
+        self.assertNotIn(1, userbot.chat_history)
+        self.assertNotIn(2, userbot.chat_history)
+        self.assertNotIn(4, userbot.chat_history)
+        self.assertEqual(
+            list(userbot.chat_history[3]), [{"role": "user", "content": "x"}]
+        )
 
 
 class ModelsTextTest(BotTestCase):
@@ -1856,6 +1890,10 @@ class ExtraToolsTest(BotTestCase):
                 self._run("fetch_url", {"url": "https://93.184.216.34/"}), "Hi"
             )
 
+    def test_fetch_url_rejects_bad_port(self):
+        out = self._run("fetch_url", {"url": "http://93.184.216.34:99999/"})
+        self.assertIn("Некорректный порт", out)
+
     def test_fetch_url_blocks_private_targets(self):
         for url in (
             "http://127.0.0.1:8008/v1/models",
@@ -1934,6 +1972,16 @@ class ExtraToolsTest(BotTestCase):
 
     def test_tool_names_of_ignores_broken_schema(self):
         self.assertEqual(tools_module.tool_names_of([{"nope": 1}, "x"]), set())
+        self.assertEqual(
+            tools_module.tool_names_of(
+                [{"function": "x"}, {"function": {}}, {"function": {"name": 1}}, None]
+            ),
+            set(),
+        )
+        self.assertEqual(
+            tools_module.tool_names_of([{"function": {"name": "get_time"}}]),
+            {"get_time"},
+        )
 
     def test_memory_and_skill_tools_work_through_threads(self):
         tmp = Path(tempfile.mkdtemp(prefix="danybot_tools_store_"))
@@ -2426,6 +2474,37 @@ class CoreHelpersTest(BotTestCase):
         self.assertEqual(parsed["reasoning_hidden"], {2})
         self.assertEqual(parsed["tools_hidden"], {3})
 
+    def test_parse_state_data_coerces_model_to_text(self):
+        parsed = core.parse_state_data({"model_overrides": {"1": 5}})
+        self.assertEqual(parsed["model_overrides"], {1: "5"})
+
+    def test_async_saver_mark_dirty_without_loop(self):
+        saver = core.AsyncSaver(lambda: None)
+        saver.mark_dirty()
+        self.assertTrue(saver._dirty)
+        self.assertIsNone(saver._task)
+
+    @unittest.skipUnless(os.name == "posix", "права файла задаёт только posix")
+    def test_atomic_write_keeps_file_mode(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_mode_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "state.json"
+        target.write_text("{}", encoding="utf-8")
+        os.chmod(target, 0o600)
+        self.assertTrue(
+            core.save_state_file(
+                target,
+                {
+                    "model_overrides": {},
+                    "coder_chats": set(),
+                    "reasoning_hidden": set(),
+                    "tools_hidden": set(),
+                },
+            )
+        )
+        self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in tmp.iterdir()], ["state.json"])
+
 
 class ContractPromptTest(BotTestCase):
     CHAT_ID = 7591254790
@@ -2528,7 +2607,7 @@ class ContractPromptTest(BotTestCase):
         rows = bot._settings_rows(self.CHAT_ID)
         data = {btn_data(btn) for row in rows for btn in row}
         self.assertIn("settings:prompt", data)
-        source = Path("bot.py").read_text(encoding="utf-8")
+        source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
         menu_block = source[
             source.index("SetBotCommandsRequest") : source.index(
                 "]", source.index("SetBotCommandsRequest")
@@ -3139,12 +3218,12 @@ class CoderModeTest(BotTestCase):
         self.assertFalse(bot.coder_active_for(self.CHAT_ID + 1, self.CHAT_ID))
 
     def test_userbot_handler_does_not_switch_to_coder(self):
-        source = Path("userbot.py").read_text(encoding="utf-8")
+        source = (PROJECT_DIR / "userbot.py").read_text(encoding="utf-8")
         self.assertNotIn("CODER_TOOLS if", source)
         self.assertNotIn('mode="coder"', source)
 
     def test_menu_covers_every_help_command(self):
-        source = Path("bot.py").read_text(encoding="utf-8")
+        source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
         start = source.index("SetBotCommandsRequest")
         menu_block = source[start : source.index("]", start)]
         menu = {
@@ -3160,7 +3239,7 @@ class CoderModeTest(BotTestCase):
             self.assertIn(name, menu)
 
     def test_bot_handler_uses_coder_tools(self):
-        source = Path("bot.py").read_text(encoding="utf-8")
+        source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
         self.assertIn(
             "tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS",
             source,
@@ -3439,6 +3518,29 @@ class SettingsMenuTest(BotTestCase):
         self.assertIn("Кодер-режим", text)
         self.assertIn("вкл", text)
 
+    def _coder_button_text(self):
+        rows = bot._settings_rows(self.CHAT_ID)
+        return next(
+            btn.text for row in rows for btn in row if btn_data(btn) == "settings:coder"
+        )
+
+    def test_coder_button_shows_on_off(self):
+        bot.coder_chats.discard(self.CHAT_ID)
+        self.assertIn("выкл", self._coder_button_text())
+        bot.coder_chats.add(self.CHAT_ID)
+        self.assertIn("вкл", self._coder_button_text())
+
+    def test_visibility_buttons_stay_visibility_wording(self):
+        bot.reasoning_hidden.discard(self.CHAT_ID)
+        rows = bot._settings_rows(self.CHAT_ID)
+        text = next(
+            btn.text
+            for row in rows
+            for btn in row
+            if btn_data(btn) == "settings:reasoning"
+        )
+        self.assertIn("видно", text)
+
 
 class UserbotHelpersTest(BotTestCase):
     def test_registry_helpers_are_gone(self):
@@ -3574,6 +3676,27 @@ class BotModuleTest(BotTestCase):
         with mock.patch.object(bot, "get_bot_client", RichFakeClient):
             self.assertTrue(asyncio.run(bot.edit_text(1, 2, "t")))
 
+    def test_disconnect_quietly_flushes_history(self):
+        flushed = []
+
+        class _Saver:
+            def mark_dirty(self):
+                pass
+
+            async def flush(self):
+                flushed.append(1)
+
+        saved_saver = bot.HISTORY_SAVER
+        saved_client = bot.bot_client
+        bot.HISTORY_SAVER = _Saver()
+        bot.bot_client = None
+        try:
+            asyncio.run(bot.disconnect_quietly())
+        finally:
+            bot.HISTORY_SAVER = saved_saver
+            bot.bot_client = saved_client
+        self.assertEqual(flushed, [1])
+
 
 class SubagentsTest(BotTestCase):
     def setUp(self):
@@ -3602,6 +3725,39 @@ class SubagentsTest(BotTestCase):
                     return SimpleNamespace(choices=[SimpleNamespace(message=message)])
 
             self.chat = SimpleNamespace(completions=_Completions(self))
+
+    class _ToolAI:
+        def __init__(self, rounds):
+            self._rounds = [list(r) for r in rounds]
+            self.seen = []
+            outer = self
+
+            class _Completions:
+                async def create(self, **kwargs):
+                    outer.seen.append(kwargs["messages"])
+                    content, tool_calls = outer._rounds.pop(0)
+                    message = SimpleNamespace(content=content, tool_calls=tool_calls)
+                    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+
+            self.chat = SimpleNamespace(completions=_Completions())
+
+    @staticmethod
+    def _tool_call(call_id, name, arguments):
+        return SimpleNamespace(
+            id=call_id, function=SimpleNamespace(name=name, arguments=arguments)
+        )
+
+    @staticmethod
+    def _tool_messages(ai):
+        return [m for m in ai.seen[-1] if m.get("role") == "tool"]
+
+    @staticmethod
+    async def _allow(name, arguments, model):
+        return True
+
+    @staticmethod
+    async def _deny(name, arguments, model):
+        return False
 
     def test_configure_and_is_configured(self):
         subagents.configure(ai=object(), model="m", enabled=True)
@@ -3647,6 +3803,139 @@ class SubagentsTest(BotTestCase):
         subagents.configure(ai=self._AI("r"), model="m", verifier=None, enabled=True)
         results = asyncio.run(subagents.run_subagents(["a", "b"], concurrency=2))
         self.assertEqual(len(results), 2)
+
+    def test_tool_runs_when_verifier_allows(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"2+2"}')]),
+                ("итог 4", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай 2+2", verify=True))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["result"], "итог 4")
+        self.assertEqual(result["tools_used"], ["evaluate"])
+        self.assertEqual(self._tool_messages(ai)[0]["content"], "4")
+
+    def test_tool_blocked_when_verifier_denies(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"2+2"}')]),
+                ("не буду", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._deny, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай 2+2", verify=True))
+        self.assertEqual(result["tools_used"], [])
+        self.assertEqual(
+            self._tool_messages(ai)[0]["content"],
+            "Вызов отклонён проверкой безопасности.",
+        )
+
+    def test_tool_runs_without_verifier(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"3*3"}')]),
+                ("девять", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=None, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай 3*3"))
+        self.assertEqual(self._tool_messages(ai)[0]["content"], "9")
+        self.assertEqual(result["tools_used"], ["evaluate"])
+
+    def test_several_tools_in_one_round_keep_order(self):
+        ai = self._ToolAI(
+            [
+                (
+                    "",
+                    [
+                        self._tool_call("c1", "evaluate", '{"expression":"1+1"}'),
+                        self._tool_call("c2", "get_time", "{}"),
+                    ],
+                ),
+                ("готово", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай и дай время"))
+        messages = self._tool_messages(ai)
+        self.assertEqual([m["tool_call_id"] for m in messages], ["c1", "c2"])
+        self.assertEqual(messages[0]["content"], "2")
+        self.assertIn("utc", messages[1]["content"])
+        self.assertEqual(result["tools_used"], ["evaluate", "get_time"])
+
+    def test_broken_tool_arguments_do_not_stop_round(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", "не json")]),
+                ("готово", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай"))
+        self.assertTrue(result["ok"])
+        self.assertIn("Ошибка вычисления", self._tool_messages(ai)[0]["content"])
+
+    def test_tool_outside_allowed_set_is_refused(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "read_file", '{"path":"x"}')]),
+                ("готово", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        result = asyncio.run(subagents.run_subagent("прочитай файл"))
+        self.assertEqual(result["tools_used"], ["read_file"])
+        self.assertIn("недоступен в этой сессии", self._tool_messages(ai)[0]["content"])
+
+    def test_verifier_crash_is_treated_as_denial(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"2+2"}')]),
+                ("готово", None),
+            ]
+        )
+
+        async def crash(name, arguments, model):
+            raise ValueError("verifier down")
+
+        subagents.configure(ai=ai, model="m", verifier=crash, enabled=True)
+        result = asyncio.run(subagents.run_subagent("посчитай 2+2"))
+        self.assertEqual(result["tools_used"], [])
+        self.assertIn("отклонён", self._tool_messages(ai)[0]["content"])
+
+    def test_failing_worker_does_not_kill_others(self):
+        async def explode(spec):
+            raise RuntimeError("subagent down")
+
+        async def fine(spec):
+            return {"name": "fine", "task": spec["task"], "ok": True}
+
+        async def run():
+            mixed = await subagents._gather_workers(
+                explode, [{"name": "bad", "task": "a"}, {"name": "bad", "task": "b"}]
+            )
+            healthy = await subagents._gather_workers(fine, [{"task": "c"}])
+            return mixed, healthy
+
+        mixed, healthy = asyncio.run(run())
+        self.assertEqual(len(mixed), 2)
+        self.assertTrue(all(not item["ok"] for item in mixed))
+        self.assertIn("Ошибка субагента", mixed[0]["result"])
+        self.assertTrue(healthy[0]["ok"])
+        self.assertEqual(healthy[0]["task"], "c")
+
+    def test_cancelled_worker_is_not_swallowed(self):
+        async def cancel(spec):
+            raise asyncio.CancelledError
+
+        async def run():
+            await subagents._gather_workers(cancel, [{"name": "a", "task": "t"}])
+
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(run())
 
 
 def run_unit_tests():

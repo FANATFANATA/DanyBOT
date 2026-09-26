@@ -963,7 +963,11 @@ async def _check_public_url(url: str) -> str:
     host = parsed.hostname
     if not host:
         return "URL без хоста."
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        return f"Некорректный порт в URL: {exc}"
+    port = port or (443 if parsed.scheme == "https" else 80)
     try:
         addrs = await _resolve_addrs(host, port)
     except (OSError, ValueError, UnicodeError) as exc:
@@ -1399,8 +1403,11 @@ async def execute_tool(
 
 
 def tool_names_of(schema) -> set:
-    return {
-        item["function"]["name"]
-        for item in schema
-        if isinstance(item, dict) and "function" in item
-    }
+    names = set()
+    for item in schema:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"])
+    return names

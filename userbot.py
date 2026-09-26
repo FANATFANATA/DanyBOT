@@ -2,7 +2,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import re
 import struct
 import sys
@@ -41,24 +40,24 @@ def strip_role_tag(text: str) -> str:
 
 
 API_ID = _env_int("API_ID", 0)
-API_HASH = os.getenv("API_HASH", "").strip()
-SESSION_NAME = os.getenv("SESSION_NAME", "session")
+API_HASH = _env_str("API_HASH", "")
+SESSION_NAME = _env_str("SESSION_NAME", "session")
 
-DANYAPI_URL = os.getenv("DANYAPI_URL", "http://127.0.0.1:8008/v1")
-DANYAPI_MODEL = os.getenv("DANYAPI_MODEL", "deepseek-v4.1-flash")
-DANYAPI_KEY = os.getenv("DANYAPI_KEY", "danyapi")
-SYSTEM_PROMPT = os.getenv(
+DANYAPI_URL = _env_str("DANYAPI_URL", "http://127.0.0.1:8008/v1")
+DANYAPI_MODEL = _env_str("DANYAPI_MODEL", "deepseek-v4.1-flash")
+DANYAPI_KEY = _env_str("DANYAPI_KEY", "danyapi")
+SYSTEM_PROMPT = _env_str(
     "SYSTEM_PROMPT",
     "Ты - DanyBOT, юзербот пользователя DanyaVoredom, работающий в Telegram. "
     "Отвечай максимально кратко и только по делу.",
 )
-SYSTEM_PROMPT_BOT = os.getenv(
+SYSTEM_PROMPT_BOT = _env_str(
     "SYSTEM_PROMPT_BOT",
     "Ты - DanyBOT, Telegram-бот. Отвечай максимально кратко и только по делу. "
     "Всегда отвечай на том языке, на котором написано последнее сообщение "
     "пользователя.",
 )
-TOOL_VERIFY_PROMPT = os.getenv(
+TOOL_VERIFY_PROMPT = _env_str(
     "TOOL_VERIFY_PROMPT",
     "Ты - система безопасности Telegram-бота. Тебе показывают вызов инструмента "
     "с аргументами. Оцени, безопасно ли его выполнять: не приведёт ли он к удалению "
@@ -70,7 +69,7 @@ TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
 VERIFY_TOKENS_SHELL = _env_int("VERIFY_TOKENS_SHELL", 1024)
 VERIFY_TOKENS_TOOL = _env_int("VERIFY_TOKENS_TOOL", 512)
 RUN_SHELL_MODEL = _env_str("RUN_SHELL_MODEL", "")
-RUN_SHELL_VERIFY_PROMPT = os.getenv(
+RUN_SHELL_VERIFY_PROMPT = _env_str(
     "RUN_SHELL_VERIFY_PROMPT",
     "Ты - система безопасности Telegram-бота. Тебе показывают вызов инструмента "
     "run_shell с shell-командой. Сначала рассуждай по шагам: что именно выполнит "
@@ -80,7 +79,7 @@ RUN_SHELL_VERIFY_PROMPT = os.getenv(
 )
 SANITIZE_ENABLED = _env_bool("SANITIZE_ENABLED", True)
 SANITIZE_MODEL = _env_str("SANITIZE_MODEL", "")
-SANITIZE_PROMPT = os.getenv(
+SANITIZE_PROMPT = _env_str(
     "SANITIZE_PROMPT",
     "Ты - фильтр секретов. Тебе дают вывод shell-команды. Сначала рассуждай по шагам, "
     "затем верни ТОЛЬКО очищенный текст: удали или замени на [REDACTED] приватные "
@@ -104,7 +103,7 @@ COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
 SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
 
-CODER_SYSTEM_PROMPT = os.getenv(
+CODER_SYSTEM_PROMPT = _env_str(
     "CODER_SYSTEM_PROMPT",
     "Ты - DanyBOT в режиме кодера и работаешь как автономный агент. "
     "Доступны инструменты read_file, write_file, edit_file, list_dir, "
@@ -412,15 +411,21 @@ async def execute_tool(
     name: str,
     arguments: dict,
     chat_id,
-    client=None,
+    tool_client=None,
     stats=None,
     unrestricted=False,
     allowed=None,
 ):
-    if client is None:
-        client = globals()["client"]
+    if tool_client is None:
+        tool_client = client
     return await tools_module.execute_tool(
-        name, arguments, chat_id, client, stats or _bot_stats, unrestricted, allowed
+        name,
+        arguments,
+        chat_id,
+        tool_client,
+        stats or _bot_stats,
+        unrestricted,
+        allowed,
     )
 
 
@@ -648,7 +653,7 @@ async def stream_with_tools(
                 and not unrestricted
                 and not await verify_tool_call(slot["name"], args, verify_model)
             ):
-                return slot, None
+                return None
             result = await execute_tool(
                 slot["name"],
                 args,
@@ -659,11 +664,18 @@ async def stream_with_tools(
                 allowed,
             )
             if slot["name"] in SANITIZED_TOOLS and sanitize_tools and not unrestricted:
-                result = await sanitize_tool_output(result, model)
-            return slot, result
+                return await sanitize_tool_output(result, model)
+            return result
 
-        results = await asyncio.gather(*(run_slot(s) for s in slots))
-        for slot, result in results:
+        results = await asyncio.gather(
+            *(run_slot(s) for s in slots), return_exceptions=True
+        )
+        for slot, result in zip(slots, results):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
+                logger.warning("Инструмент %s упал: %r", slot["name"], result)
+                result = f"Ошибка инструмента {slot['name']}: {result}"
             if result is None:
                 working.append(
                     {

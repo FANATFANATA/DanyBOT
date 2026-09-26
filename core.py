@@ -3,6 +3,7 @@ import contextlib
 import json
 import os
 import re
+import stat
 import time
 from collections import deque
 from collections.abc import Callable
@@ -10,6 +11,8 @@ from typing import Any
 
 from dotenv import load_dotenv
 from telethon.errors import FloodWaitError, RPCError
+
+load_dotenv()
 
 
 def _env_str(name: str, default: str) -> str:
@@ -225,7 +228,7 @@ def models_text(current: str, models) -> str:
 def parse_state_data(data):
     return {
         "model_overrides": {
-            int(k): v for k, v in data.get("model_overrides", {}).items()
+            int(k): str(v) for k, v in data.get("model_overrides", {}).items()
         },
         "coder_chats": {int(x) for x in data.get("coder_chats", [])},
         "reasoning_hidden": {int(x) for x in data.get("reasoning_hidden", [])},
@@ -246,6 +249,8 @@ def _write_text_atomic(path, text) -> bool:
     tmp = path.with_name(f"{path.name}.tmp")
     try:
         tmp.write_text(text, encoding="utf-8")
+        if path.is_file():
+            os.chmod(tmp, stat.S_IMODE(path.stat().st_mode))
         os.replace(tmp, path)
         return True
     except (OSError, TypeError, ValueError):
@@ -278,6 +283,8 @@ def load_history_file(path, dm_limit, group_limit):
         try:
             chat_id = int(key)
         except (ValueError, TypeError):
+            continue
+        if not isinstance(value, (list, tuple)):
             continue
         limit = dm_limit if chat_id > 0 else group_limit
         history[chat_id] = deque(value, maxlen=limit)
@@ -338,7 +345,8 @@ class AsyncSaver:
     def mark_dirty(self):
         self._dirty = True
         if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._run())
+            with contextlib.suppress(RuntimeError):
+                self._task = asyncio.create_task(self._run())
 
     async def _write(self) -> bool:
         try:
@@ -731,6 +739,3 @@ async def stream_answer(
     if error is not None:
         raise error
     return full_answer
-
-
-load_dotenv()
