@@ -181,10 +181,6 @@ class FakeClient:
         self.edited = []
         self.history_limits = []
 
-    async def send_message(self, chat, text):
-        self.sent.append((chat, text))
-        return SimpleNamespace(id=999)
-
     async def edit_message(self, chat, msg_id, text, **kwargs):
         self.edited.append((chat, msg_id, text))
         return True
@@ -209,15 +205,6 @@ class FakeClient:
             first_name="A",
             last_name="B",
         )
-
-    async def get_dialogs(self, limit=30):
-        return [
-            SimpleNamespace(
-                entity=SimpleNamespace(id=i, username=f"user{i}"),
-                name=f"name{i}",
-            )
-            for i in range(1, limit + 1)
-        ]
 
     async def get_me(self):
         return SimpleNamespace(
@@ -948,48 +935,6 @@ class ExecuteToolTest(BotTestCase):
         result = asyncio.run(userbot.execute_tool("nope", {}, -100))
         self.assertEqual(result, "Неизвестная функция: nope")
 
-    def test_send_message_to_guards(self):
-        empty = asyncio.run(userbot.execute_tool("send_message_to", {}, -100))
-        self.assertEqual(empty, "Нужны chat и text.")
-        ok = asyncio.run(
-            userbot.execute_tool(
-                "send_message_to", {"chat": "@me", "text": "hello"}, -100
-            )
-        )
-        self.assertEqual(ok, "Сообщение отправлено.")
-        self.assertEqual(self.fake_client.sent, [("@me", "hello")])
-
-    def test_edit_message_guard_and_call(self):
-        empty = asyncio.run(
-            userbot.execute_tool("edit_message", {"message_id": 1, "text": ""}, -100)
-        )
-        self.assertEqual(empty, "Пустой текст.")
-        ok = asyncio.run(
-            userbot.execute_tool("edit_message", {"message_id": 5, "text": "new"}, -100)
-        )
-        self.assertEqual(ok, "Сообщение отредактировано.")
-        self.assertEqual(self.fake_client.edited, [(-100, 5, "new")])
-
-    def test_get_chat_history_formatting_and_clamp(self):
-        result = asyncio.run(
-            userbot.execute_tool("get_chat_history", {"limit": 150}, -100)
-        )
-        self.assertEqual(self.fake_client.history_limits[-1], 100)
-        lines = result.splitlines()
-        self.assertEqual(len(lines), 100)
-        self.assertEqual(lines[0], "[1] 1: t1")
-        self.assertEqual(lines[-1], "[100] 1: t100")
-
-    def test_get_message_by_id_found_and_missing(self):
-        found = asyncio.run(
-            userbot.execute_tool("get_message_by_id", {"message_id": 42}, -100)
-        )
-        self.assertEqual(found, "found")
-        missing = asyncio.run(
-            userbot.execute_tool("get_message_by_id", {"message_id": 43}, -100)
-        )
-        self.assertEqual(missing, "Сообщение не найдено.")
-
     def test_get_chat_info_json(self):
         result = asyncio.run(userbot.execute_tool("get_chat_info", {}, -100))
         data = json.loads(result)
@@ -1010,12 +955,6 @@ class ExecuteToolTest(BotTestCase):
             userbot.execute_tool("get_user_info", {"handle": ""}, -100)
         )
         self.assertEqual(result, "Пустой handle.")
-
-    def test_list_chats_labels(self):
-        result = asyncio.run(userbot.execute_tool("list_chats", {"limit": 3}, -100))
-        lines = result.splitlines()
-        self.assertEqual(len(lines), 3)
-        self.assertTrue(lines[0].startswith("1: name1 (@user1)"))
 
     def test_get_profile_json(self):
         result = asyncio.run(userbot.execute_tool("get_profile", {}, -100))
@@ -1120,30 +1059,14 @@ class SystemForModeTest(BotTestCase):
     def test_tools_has_all_required(self):
         names = {t["function"]["name"] for t in userbot.TOOLS}
         for required in (
-            "get_chat_history",
-            "list_chats",
-            "send_message_to",
-            "get_chat_history_in",
             "evaluate",
             "get_chat_info",
             "get_user_info",
-            "edit_message",
-            "get_message_by_id",
             "get_profile",
             "run_shell",
             "web_search",
             "fetch_url",
             "run_subagent",
-            "pin_message",
-            "unpin_message",
-            "get_pinned_messages",
-            "react_to_message",
-            "get_last_messages",
-            "search_messages",
-            "send_message",
-            "delete_message",
-            "forward_message",
-            "create_poll",
             "get_time",
             "text_stats",
             "get_bot_stats",
@@ -1641,36 +1564,11 @@ class FlakyEditClient(FakeClient):
 class RichFakeClient(FakeClient):
     def __init__(self):
         super().__init__()
-        self.pinned = []
-        self.unpinned = []
-        self.deleted = []
-        self.forwarded = []
-        self.files = []
         self.requests = []
-
-    async def pin_message(self, chat, msg_id, notify=False):
-        self.pinned.append((chat, msg_id, notify))
-
-    async def unpin_message(self, chat, msg_id):
-        self.unpinned.append((chat, msg_id))
-
-    async def delete_messages(self, chat, ids):
-        self.deleted.append((chat, list(ids)))
-
-    async def forward_messages(self, target, msg_id, from_chat):
-        self.forwarded.append((target, msg_id, from_chat))
-
-    async def send_file(self, chat, file):
-        self.files.append((chat, file))
 
     async def __call__(self, request):
         self.requests.append(request)
         return SimpleNamespace()
-
-    async def get_messages(self, chat, limit=20, ids=None, filter=None, search=None):
-        if filter is not None:
-            return [SimpleNamespace(id=5, sender_id=1, message="pinned")]
-        return await super().get_messages(chat, limit=limit, ids=ids)
 
 
 class _FakeResp:
@@ -1730,95 +1628,6 @@ class ExtraToolsTest(BotTestCase):
 
     def _run(self, name, args):
         return asyncio.run(userbot.execute_tool(name, args, self.CHAT_ID))
-
-    def test_get_chat_history_in_guard_and_ok(self):
-        self.assertEqual(self._run("get_chat_history_in", {}), "Пустой chat.")
-        out = self._run("get_chat_history_in", {"chat": "@x", "limit": 2})
-        self.assertEqual(len(out.splitlines()), 2)
-
-    def test_send_message_empty_and_ok(self):
-        self.assertEqual(self._run("send_message", {}), "Пустой текст.")
-        self.assertEqual(
-            self._run("send_message", {"text": "hi"}), "Сообщение отправлено."
-        )
-        self.assertEqual(self.fake_client.sent[-1], (self.CHAT_ID, "hi"))
-
-    def test_delete_message_bad_and_ok(self):
-        self.assertEqual(
-            self._run("delete_message", {"message_id": "x"}), "Некорректный message_id."
-        )
-        self.assertEqual(
-            self._run("delete_message", {"message_id": 9}), "Сообщение удалено."
-        )
-        self.assertEqual(self.fake_client.deleted[-1], (self.CHAT_ID, [9]))
-
-    def test_forward_message_bad_and_ok(self):
-        self.assertEqual(
-            self._run("forward_message", {"message_id": "x", "target": "@t"}),
-            "Некорректный message_id.",
-        )
-        self.assertEqual(
-            self._run("forward_message", {"message_id": 1, "target": ""}),
-            "Пустой target.",
-        )
-        self.assertEqual(
-            self._run("forward_message", {"message_id": 1, "target": "@t"}),
-            "Сообщение переслано.",
-        )
-        self.assertEqual(self.fake_client.forwarded[-1], ("@t", 1, self.CHAT_ID))
-
-    def test_create_poll_guards_and_ok(self):
-        self.assertEqual(self._run("create_poll", {"question": ""}), "Пустой вопрос.")
-        self.assertEqual(
-            self._run("create_poll", {"question": "q", "options": ["a"]}),
-            "Нужно минимум 2 варианта.",
-        )
-        self.assertEqual(
-            self._run("create_poll", {"question": "q", "options": ["a", " ", ""]}),
-            "Нужно минимум 2 непустых варианта.",
-        )
-        self.assertEqual(
-            self._run("create_poll", {"question": "q", "options": ["a", "b"]}),
-            "Опрос создан.",
-        )
-        self.assertEqual(len(self.fake_client.files), 1)
-
-    def test_pin_unpin_get_pinned(self):
-        self.assertEqual(
-            self._run("pin_message", {"message_id": "x"}), "Некорректный message_id."
-        )
-        self.assertEqual(
-            self._run("pin_message", {"message_id": 3, "notify": True}),
-            "Сообщение закреплено.",
-        )
-        self.assertEqual(self.fake_client.pinned[-1], (self.CHAT_ID, 3, True))
-        self.assertEqual(
-            self._run("unpin_message", {"message_id": 3}), "Сообщение откреплено."
-        )
-        self.assertEqual(self.fake_client.unpinned[-1], (self.CHAT_ID, 3))
-        self.assertEqual(self._run("get_pinned_messages", {}), "[5] 1: pinned")
-
-    def test_react_to_message_guards_and_ok(self):
-        self.assertEqual(
-            self._run("react_to_message", {"message_id": "x", "emoji": "x"}),
-            "Некорректный message_id.",
-        )
-        self.assertEqual(
-            self._run("react_to_message", {"message_id": 1, "emoji": ""}),
-            "Пустая реакция.",
-        )
-        self.assertEqual(
-            self._run("react_to_message", {"message_id": 1, "emoji": "ok"}),
-            "Реакция ok поставлена.",
-        )
-        self.assertEqual(len(self.fake_client.requests), 1)
-
-    def test_last_and_search_messages(self):
-        out = self._run("get_last_messages", {"limit": 2})
-        self.assertEqual(len(out.splitlines()), 2)
-        self.assertEqual(self._run("search_messages", {"query": ""}), "Пустой запрос.")
-        out = self._run("search_messages", {"query": "t", "limit": 2})
-        self.assertEqual(len(out.splitlines()), 2)
 
     def test_web_search_empty_and_ok(self):
         self.assertEqual(self._run("web_search", {"query": ""}), "Пустой запрос.")
@@ -2814,43 +2623,6 @@ class CoderModeTest(BotTestCase):
         self.assertEqual(userbot.handle_commands(".db coder"), ("coder_status", None))
         self.assertEqual(bot.handle_bot_commands("/coder off"), ("coder", False))
         self.assertEqual(bot.handle_bot_commands("/coder"), ("coder_status", None))
-
-    def test_coder_tools_are_agentic(self):
-        names = {t["function"]["name"] for t in tools_module.CODER_TOOLS}
-        self.assertEqual(
-            names,
-            {
-                "read_file",
-                "write_file",
-                "edit_file",
-                "list_dir",
-                "search_files",
-                "execute_script",
-                "run_shell",
-                "web_search",
-                "fetch_url",
-                "get_time",
-                "memory_remember",
-                "memory_recall",
-                "memory_forget",
-                "memory_list",
-                "save_skill",
-                "load_skill",
-                "list_skills",
-                "delete_skill",
-            },
-        )
-        telegram_names = {
-            "send_message",
-            "edit_message",
-            "delete_message",
-            "forward_message",
-            "pin_message",
-            "create_poll",
-            "list_chats",
-            "react_to_message",
-        }
-        self.assertFalse(names & telegram_names)
 
     def test_subagents_get_no_coder_tools(self):
         names = {t["function"]["name"] for t in subagents._select_tools(None)}
