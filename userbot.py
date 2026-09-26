@@ -49,18 +49,18 @@ DANYAPI_MODEL = os.getenv("DANYAPI_MODEL", "deepseek-v4.1-flash")
 DANYAPI_KEY = os.getenv("DANYAPI_KEY", "danyapi")
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "Ты — DanyBOT, юзербот пользователя DanyaVoredom, работающий в Telegram. "
+    "Ты - DanyBOT, юзербот пользователя DanyaVoredom, работающий в Telegram. "
     "Отвечай максимально кратко и только по делу.",
 )
 SYSTEM_PROMPT_BOT = os.getenv(
     "SYSTEM_PROMPT_BOT",
-    "Ты — DanyBOT, Telegram-бот. Отвечай максимально кратко и только по делу. "
+    "Ты - DanyBOT, Telegram-бот. Отвечай максимально кратко и только по делу. "
     "Всегда отвечай на том языке, на котором написано последнее сообщение "
     "пользователя.",
 )
 TOOL_VERIFY_PROMPT = os.getenv(
     "TOOL_VERIFY_PROMPT",
-    "Ты — система безопасности Telegram-бота. Тебе показывают вызов инструмента "
+    "Ты - система безопасности Telegram-бота. Тебе показывают вызов инструмента "
     "с аргументами. Оцени, безопасно ли его выполнять: не приведёт ли он к удалению "
     "или порче данных, утечке приватной информации, выполнению опасных shell-команд, "
     "рассылке сообщений, действиям против владельца аккаунта. "
@@ -70,7 +70,7 @@ TOOL_VERIFY_MODEL = _env_str("TOOL_VERIFY_MODEL", "")
 RUN_SHELL_MODEL = _env_str("RUN_SHELL_MODEL", "")
 RUN_SHELL_VERIFY_PROMPT = os.getenv(
     "RUN_SHELL_VERIFY_PROMPT",
-    "Ты — система безопасности Telegram-бота. Тебе показывают вызов инструмента "
+    "Ты - система безопасности Telegram-бота. Тебе показывают вызов инструмента "
     "run_shell с shell-командой. Сначала рассуждай по шагам: что именно выполнит "
     "команда, какие файлы/данные затронет, есть ли удаление, перезапись, эксфильтрация "
     "секретов, обращение к сети, повышение прав, действия против владельца аккаунта. "
@@ -80,9 +80,9 @@ SANITIZE_ENABLED = _env_bool("SANITIZE_ENABLED", True)
 SANITIZE_MODEL = _env_str("SANITIZE_MODEL", "")
 SANITIZE_PROMPT = os.getenv(
     "SANITIZE_PROMPT",
-    "Ты — фильтр секретов. Тебе дают вывод shell-команды. Сначала рассуждай по шагам, "
+    "Ты - фильтр секретов. Тебе дают вывод shell-команды. Сначала рассуждай по шагам, "
     "затем верни ТОЛЬКО очищенный текст: удали или замени на [REDACTED] приватные "
-    "данные — значения из .env и любых конфигов, токены, API-ключи, пароли, хеши, "
+    "данные - значения из .env и любых конфигов, токены, API-ключи, пароли, хеши, "
     "cookie, приватные ключи, строки сессий, URL с credentials. Остальной текст "
     "сохрани дословно. Не добавляй пояснений, верни только очищенный вывод.",
 )
@@ -103,7 +103,7 @@ SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
 
 CODER_SYSTEM_PROMPT = os.getenv(
     "CODER_SYSTEM_PROMPT",
-    "Ты — DanyBOT в режиме кодера. Работаешь как агент: доступны файловые "
+    "Ты - DanyBOT в режиме кодера. Работаешь как агент: доступны файловые "
     "операции read_file, write_file, edit_file, list_dir, search_files, "
     "execute_script, run_shell, web_search, fetch_url, get_time, "
     "memory_remember, memory_recall, memory_forget, memory_list, "
@@ -386,7 +386,7 @@ def system_prompt_report(chat_id, mode="userbot", limit=3000):
         f"Длина / Length: {len(text)} символов\n"
         f"Контракт / Contract: "
         f"{'включён' if contract else 'выключен'} ({len(contract)} символов)\n"
-        f"Источник / Source: {CONTRACT_DIR} — {files}\n"
+        f"Источник / Source: {CONTRACT_DIR} - {files}\n"
     )
     if len(text) <= limit:
         return f"{head}\n{text}"
@@ -719,17 +719,17 @@ async def refresh_models():
 HELP_TEXT = (
     "Алиасы триггера / Trigger aliases: .db .ai\n"
     "Команды / Commands:\n"
-    ".db <текст/text> — вопрос / question\n"
-    ".db model <id> — сменить модель / set model\n"
-    ".db models — список моделей / list models\n"
-    ".db model — показать текущую модель / show current model\n"
-    ".db clear — очистить контекст / clear context\n"
-    ".db coder — кодер-режим живёт в боте / coder mode lives in the bot\n"
-    ".db reasoning on/off — показ рассуждений / show reasoning\n"
-    ".db tools on/off — показ вызовов инструментов / show tool calls\n"
-    ".db prompt — системный промпт, только владелец / system prompt, owner only\n"
-    ".db settings — текущие настройки, только владелец / settings, owner only\n"
-    ".db help — эта справка / this help\n"
+    ".db <текст/text> - вопрос / question\n"
+    ".db model <id> - сменить модель / set model\n"
+    ".db models - список моделей / list models\n"
+    ".db model - показать текущую модель / show current model\n"
+    ".db clear - очистить контекст / clear context\n"
+    ".db coder - кодер-режим живёт в боте / coder mode lives in the bot\n"
+    ".db reasoning on/off - показ рассуждений / show reasoning\n"
+    ".db tools on/off - показ вызовов инструментов / show tool calls\n"
+    ".db prompt - системный промпт, только владелец / system prompt, owner only\n"
+    ".db settings - текущие настройки, только владелец / settings, owner only\n"
+    ".db help - эта справка / this help\n"
 )
 
 
