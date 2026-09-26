@@ -116,6 +116,7 @@ SUB_ALIASES = {
     "reasoning": ("reasoning",),
     "tools": ("tools",),
     "prompt": ("prompt",),
+    "settings": ("settings",),
 }
 
 _SUB_LOOKUP = {

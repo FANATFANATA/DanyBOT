@@ -353,6 +353,24 @@ def system_for(chat_id, mode="userbot"):
     return "\n\n".join(parts)
 
 
+def settings_report(chat_id):
+    current = model_for(chat_id)
+    ctx_len = len(chat_history.get(chat_id, deque()))
+    limit = DM_HISTORY_LIMIT if chat_id > 0 else GROUP_HISTORY_LIMIT
+    reasoning_state = "скрыто" if chat_id in reasoning_hidden else "видно"
+    tools_state = "скрыто" if chat_id in tools_hidden else "видно"
+    contract = load_contract()
+    return (
+        "Настройки / Settings\n"
+        f"Модель / Model: {current}\n"
+        f"Рассуждения / Reasoning: {reasoning_state}\n"
+        f"Инструменты / Tools: {tools_state}\n"
+        f"Контекст / Context: {ctx_len}/{limit}\n"
+        f"Контракт / Contract: {'включён' if contract else 'выключен'} "
+        f"({len(contract)} символов)"
+    )
+
+
 def system_prompt_report(chat_id, mode="userbot", limit=3000):
     text = system_for(chat_id, mode=mode)
     contract = load_contract()
@@ -684,6 +702,7 @@ HELP_TEXT = (
     ".db reasoning on/off — показ рассуждений / show reasoning\n"
     ".db tools on/off — показ вызовов инструментов / show tool calls\n"
     ".db prompt — системный промпт, только владелец / system prompt, owner only\n"
+    ".db settings — текущие настройки, только владелец / settings, owner only\n"
     ".db help — эта справка / this help\n"
 )
 
@@ -725,6 +744,13 @@ async def handler(event: Any):
             await safe_reply(event, "Системный промпт доступен только владельцу.")
             return
         await safe_reply(event, system_prompt_report(chat_id, mode="userbot"))
+        return
+
+    if command and command[0] == "settings":
+        if sender_id not in OWNER_IDS:
+            await safe_reply(event, "Настройки доступны только владельцу.")
+            return
+        await safe_reply(event, settings_report(chat_id))
         return
 
     if command and command[0] in core.VISIBILITY_COMMANDS:
