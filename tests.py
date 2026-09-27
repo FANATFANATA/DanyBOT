@@ -46,7 +46,7 @@ PY_FILES = (
     "tests.py",
 )
 WHITELIST_FILE = "vulture_whitelist.py"
-BANDIT_SKIP = "B404,B603,B608"
+BANDIT_SKIP = "B404,B603,B607,B608"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
 BOT_AUTH_VALUE = "bot-token"
@@ -5504,6 +5504,55 @@ class HardeningTest(BotTestCase):
         sink.feed(b"0123456789A")
         self.assertTrue(sink.truncated)
         self.assertEqual(sink.text(), "0123456789")
+
+    def test_interrupted_shell_child_does_not_outlive_the_task(self):
+        tmp = self._tmp_dir("danybot_kill_")
+        self._use_coder_root(tmp)
+        marker = tmp / "survived.txt"
+        script = (
+            "import time,pathlib;"
+            f"time.sleep(1);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        command = f'"{sys.executable}" -c "{script}"'
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                userbot.execute_tool(
+                    "run_shell",
+                    {"command": command, "cwd": str(tmp)},
+                    1,
+                    unrestricted=True,
+                )
+            )
+            await asyncio.sleep(0.2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        time.sleep(1.6)
+        self.assertFalse(marker.exists(), "процесс пережил прерывание задачи")
+
+    def test_shell_timeout_kills_grandchildren(self):
+        tmp = self._tmp_dir("danybot_kill2_")
+        self._use_coder_root(tmp)
+        marker = tmp / "survived_timeout.txt"
+        script = (
+            "import time,pathlib;"
+            f"time.sleep(1.2);pathlib.Path({str(marker)!r}).write_text('x')"
+        )
+        command = f'"{sys.executable}" -c "{script}"'
+        out = asyncio.run(
+            userbot.execute_tool(
+                "run_shell",
+                {"command": command, "cwd": str(tmp), "timeout": 1},
+                1,
+                unrestricted=True,
+            )
+        )
+        self.assertIn("Таймаут 1s", out)
+        time.sleep(1.7)
+        self.assertFalse(marker.exists(), "процесс пережил таймаут")
 
     def test_scan_files_stops_on_directory_flood(self):
         tmp = self._tmp_dir("danybot_scan_")

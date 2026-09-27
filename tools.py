@@ -9,8 +9,10 @@ import logging
 import math
 import os
 import re
+import signal
 import socket
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -831,11 +833,34 @@ async def _tool_get_profile(arguments, chat_id, client, stats, unrestricted=Fals
     return _entity_json(me)
 
 
-async def _kill_process(proc) -> None:
+def _kill_process_now(proc) -> None:
+    if proc.returncode is not None:
+        return
+    if os.name == "nt":
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+    else:
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.kill(-proc.pid, getattr(signal, "SIGKILL", 9))
     with contextlib.suppress(ProcessLookupError, OSError):
         proc.kill()
-    with contextlib.suppress(Exception):
-        await proc.wait()
+
+
+async def _kill_process(proc) -> None:
+    _kill_process_now(proc)
+    with contextlib.suppress(Exception, asyncio.CancelledError):
+        await asyncio.wait_for(proc.wait(), timeout=5)
+
+
+def _spawn_kwargs():
+    if os.name == "nt":
+        return {}
+    return {"start_new_session": True}
 
 
 class _OutputSink:
@@ -889,12 +914,11 @@ async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str,
     err = _OutputSink(cap)
     drain = asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
     try:
-        try:
-            await asyncio.wait_for(asyncio.shield(drain), timeout=timeout)
-        except asyncio.TimeoutError:
+        done, _pending = await asyncio.wait({drain}, timeout=timeout)
+        if not done:
             await _kill_process(proc)
             _close_pipes(proc)
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
                 await asyncio.wait_for(drain, timeout=DRAIN_GRACE)
             return -1, out.text(), err.text(), f"Таймаут {timeout}s: команда прервана."
         with contextlib.suppress(Exception):
@@ -906,14 +930,12 @@ async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str,
             note = f"{note} Вывод обрезан.".strip()
         return _exit_code(proc), out.text(), err.text(), note
     finally:
-        await _ensure_stopped(proc)
-
-
-async def _ensure_stopped(proc) -> None:
-    if proc.returncode is not None:
-        return
-    with contextlib.suppress(Exception):
-        await asyncio.wait_for(_kill_process(proc), timeout=5)
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await _kill_process(proc)
+        if not drain.done():
+            drain.cancel()
+        with contextlib.suppress(BaseException):
+            await drain
 
 
 def _format_process_result(rc: int, out: str, err: str) -> str:
@@ -949,6 +971,7 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
             env=_subprocess_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_spawn_kwargs(),
         )
     except OSError as exc:
         return f"Ошибка запуска: {exc}"
@@ -1576,6 +1599,7 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
             env=_subprocess_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_spawn_kwargs(),
         )
     except OSError as exc:
         return f"Ошибка запуска: {exc}"
