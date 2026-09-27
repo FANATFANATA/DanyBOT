@@ -510,6 +510,19 @@ def save_history_from(store, history_file, logger):
         logger.warning("Не удалось сохранить %s", history_file.name)
 
 
+MAX_RECENT_IDS = 5000
+MAX_SEEN_MSG_KEYS = 20000
+_EVICT_BATCH = 1000
+
+
+def _evict_oldest(target, limit: int) -> None:
+    overflow = len(target) - limit
+    if overflow <= 0:
+        return
+    for key in list(target)[: min(overflow, _EVICT_BATCH)]:
+        target.discard(key)
+
+
 async def safe_reply(event, text, attempts, recent_ids):
     if not text or not text.strip():
         text = "…"
@@ -523,8 +536,7 @@ async def safe_reply(event, text, attempts, recent_ids):
             return None
         if sent:
             recent_ids.add((getattr(event, "chat_id", None), sent.id))
-            if len(recent_ids) > 5000:
-                recent_ids.clear()
+            _evict_oldest(recent_ids, MAX_RECENT_IDS)
         return sent
     return None
 
@@ -562,15 +574,33 @@ async def edit_text(client, chat_id, msg_id, text, attempts, logger=None):
     return False
 
 
-async def fetch_replied_text(message):
+async def fetch_replied_message(message):
     try:
-        if message.is_reply:
-            reply_msg = await message.get_reply_message()
-            if reply_msg and reply_msg.message:
-                return reply_msg.message.strip()
-    except (RPCError, OSError, ValueError):
-        pass
+        if not message.is_reply:
+            return None
+        return await message.get_reply_message()
+    except (RPCError, OSError, ValueError, TypeError, AttributeError):
+        return None
+
+
+async def fetch_replied_text(message):
+    reply_msg = await fetch_replied_message(message)
+    if reply_msg and reply_msg.message:
+        return reply_msg.message.strip()
     return None
+
+
+QUOTE_HEADER = "Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
+
+
+def compose_prompt(prompt, replied_text, limit):
+    if not replied_text:
+        return prompt
+    quoted = replied_text[: max(1, limit // 2)]
+    if not prompt:
+        return quoted
+    header = QUOTE_HEADER.format(quoted=quoted)
+    return header + prompt[: max(1, limit - len(header))]
 
 
 def check_cooldown(
@@ -699,8 +729,7 @@ async def append_message_context(
     if key in store.seen_msg_keys:
         return
     store.seen_msg_keys.add(key)
-    if len(store.seen_msg_keys) > 20000:
-        store.seen_msg_keys.clear()
+    _evict_oldest(store.seen_msg_keys, MAX_SEEN_MSG_KEYS)
     stripped = strip_trigger_fn(text, triggered) or text.strip()
     if is_self:
         role = "user" if triggered else "assistant"
@@ -720,8 +749,7 @@ async def prepare_messages(store, chat_id, dm_limit, group_limit, system_fn):
     limit = dm_limit if chat_id > 0 else group_limit
     async with store.ctx_lock:
         hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
-        sysp = system_fn(chat_id)
-        return hist, [{"role": "system", "content": sysp}, *list(hist)]
+        return [{"role": "system", "content": system_fn(chat_id)}, *list(hist)]
 
 
 def trim_tool_history(messages, max_messages, head_size=1):

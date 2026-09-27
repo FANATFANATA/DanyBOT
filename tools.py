@@ -63,6 +63,7 @@ MAX_EVAL_STEPS = 5000
 MAX_EVAL_BITS = 40000
 MAX_FETCH_REDIRECTS = 3
 MAX_FETCH_BYTES = 2_000_000
+MAX_SEARCH_BYTES = 2_000_000
 FETCH_TIMEOUT = 25
 
 TOOL_ERRORS: tuple[type[BaseException], ...] = (
@@ -80,6 +81,50 @@ TOOL_ERRORS: tuple[type[BaseException], ...] = (
     sqlite3.Error,
     httpx.HTTPError,
 )
+
+
+_SUBPROCESS_ENV_DENY = frozenset(
+    {
+        "API_ID",
+        "API_HASH",
+        "BOT_TOKEN",
+        "DANYAPI_KEY",
+        "SESSION_NAME",
+        "VALIDATE_API_ID",
+        "VALIDATE_API_HASH",
+    }
+)
+
+_SUBPROCESS_ENV_HINTS = (
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "PASSPHRASE",
+    "APIKEY",
+    "API_KEY",
+    "_KEY",
+    "KEY_",
+    "HASH",
+    "SESSION",
+    "CREDENTIAL",
+    "AUTH_SOCK",
+    "AUTH_TOKEN",
+    "COOKIE",
+    "PRIVATE",
+)
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if upper in _SUBPROCESS_ENV_DENY:
+            continue
+        if any(hint in upper for hint in _SUBPROCESS_ENV_HINTS):
+            continue
+        env[key] = value
+    return env
 
 
 def _resolve_path(raw, root=None):
@@ -169,6 +214,8 @@ def _eval_node(node):
         raise ValueError("Недопустимое имя")
     if isinstance(node, ast.Call):
         if isinstance(node.func, ast.Name) and node.func.id in SAFE_FUNCS:
+            if node.keywords:
+                raise ValueError("Именованные аргументы не поддерживаются")
             args = [_eval_node(a) for a in node.args]
             return SAFE_FUNCS[node.func.id](*args)
         raise ValueError("Недопустимый вызов")
@@ -699,9 +746,41 @@ CODER_TOOLS: list[dict[str, Any]] = [
 
 BOT_TOOLS: list[dict[str, Any]] = list(TOOLS)
 
+OWNER_ONLY_TOOLS = frozenset(
+    {
+        "run_shell",
+        "execute_script",
+        "run_subagent",
+        "memory_remember",
+        "memory_forget",
+        "save_skill",
+        "delete_skill",
+        *FILE_TOOL_NAMES,
+    }
+)
+
+PUBLIC_TOOLS: list[dict[str, Any]] = [
+    item
+    for item in [*FILE_TOOLS, *TOOLS]
+    if item["function"]["name"] not in OWNER_ONLY_TOOLS
+]
+
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
     {"run_subagent", "run_shell", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
 )
+
+
+def _entity_json(entity) -> str:
+    first = getattr(entity, "first_name", "") or ""
+    last = getattr(entity, "last_name", "") or ""
+    return json.dumps(
+        {
+            "id": getattr(entity, "id", None),
+            "name": " ".join(x for x in [first, last] if x).strip(),
+            "username": getattr(entity, "username", None),
+        },
+        ensure_ascii=False,
+    )
 
 
 async def _tool_evaluate(arguments, chat_id, client, stats, unrestricted=False):
@@ -732,17 +811,7 @@ async def _tool_get_user_info(arguments, chat_id, client, stats, unrestricted=Fa
         entity = await client.get_entity(handle)
     except (RPCError, OSError, ValueError) as exc:
         return f"Ошибка получения пользователя: {exc}"
-    first = getattr(entity, "first_name", "") or ""
-    last = getattr(entity, "last_name", "") or ""
-    full = " ".join(x for x in [first, last] if x).strip()
-    return json.dumps(
-        {
-            "id": getattr(entity, "id", None),
-            "name": full,
-            "username": getattr(entity, "username", None),
-        },
-        ensure_ascii=False,
-    )
+    return _entity_json(entity)
 
 
 async def _tool_get_profile(arguments, chat_id, client, stats, unrestricted=False):
@@ -750,17 +819,7 @@ async def _tool_get_profile(arguments, chat_id, client, stats, unrestricted=Fals
         me = await client.get_me()
     except (RPCError, OSError, ValueError) as exc:
         return f"Ошибка получения профиля: {exc}"
-    first = getattr(me, "first_name", "") or ""
-    last = getattr(me, "last_name", "") or ""
-    full = " ".join(x for x in [first, last] if x).strip()
-    return json.dumps(
-        {
-            "id": getattr(me, "id", None),
-            "name": full,
-            "username": getattr(me, "username", None),
-        },
-        ensure_ascii=False,
-    )
+    return _entity_json(me)
 
 
 async def _kill_process(proc) -> None:
@@ -832,8 +891,10 @@ async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str,
         with contextlib.suppress(Exception):
             await asyncio.wait_for(proc.wait(), timeout=5)
         note = ""
+        if proc.returncode is None:
+            note = "Процесс не завершился после закрытия вывода, убит."
         if out.truncated or err.truncated:
-            note = "Вывод обрезан."
+            note = f"{note} Вывод обрезан.".strip()
         return _exit_code(proc), out.text(), err.text(), note
     finally:
         await _ensure_stopped(proc)
@@ -876,6 +937,7 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
         proc = await asyncio.create_subprocess_shell(
             command,
             cwd=str(workdir),
+            env=_subprocess_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1011,20 +1073,20 @@ async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False
     errors = []
     for url, parser in SEARCH_ENGINES:
         try:
-            resp = await hc.get(url, params={"q": query}, timeout=20)
-            resp.raise_for_status()
+            async with hc.stream("GET", url, params={"q": query}, timeout=20) as resp:
+                resp.raise_for_status()
+                body, _cut = await _read_capped(resp, MAX_SEARCH_BYTES)
         except (httpx.HTTPError, OSError, ValueError) as exc:
             errors.append(f"{url}: {_error_label(exc)}")
             continue
-        results = parser(resp.text, limit)
+        results = parser(body.decode("utf-8", errors="replace"), limit)
         if results:
             return "\n\n".join(results)
         errors.append(f"{url}: пустая выдача")
     logger.warning("web_search без результатов: %s", "; ".join(errors))
-    if len(errors) == len(SEARCH_ENGINES) and all(
-        "пустая выдача" not in e for e in errors
-    ):
-        return f"Ошибка поиска: {errors[0]}"
+    failures = [e for e in errors if "пустая выдача" not in e]
+    if failures:
+        return f"Ошибка поиска: {'; '.join(failures)}"
     return "Ничего не найдено."
 
 
@@ -1044,6 +1106,8 @@ def _is_public_addr(addr) -> bool:
 
 async def _check_public_url(url: str) -> str:
     parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"Схема заблокирована: {parsed.scheme or 'пусто'}"
     host = parsed.hostname
     if not host:
         return "URL без хоста."
@@ -1117,6 +1181,8 @@ def _strip_page(raw: str) -> str:
         while gt < limit and raw[gt] != ">":
             gt += 1
         if gt >= limit:
+            if not skip_name:
+                out.append(raw[pos:lt])
             pos = limit
             continue
         tag = raw[lt + 1 : gt]
@@ -1168,13 +1234,24 @@ async def _fetch_once(hc, url: str) -> tuple[int, str, bytes, bool]:
         return status, str(location), body, truncated
 
 
+WEEKDAYS = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+
+
 async def _tool_get_time(arguments, chat_id, client, stats, unrestricted=False):
     utc = datetime.datetime.now(datetime.timezone.utc)
     return json.dumps(
         {
             "utc": utc.isoformat(),
             "local": utc.astimezone().isoformat(),
-            "weekday": utc.strftime("%A"),
+            "weekday": WEEKDAYS[utc.weekday()],
         },
         ensure_ascii=False,
     )
@@ -1200,6 +1277,16 @@ async def _tool_get_bot_stats(arguments, chat_id, client, stats, unrestricted=Fa
 
 SUBAGENT_RESULT_CHARS = 1500
 SUBAGENT_REPORT_CHARS = 8000
+
+
+def _tool_name_list(raw) -> list[str] | None:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return None
+    return [str(item).strip() for item in raw if str(item).strip()] or None
 
 
 def _subagent_report(results) -> str:
@@ -1236,7 +1323,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
         concurrency=_opt_int_arg(arguments, "concurrency", 1, 16),
         system=_str_arg(arguments, "system") or None,
         model=_str_arg(arguments, "model") or None,
-        tool_names=arguments.get("tools"),
+        tool_names=_tool_name_list(arguments.get("tools")),
         chat_id=chat_id,
         client=client,
         max_rounds=_opt_int_arg(arguments, "max_rounds", 1, 20),
@@ -1329,8 +1416,16 @@ async def _tool_edit_file(arguments, chat_id, client, stats, unrestricted=False)
     return f"Изменён: {path} (замен {count if replace_all else 1}, {size} байт)"
 
 
-def _list_entries(path: Path) -> list[Path]:
-    return sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+def _list_entries(path: Path) -> tuple[list[Path], int]:
+    entries: list[Path] = []
+    total = 0
+    with os.scandir(path) as scan:
+        for item in scan:
+            total += 1
+            if len(entries) < MAX_LIST_ENTRIES:
+                entries.append(Path(item.path))
+    entries.sort(key=lambda p: (p.is_file(), p.name.lower()))
+    return entries, total
 
 
 async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
@@ -1342,11 +1437,11 @@ async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
     if path.is_file():
         return f"Это файл: {path}. Используй read_file."
     try:
-        entries = await asyncio.to_thread(_list_entries, path)
+        entries, total = await asyncio.to_thread(_list_entries, path)
     except OSError as exc:
         return f"Ошибка чтения каталога: {exc}"
     rows = []
-    for entry in entries[:MAX_LIST_ENTRIES]:
+    for entry in entries:
         try:
             rows.append(
                 f"{entry.name}/"
@@ -1355,12 +1450,18 @@ async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
             )
         except OSError:
             rows.append(entry.name)
-    head = f"{path} | элементов {len(entries)}"
-    if len(entries) > MAX_LIST_ENTRIES:
-        head += f", показано {MAX_LIST_ENTRIES}"
+    head = f"{path} | элементов {total}"
+    if total > len(rows):
+        head += f", показано {len(rows)}"
     if not rows:
         return f"{head}\n(пусто)"
     return head + "\n" + "\n".join(rows)
+
+
+def _is_safe_glob(pattern: str) -> bool:
+    if pattern.startswith(("/", "\\", "~")) or re.match(r"^[a-zA-Z]:", pattern):
+        return False
+    return ".." not in re.split(r"[\\/]+", pattern)
 
 
 def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
@@ -1377,6 +1478,12 @@ def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
             break
         visited += 1
         if not item.is_file():
+            continue
+        try:
+            real = item.resolve()
+        except (OSError, RuntimeError):
+            continue
+        if real != root and root not in real.parents:
             continue
         try:
             if item.stat().st_size > MAX_SEARCH_FILE_BYTES:
@@ -1405,6 +1512,8 @@ async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=Fal
     if not path.exists():
         return f"Путь не найден: {path}"
     glob_pat = _str_arg(arguments, "glob") or "*"
+    if not _is_safe_glob(glob_pat):
+        return "Недопустимый glob."
     limit = _int_arg(arguments, "limit", 60, 1, MAX_SEARCH_RESULTS)
     try:
         rx = re.compile(pattern)
@@ -1445,6 +1554,7 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
             sys.executable,
             str(script_path),
             cwd=str(workdir),
+            env=_subprocess_env(),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
@@ -1590,6 +1700,9 @@ async def execute_tool(
     if allowed is not None and name not in allowed:
         logger.warning("Инструмент %s не разрешён в этой сессии", name)
         return f"Инструмент недоступен в этой сессии: {name}"
+    if unrestricted is not True and name in OWNER_ONLY_TOOLS:
+        logger.warning("Инструмент %s доступен только владельцу", name)
+        return f"Инструмент {name} доступен только владельцу."
     try:
         return await handler(arguments, chat_id, client, stats, unrestricted)
     except TOOL_ERRORS as exc:

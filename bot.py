@@ -20,7 +20,6 @@ import userbot
 
 logger = logging.getLogger("danybot.bot")
 
-BOT_COMMANDS = core.BOT_COMMANDS
 handle_bot_commands = core.handle_bot_commands
 
 STATE_FILE = Path(__file__).parent / "state_bot.json"
@@ -187,17 +186,14 @@ async def handler(event: Any):
     reply_to_bot = False
     replied_text = None
     if message.is_reply and not is_self:
-        try:
-            reply_msg = await message.get_reply_message()
-            if reply_msg is not None:
-                if getattr(reply_msg, "out", False) or (
-                    bot_id and getattr(reply_msg, "sender_id", None) == bot_id
-                ):
-                    reply_to_bot = True
-                if reply_msg.message:
-                    replied_text = reply_msg.message.strip()
-        except (RPCError, OSError, ValueError):
-            reply_to_bot = False
+        reply_msg = await core.fetch_replied_message(message)
+        if reply_msg is not None:
+            if getattr(reply_msg, "out", False) or (
+                bot_id and getattr(reply_msg, "sender_id", None) == bot_id
+            ):
+                reply_to_bot = True
+            if reply_msg.message:
+                replied_text = reply_msg.message.strip()
 
     try:
         command = handle_bot_commands(text)
@@ -331,15 +327,7 @@ async def handler(event: Any):
     logger.info("Бот: запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
     limit = userbot.MAX_REQUEST_LEN
-    prompt = _strip_mention(text.strip())
-
-    if replied_text:
-        quoted = replied_text[: max(1, limit // 2)]
-        if prompt:
-            header = f"Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
-            prompt = header + prompt[: max(1, limit - len(header))]
-        else:
-            prompt = quoted
+    prompt = core.compose_prompt(_strip_mention(text.strip()), replied_text, limit)
 
     if not prompt:
         return
@@ -349,12 +337,13 @@ async def handler(event: Any):
 
     model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     mode = "coder" if coder_active else "bot"
+    is_owner = sender_id in userbot.OWNER_IDS
 
     def system_fn(_cid):
         return userbot.system_for(_cid, mode=mode, with_contract=(mode == "coder"))
 
     if is_private:
-        hist, messages = await core.prepare_messages(
+        messages = await core.prepare_messages(
             STORE,
             chat_id,
             userbot.DM_HISTORY_LIMIT,
@@ -372,7 +361,7 @@ async def handler(event: Any):
             ctx_lock,
         )
         HISTORY_SAVER.mark_dirty()
-        hist, messages = await core.prepare_messages(
+        messages = await core.prepare_messages(
             STORE,
             chat_id,
             userbot.DM_HISTORY_LIMIT,
@@ -388,6 +377,12 @@ async def handler(event: Any):
         self_edit_id = None
 
     delivery: dict[str, bool] = {}
+    if coder_active:
+        tool_menu = tools_module.CODER_TOOLS
+    elif is_owner:
+        tool_menu = tools_module.BOT_TOOLS
+    else:
+        tool_menu = tools_module.PUBLIC_TOOLS
     try:
         full_answer = await core.stream_answer(
             STORE,
@@ -406,7 +401,7 @@ async def handler(event: Any):
             action=cast(Any, get_bot_client().action(chat_id, "typing")),
             stream_fn=userbot.stream_with_tools,
             tool_client=get_bot_client(),
-            tools=tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS,
+            tools=tool_menu,
             edit_interval=userbot.EDIT_INTERVAL,
             owner_id=sender_id,
             logger=logger,
@@ -414,14 +409,15 @@ async def handler(event: Any):
             delivery=delivery,
         )
 
-        async with ctx_lock:
-            if chat_id in chat_history:
-                chat_history[chat_id].append(
+        if full_answer.strip():
+            limit_ctx = (
+                userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
+            )
+            async with ctx_lock:
+                chat_history.setdefault(chat_id, deque(maxlen=limit_ctx)).append(
                     {"role": "assistant", "content": full_answer}
                 )
-            else:
-                hist.append({"role": "assistant", "content": full_answer})
-        HISTORY_SAVER.mark_dirty()
+            HISTORY_SAVER.mark_dirty()
     except userbot.HANDLER_ERRORS:
         logger.exception("Бот: ошибка генерации ответа")
         if not delivery.get("delivered"):
@@ -456,12 +452,20 @@ def _settings_rows(chat_id):
     return rows
 
 
+MODEL_MENU_LIMIT = 20
+
+
 def _model_rows(chat_id):
     current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     rows = []
-    for name in userbot.MODELS[:20]:
+    for name in userbot.MODELS[:MODEL_MENU_LIMIT]:
         marker = " *" if name == current else ""
         rows.append([Button.inline(f"{name}{marker}", _pick_data(name))])
+    hidden = len(userbot.MODELS) - MODEL_MENU_LIMIT
+    if hidden > 0:
+        rows.append(
+            [Button.inline(f"Ещё {hidden} (список /models)", b"settings:models")]
+        )
     rows.append([Button.inline("Назад", b"settings:main")])
     return rows
 
@@ -575,6 +579,15 @@ async def callback_handler(event: Any):
         await _answer(event, "Выбор модели.")
         await _edit_settings(event, chat_id, "Модель / Model:", _model_rows(chat_id))
         return
+    elif action == "models":
+        await _answer(event)
+        await safe_reply(
+            event,
+            core.models_text(
+                model_overrides.get(chat_id, userbot.DANYAPI_MODEL), userbot.MODELS
+            ),
+        )
+        return
     elif action == "main":
         await _answer(event)
         await _edit_settings(event, chat_id)
@@ -615,9 +628,6 @@ async def start_bot():
     load_history()
 
     cli = get_bot_client()
-    cli.add_event_handler(handler, events.NewMessage(incoming=None))
-    cli.add_event_handler(callback_handler, events.CallbackQuery())
-
     candidates = await _proxy_candidates()
     if not candidates:
         logger.warning("Бот: нет прокси, пробую напрямую")
@@ -684,6 +694,9 @@ async def start_bot():
     else:
         logger.error("Бот: не удалось подключиться ни через один прокси")
         return
+
+    cli.add_event_handler(handler, events.NewMessage(incoming=None))
+    cli.add_event_handler(callback_handler, events.CallbackQuery())
 
     await cast(Any, cli.run_until_disconnected())
 

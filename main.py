@@ -31,6 +31,12 @@ async def run():
     userbot.load_history()
     await userbot.refresh_models()
 
+    if not userbot.OWNER_IDS:
+        logger.error(
+            "OWNER_IDS пуст: команды владельца, кодер-режим и привилегированные "
+            "инструменты недоступны"
+        )
+
     subagents.configure(
         ai=userbot.ai,
         model=userbot.SUBAGENT_MODEL or userbot.DANYAPI_MODEL,

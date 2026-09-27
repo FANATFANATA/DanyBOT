@@ -88,7 +88,6 @@ SANITIZE_PROMPT = _env_str(
     "сохрани дословно. Не добавляй пояснений, верни только очищенный вывод.",
 )
 
-TRIGGER_ALIASES = core.TRIGGER_ALIASES
 TRIGGER_RE = core.TRIGGER_RE
 
 EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
@@ -771,11 +770,20 @@ async def refresh_models():
     global MODELS
     try:
         models = await asyncio.wait_for(ai.models.list(), timeout=REQUEST_TIMEOUT)
-        ids = [m.id for m in models.data if getattr(m, "id", None)]
+        data = getattr(models, "data", None) or ()
+        ids = [getattr(m, "id", None) for m in data]
+        ids = [i for i in ids if isinstance(i, str) and i]
         if ids:
             MODELS = ids
             logger.info("Загружено %d моделей из DanyAPI", len(ids))
-    except (OpenAIError, OSError, ValueError, asyncio.TimeoutError) as exc:
+    except (
+        OpenAIError,
+        OSError,
+        ValueError,
+        TypeError,
+        AttributeError,
+        asyncio.TimeoutError,
+    ) as exc:
         logger.warning("Не удалось загрузить модели из DanyAPI: %s", exc)
 
 
@@ -912,14 +920,7 @@ async def handler(event: Any):
     prompt = TRIGGER_RE.sub("", text, count=1).strip()
 
     replied_text = await core.fetch_replied_text(message)
-
-    if replied_text:
-        quoted = replied_text[: max(1, MAX_REQUEST_LEN // 2)]
-        if prompt:
-            header = f"Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
-            prompt = header + prompt[: max(1, MAX_REQUEST_LEN - len(header))]
-        else:
-            prompt = quoted
+    prompt = core.compose_prompt(prompt, replied_text, MAX_REQUEST_LEN)
 
     if not prompt:
         return
@@ -940,9 +941,9 @@ async def handler(event: Any):
             chat_id, user_content, chat_history, GROUP_HISTORY_LIMIT, ctx_lock
         )
         HISTORY_SAVER.mark_dirty()
-    async with ctx_lock:
-        hist = chat_history.setdefault(chat_id, deque(maxlen=limit))
     live = await fetch_live_messages(chat_id, LIVE_HISTORY_LIMIT)
+    if not live:
+        live = [{"role": "user", "content": prompt}]
     messages = [{"role": "system", "content": system_fn(chat_id)}, *live]
 
     if is_self:
@@ -953,6 +954,7 @@ async def handler(event: Any):
         self_edit_id = None
 
     delivery: dict[str, bool] = {}
+    tool_menu = TOOLS if sender_id in OWNER_IDS else tools_module.PUBLIC_TOOLS
     try:
         full_answer = await core.stream_answer(
             STORE,
@@ -971,7 +973,7 @@ async def handler(event: Any):
             action=cast(Any, get_client().action(chat_id, "typing")),
             stream_fn=stream_with_tools,
             tool_client=None,
-            tools=TOOLS,
+            tools=tool_menu,
             edit_interval=EDIT_INTERVAL,
             owner_id=sender_id,
             logger=logger,
@@ -979,14 +981,12 @@ async def handler(event: Any):
             delivery=delivery,
         )
 
-        async with ctx_lock:
-            if chat_id in chat_history:
-                chat_history[chat_id].append(
+        if full_answer.strip():
+            async with ctx_lock:
+                chat_history.setdefault(chat_id, deque(maxlen=limit)).append(
                     {"role": "assistant", "content": full_answer}
                 )
-            else:
-                hist.append({"role": "assistant", "content": full_answer})
-        HISTORY_SAVER.mark_dirty()
+            HISTORY_SAVER.mark_dirty()
     except HANDLER_ERRORS:
         logger.exception("Ошибка генерации ответа")
         if not delivery.get("delivered"):
@@ -1060,7 +1060,8 @@ async def start_userbot():
             logger.warning(
                 "Не удалось подключиться через %s: %s", proxy, type(exc).__name__
             )
-            await disconnect_quietly()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
             if proxy:
                 proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
     else:

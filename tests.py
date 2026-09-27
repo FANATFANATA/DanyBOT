@@ -1111,15 +1111,11 @@ class NewToolsTest(BotTestCase):
         self.assertIn("modes", data)
 
     def test_run_shell_echo(self):
-        result = asyncio.run(
-            userbot.execute_tool("run_shell", {"command": "echo hello"}, self.CHAT_ID)
-        )
+        result = _owner_tool("run_shell", {"command": "echo hello"}, self.CHAT_ID)
         self.assertIn("hello", result)
 
     def test_run_shell_empty(self):
-        result = asyncio.run(
-            userbot.execute_tool("run_shell", {"command": ""}, self.CHAT_ID)
-        )
+        result = _owner_tool("run_shell", {"command": ""}, self.CHAT_ID)
         self.assertEqual(result, "Пустая команда.")
 
 
@@ -1988,6 +1984,12 @@ class _StoreStub:
         self.last_chat_activity = {}
 
 
+def _owner_tool(name, arguments, chat_id=-100, **kwargs):
+    return asyncio.run(
+        userbot.execute_tool(name, arguments, chat_id, unrestricted=True, **kwargs)
+    )
+
+
 class ExtraToolsTest(BotTestCase):
     CHAT_ID = -100
 
@@ -2000,6 +2002,9 @@ class ExtraToolsTest(BotTestCase):
 
     def _run(self, name, args):
         return asyncio.run(userbot.execute_tool(name, args, self.CHAT_ID))
+
+    def _owner_run(self, name, args):
+        return _owner_tool(name, args, self.CHAT_ID)
 
     def test_web_search_empty_and_ok(self):
         self.assertEqual(self._run("web_search", {"query": ""}), "Пустой запрос.")
@@ -2092,7 +2097,8 @@ class ExtraToolsTest(BotTestCase):
 
     def test_run_subagent_guards(self):
         self.assertEqual(
-            self._run("run_subagent", {"task": "x"}), "Субагенты недоступны."
+            self._owner_run("run_subagent", {"task": "x"}),
+            "Субагенты недоступны.",
         )
 
     def test_execute_tool_reports_handler_crash(self):
@@ -2155,7 +2161,7 @@ class ExtraToolsTest(BotTestCase):
                 self.addCleanup(patcher.stop)
             self.addCleanup(mod._initialized.clear)
             mod._initialized.clear()
-        created = self._run(
+        created = self._owner_run(
             "memory_remember", {"key": "k1", "value": "v1", "tags": ["a"]}
         )
         self.assertIn("created", created)
@@ -2164,31 +2170,33 @@ class ExtraToolsTest(BotTestCase):
         listed = self._run("memory_list", {})
         self.assertIn("k1", listed)
         self.assertIn("stats", listed)
-        self.assertIn("deleted", self._run("memory_forget", {"key": "k1"}))
-        self.assertIn("created", self._run("save_skill", {"name": "s", "body": "b"}))
+        self.assertIn("deleted", self._owner_run("memory_forget", {"key": "k1"}))
+        self.assertIn(
+            "created", self._owner_run("save_skill", {"name": "s", "body": "b"})
+        )
         self.assertIn("s", self._run("load_skill", {"name": "s"}))
         self.assertIn("s", self._run("list_skills", {}))
-        self.assertIn("deleted", self._run("delete_skill", {"name": "s"}))
+        self.assertIn("deleted", self._owner_run("delete_skill", {"name": "s"}))
 
     def test_execute_tool_unknown_name(self):
         self.assertEqual(self._run("nope", {}), "Неизвестная функция: nope")
 
     def test_run_shell_defaults_to_coder_root(self):
-        out = self._run("run_shell", {"command": "cd"})
+        out = self._owner_run("run_shell", {"command": "cd"})
         self.assertIn("rc=0", out)
         self.assertIn(str(tools_module.CODER_ROOT), out)
 
     def test_run_shell_cwd_outside_root(self):
-        out = self._run("run_shell", {"command": "cd", "cwd": "/etc"})
+        out = self._owner_run("run_shell", {"command": "cd", "cwd": "/etc"})
         self.assertIn("вне разрешённого корня", out)
 
     def test_search_files_rejects_long_pattern(self):
-        out = self._run("search_files", {"pattern": "a" * 500})
+        out = self._owner_run("search_files", {"pattern": "a" * 500})
         self.assertIn("Слишком длинный pattern", out)
 
     def test_output_over_cap_is_drained_and_marked(self):
         with mock.patch.object(tools_module, "MAX_PROCESS_BYTES", 64):
-            out = self._run(
+            out = self._owner_run(
                 "run_shell",
                 {"command": f'"{sys.executable}" -c "print(chr(65)*4096)"'},
             )
@@ -2198,7 +2206,7 @@ class ExtraToolsTest(BotTestCase):
 
     def test_output_over_cap_keeps_exit_code(self):
         with mock.patch.object(tools_module, "MAX_PROCESS_BYTES", 64):
-            out = self._run(
+            out = self._owner_run(
                 "execute_script",
                 {"code": "print('B' * 4096)\nraise SystemExit(3)"},
             )
@@ -2206,7 +2214,7 @@ class ExtraToolsTest(BotTestCase):
         self.assertTrue(out.startswith("rc=3") or "\nrc=3" in out)
 
     def test_timeout_returns_partial_output(self):
-        out = self._run(
+        out = self._owner_run(
             "run_shell",
             {
                 "command": (
@@ -2588,7 +2596,7 @@ class CoreHelpersTest(BotTestCase):
     def test_prepare_messages(self):
         store = _StoreStub()
         store.chat_history[1] = deque([{"role": "user", "content": "x"}], maxlen=5)
-        _hist, messages = asyncio.run(
+        messages = asyncio.run(
             core.prepare_messages(store, 1, 5, 5, lambda _cid: "sys")
         )
         self.assertEqual(messages[0], {"role": "system", "content": "sys"})
@@ -3124,6 +3132,19 @@ class BotHandlerTest(BotTestCase):
     def _prefix(self):
         return self.stream_calls[0][1]["prefix"]
 
+    def test_owner_gets_full_tool_menu(self):
+        self._run(self._group_event("@danybot привет", sender_id=self.OWNER))
+        self.assertEqual(self.stream_calls[0][1]["tools"], tools_module.BOT_TOOLS)
+
+    def test_stranger_gets_public_tool_menu(self):
+        self._run(self._group_event("@danybot привет", sender_id=1))
+        self.assertEqual(self.stream_calls[0][1]["tools"], tools_module.PUBLIC_TOOLS)
+
+    def test_coder_chat_gets_coder_tool_menu(self):
+        bot.coder_chats.add(self.GROUP)
+        self._run(self._group_event("@danybot привет", sender_id=self.OWNER))
+        self.assertEqual(self.stream_calls[0][1]["tools"], tools_module.CODER_TOOLS)
+
     def test_empty_message_ignored(self):
         self._run(self._group_event(""))
         self.assertEqual(self.stream_calls, [])
@@ -3456,10 +3477,9 @@ class CoderModeTest(BotTestCase):
 
     def test_bot_handler_uses_coder_tools(self):
         source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
-        self.assertIn(
-            "tools_module.CODER_TOOLS if coder_active else tools_module.BOT_TOOLS",
-            source,
-        )
+        self.assertIn("tool_menu = tools_module.CODER_TOOLS", source)
+        self.assertIn("tool_menu = tools_module.BOT_TOOLS", source)
+        self.assertIn("tool_menu = tools_module.PUBLIC_TOOLS", source)
         self.assertIn('mode = "coder" if coder_active else "bot"', source)
 
     def test_db_trigger_never_active(self):
@@ -3489,77 +3509,59 @@ class CoderModeTest(BotTestCase):
         tmp = tools_module.CODER_ROOT / ".coder_selftest"
         self.addCleanup(shutil.rmtree, tmp, True)
         target = ".coder_selftest/note.txt"
-        written = asyncio.run(
-            userbot.execute_tool(
-                "write_file", {"path": target, "content": "alpha\nbeta\n"}, -100
-            )
+        written = _owner_tool(
+            "write_file", {"path": target, "content": "alpha\nbeta\n"}, -100
         )
         self.assertIn("Создан", written)
-        read = asyncio.run(userbot.execute_tool("read_file", {"path": target}, -100))
+        read = _owner_tool("read_file", {"path": target}, -100)
         self.assertIn("1|alpha", read)
-        edited = asyncio.run(
-            userbot.execute_tool(
-                "edit_file",
-                {"path": target, "old_string": "beta", "new_string": "gamma"},
-                -100,
-            )
+        edited = _owner_tool(
+            "edit_file",
+            {"path": target, "old_string": "beta", "new_string": "gamma"},
+            -100,
         )
         self.assertIn("Изменён", edited)
-        found = asyncio.run(
-            userbot.execute_tool(
-                "search_files", {"pattern": "gamma", "path": ".coder_selftest"}, -100
-            )
+        found = _owner_tool(
+            "search_files", {"pattern": "gamma", "path": ".coder_selftest"}, -100
         )
         self.assertIn("note.txt:2", found)
-        listed = asyncio.run(
-            userbot.execute_tool("list_dir", {"path": ".coder_selftest"}, -100)
-        )
+        listed = _owner_tool("list_dir", {"path": ".coder_selftest"}, -100)
         self.assertIn("note.txt", listed)
-        missing = asyncio.run(
-            userbot.execute_tool("read_file", {"path": "/etc/passwd"}, -100)
-        )
+        missing = _owner_tool("read_file", {"path": "/etc/passwd"}, -100)
         self.assertIn("вне разрешённого корня", missing)
 
     def test_execute_script_runs_and_returns_output(self):
-        result = asyncio.run(
-            userbot.execute_tool(
-                "execute_script", {"code": "print('alpha')\nprint(1 + 2)"}, -100
-            )
+        result = _owner_tool(
+            "execute_script", {"code": "print('alpha')\nprint(1 + 2)"}, -100
         )
         self.assertIn("rc=0", result)
         self.assertIn("alpha", result)
         self.assertIn("3", result)
 
     def test_execute_script_reports_traceback(self):
-        result = asyncio.run(
-            userbot.execute_tool(
-                "execute_script", {"code": "raise ValueError('boom')"}, -100
-            )
+        result = _owner_tool(
+            "execute_script", {"code": "raise ValueError('boom')"}, -100
         )
         self.assertIn("rc=1", result)
         self.assertIn("ValueError", result)
 
     def test_execute_script_empty_code(self):
         self.assertEqual(
-            asyncio.run(userbot.execute_tool("execute_script", {}, -100)),
+            _owner_tool("execute_script", {}, -100),
             "Пустой код.",
         )
 
     def test_execute_script_cwd_outside_root(self):
-        result = asyncio.run(
-            userbot.execute_tool(
-                "execute_script", {"code": "print(1)", "cwd": "/etc"}, -100
-            )
+        result = _owner_tool(
+            "execute_script", {"code": "print(1)", "cwd": "/etc"}, -100
         )
         self.assertIn("вне разрешённого корня", result)
 
     def test_execute_script_cwd_inside_root(self):
-        result = asyncio.run(
-            userbot.execute_tool(
-                "execute_script",
-                {"code": "import os\nprint(os.getcwd())", "cwd": "DanyBOT"},
-                -100,
-            )
+        result = _owner_tool(
+            "execute_script",
+            {"code": "import os\nprint(os.getcwd())", "cwd": "DanyBOT"},
+            -100,
         )
         self.assertIn("DanyBOT", result)
 
@@ -4330,6 +4332,44 @@ class UserbotHandlerTest(BotTestCase):
         ]
         return entries[-1] if entries else ""
 
+    def test_falls_back_to_prompt_when_live_history_empty(self):
+        saved = userbot.fetch_live_messages
+        self.addCleanup(setattr, userbot, "fetch_live_messages", saved)
+
+        async def empty_live(*_args, **_kwargs):
+            return []
+
+        userbot.fetch_live_messages = empty_live
+        self._run(self._event(".db вопрос без живой истории"))
+        messages = self.stream_calls[-1]["messages"]
+        self.assertEqual([m["role"] for m in messages], ["system", "user"])
+        self.assertIn("вопрос без живой истории", messages[1]["content"])
+
+    def test_live_history_is_used_when_available(self):
+        self._run(self._event(".db обычный вопрос"))
+        messages = self.stream_calls[-1]["messages"]
+        self.assertGreater(len(messages), 2)
+        self.assertEqual(messages[0]["role"], "system")
+
+    def test_owner_gets_full_tool_menu(self):
+        self._run(self._event(".db привет", sender_id=self.OWNER))
+        self.assertEqual(self.stream_calls[-1]["tools"], userbot.TOOLS)
+
+    def test_stranger_gets_public_tool_menu(self):
+        self._run(self._event(".db привет", sender_id=9))
+        self.assertEqual(self.stream_calls[-1]["tools"], tools_module.PUBLIC_TOOLS)
+
+    def test_empty_answer_is_not_stored_in_history(self):
+        async def blank(*_args, **_kwargs):
+            return ""
+
+        core.stream_answer = blank
+        self._run(self._event(".db привет"))
+        history = [
+            m for m in userbot.chat_history.get(self.DM, []) if m["role"] == "assistant"
+        ]
+        self.assertEqual(history, [])
+
     def test_empty_message_ignored(self):
         self._run(self._event(""))
         self.assertEqual(self.stream_calls, [])
@@ -4654,16 +4694,12 @@ class HardeningTest(BotTestCase):
             saved = getattr(tools_module, attr)
             self.addCleanup(setattr, tools_module, attr, saved)
             setattr(tools_module, attr, value)
-        read = asyncio.run(
-            tools_module.execute_tool("read_file", {"path": "big.txt"}, 1)
-        )
+        read = _owner_tool("read_file", {"path": "big.txt"}, 1)
         self.assertIn("слишком большой", read)
-        edit = asyncio.run(
-            tools_module.execute_tool(
-                "edit_file",
-                {"path": "big.txt", "old_string": "x", "new_string": "y"},
-                1,
-            )
+        edit = _owner_tool(
+            "edit_file",
+            {"path": "big.txt", "old_string": "x", "new_string": "y"},
+            1,
         )
         self.assertIn("слишком большой", edit)
 
@@ -4673,9 +4709,7 @@ class HardeningTest(BotTestCase):
         saved = tools_module.CODER_ROOT
         self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
         tools_module.CODER_ROOT = tmp
-        out = asyncio.run(
-            tools_module.execute_tool("read_file", {"path": "a.txt", "offset": 2}, 1)
-        )
+        out = _owner_tool("read_file", {"path": "a.txt", "offset": 2}, 1)
         self.assertIn("2|two", out)
         self.assertIn("3|three", out)
 
@@ -4707,9 +4741,7 @@ class HardeningTest(BotTestCase):
         saved_exec = asyncio.create_subprocess_exec
         self.addCleanup(setattr, asyncio, "create_subprocess_exec", saved_exec)
         asyncio.create_subprocess_exec = broken
-        out = asyncio.run(
-            tools_module.execute_tool("execute_script", {"code": "print(1)"}, 1)
-        )
+        out = _owner_tool("execute_script", {"code": "print(1)"}, 1)
         self.assertIn("Ошибка инструмента", out)
         self.assertEqual(list(tmp.iterdir()), [])
 
@@ -4727,9 +4759,7 @@ class HardeningTest(BotTestCase):
 
         self.addCleanup(setattr, tempfile, "NamedTemporaryFile", real)
         tempfile.NamedTemporaryFile = failing
-        out = asyncio.run(
-            tools_module.execute_tool("execute_script", {"code": "print(1)"}, 1)
-        )
+        out = _owner_tool("execute_script", {"code": "print(1)"}, 1)
         self.assertIn("Ошибка", out)
         self.assertEqual(list(tmp.iterdir()), [])
 
@@ -4743,11 +4773,7 @@ class HardeningTest(BotTestCase):
         self.addCleanup(setattr, tools_module.core, "_write_text_atomic", saved_write)
         tools_module.CODER_ROOT = tmp
         tools_module.core._write_text_atomic = lambda *_a, **_k: False
-        out = asyncio.run(
-            tools_module.execute_tool(
-                "write_file", {"path": "keep.txt", "content": "LOST"}, 1
-            )
-        )
+        out = _owner_tool("write_file", {"path": "keep.txt", "content": "LOST"}, 1)
         self.assertIn("Ошибка записи", out)
         self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL")
 
@@ -4761,12 +4787,10 @@ class HardeningTest(BotTestCase):
         self.addCleanup(setattr, tools_module.core, "_write_text_atomic", saved_write)
         tools_module.CODER_ROOT = tmp
         tools_module.core._write_text_atomic = lambda *_a, **_k: False
-        out = asyncio.run(
-            tools_module.execute_tool(
-                "edit_file",
-                {"path": "keep.txt", "old_string": "ORIGINAL", "new_string": "NEW"},
-                1,
-            )
+        out = _owner_tool(
+            "edit_file",
+            {"path": "keep.txt", "old_string": "ORIGINAL", "new_string": "NEW"},
+            1,
         )
         self.assertIn("Ошибка записи", out)
         self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL")
@@ -4781,12 +4805,10 @@ class HardeningTest(BotTestCase):
         self.addCleanup(setattr, tools_module, "MAX_WRITE_BYTES", saved_cap)
         tools_module.CODER_ROOT = tmp
         tools_module.MAX_WRITE_BYTES = 64
-        out = asyncio.run(
-            tools_module.execute_tool(
-                "edit_file",
-                {"path": "a.txt", "old_string": "tiny", "new_string": "x" * 500},
-                1,
-            )
+        out = _owner_tool(
+            "edit_file",
+            {"path": "a.txt", "old_string": "tiny", "new_string": "x" * 500},
+            1,
         )
         self.assertIn("Слишком большой", out)
         self.assertEqual(target.read_text(encoding="utf-8"), "tiny")
@@ -4809,8 +4831,14 @@ class HardeningTest(BotTestCase):
         raw = "<scriptaaaa" * 20000
         started = time.monotonic()
         out = tools_module._strip_page(raw)
-        self.assertEqual(out, "")
         self.assertLess(time.monotonic() - started, 5.0)
+        self.assertLess(len(out), len(raw))
+
+    def test_strip_page_keeps_text_before_unterminated_tag(self):
+        raw = "BEFORE " + "z" * 1990 + " < " + "q" * 5000 + " AFTER"
+        out = tools_module._strip_page(raw)
+        self.assertTrue(out.startswith("BEFORE"))
+        self.assertIn("AFTER", out)
 
     def test_strip_page_keeps_text_between_blocks(self):
         self.assertEqual(
@@ -4840,9 +4868,7 @@ class HardeningTest(BotTestCase):
         saved = tools_module.MAX_SEARCH_NODES
         self.addCleanup(setattr, tools_module, "MAX_SEARCH_NODES", saved)
         tools_module.MAX_SEARCH_NODES = 10
-        out = asyncio.run(
-            tools_module.execute_tool("search_files", {"pattern": "needle"}, 1)
-        )
+        out = _owner_tool("search_files", {"pattern": "needle"}, 1)
         self.assertIn("Совпадений не найдено", out)
 
     def test_scan_files_finds_match_within_node_budget(self):
@@ -4851,9 +4877,7 @@ class HardeningTest(BotTestCase):
         saved = tools_module.CODER_ROOT
         self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
         tools_module.CODER_ROOT = tmp
-        out = asyncio.run(
-            tools_module.execute_tool("search_files", {"pattern": "needle"}, 1)
-        )
+        out = _owner_tool("search_files", {"pattern": "needle"}, 1)
         self.assertIn("hit.txt", out)
 
     def test_web_search_error_hides_query(self):
@@ -5048,9 +5072,7 @@ class HardeningTest(BotTestCase):
             saved = getattr(subagents, attr)
             self.addCleanup(setattr, subagents, attr, saved)
             setattr(subagents, attr, value)
-        out = asyncio.run(
-            tools_module.execute_tool("run_subagent", {"task": "task one"}, 1)
-        )
+        out = _owner_tool("run_subagent", {"task": "task one"}, 1)
         data = json.loads(out)
         self.assertTrue(data[0]["ok"])
         self.assertEqual(len(data[0]["result"]), tools_module.SUBAGENT_RESULT_CHARS)
@@ -5076,9 +5098,295 @@ class HardeningTest(BotTestCase):
             saved = getattr(subagents, attr)
             self.addCleanup(setattr, subagents, attr, saved)
             setattr(subagents, attr, value)
-        out = asyncio.run(tools_module.execute_tool("run_subagent", {"task": "t"}, 1))
+        out = _owner_tool("run_subagent", {"task": "t"}, 1)
         self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
         self.assertTrue(out.endswith("…"))
+
+    def test_owner_only_tools_are_denied_for_strangers(self):
+        for name in sorted(tools_module.OWNER_ONLY_TOOLS):
+            with self.subTest(tool=name):
+                out = asyncio.run(
+                    tools_module.execute_tool(name, {"command": "echo x"}, 1)
+                )
+                self.assertIn("только владельцу", out)
+                out_owner = _owner_tool(name, {}, 1)
+                self.assertNotIn("только владельцу", out_owner)
+
+    def test_public_tools_menu_excludes_owner_only(self):
+        public = tools_module.tool_names_of(tools_module.PUBLIC_TOOLS)
+        self.assertTrue(public)
+        self.assertEqual(public & tools_module.OWNER_ONLY_TOOLS, set())
+        for name in ("evaluate", "web_search", "fetch_url", "memory_recall"):
+            self.assertIn(name, public)
+        owner_menus = tools_module.tool_names_of(
+            [*tools_module.CODER_TOOLS, *tools_module.BOT_TOOLS]
+        )
+        for name in tools_module.OWNER_ONLY_TOOLS:
+            self.assertIn(name, owner_menus)
+
+    def test_subprocess_env_drops_secrets(self):
+        for key, value in (
+            ("BOT_TOKEN", "123:secret"),
+            ("DANYAPI_KEY", "sk-secret"),
+            ("API_HASH", "hash-secret"),
+            ("SESSION_NAME", "1secret-session"),
+            ("GH_TOKEN", "ghp-secret"),
+            ("MY_PASSWORD", "hunter2"),
+        ):
+            os.environ[key] = value
+            self.addCleanup(os.environ.pop, key, None)
+        os.environ["KEEP_ME"] = "visible"
+        self.addCleanup(os.environ.pop, "KEEP_ME", None)
+        env = tools_module._subprocess_env()
+        self.assertNotIn("BOT_TOKEN", env)
+        self.assertNotIn("DANYAPI_KEY", env)
+        self.assertNotIn("API_HASH", env)
+        self.assertNotIn("SESSION_NAME", env)
+        self.assertNotIn("GH_TOKEN", env)
+        self.assertNotIn("MY_PASSWORD", env)
+        self.assertEqual(env["KEEP_ME"], "visible")
+        self.assertIn("PATH", env)
+
+    def test_run_shell_child_does_not_see_secrets(self):
+        marker = "canary-value-42"
+        for key, value in (("DANYBOT_CANARY_TOKEN", marker),):
+            os.environ[key] = value
+            self.addCleanup(os.environ.pop, key, None)
+        out = _owner_tool(
+            "run_shell",
+            {
+                "command": (
+                    f'"{sys.executable}" -c "import os;'
+                    "print(os.environ.get('DANYBOT_CANARY_TOKEN', 'absent'))\""
+                )
+            },
+            1,
+        )
+        self.assertIn("absent", out)
+        self.assertNotIn(marker, out)
+
+    def test_search_files_glob_cannot_escape_root(self):
+        tmp = self._tmp_dir("danybot_glob_")
+        root = tmp / "root"
+        root.mkdir()
+        (root / "inside.txt").write_text("needle-inside", encoding="utf-8")
+        (tmp / "outside.txt").write_text("needle-outside", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        tools_module.CODER_ROOT = root
+        for pattern in ("../outside.txt", "..\\outside.txt", "/etc/passwd", "~/x"):
+            with self.subTest(glob=pattern):
+                out = _owner_tool(
+                    "search_files",
+                    {"pattern": "needle", "path": ".", "glob": pattern},
+                    1,
+                )
+                self.assertIn("Недопустимый glob", out)
+        out = _owner_tool(
+            "search_files",
+            {"pattern": "needle", "path": ".", "glob": "../*.txt"},
+            1,
+        )
+        self.assertIn("Недопустимый glob", out)
+
+    def test_search_files_skips_symlink_out_of_root(self):
+        tmp = self._tmp_dir("danybot_link_")
+        root = tmp / "root"
+        root.mkdir()
+        (tmp / "secret.txt").write_text("needle-secret", encoding="utf-8")
+        link = root / "link.txt"
+        try:
+            link.symlink_to(tmp / "secret.txt")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        (root / "ok.txt").write_text("needle-ok", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        tools_module.CODER_ROOT = root
+        out = _owner_tool("search_files", {"pattern": "needle", "path": "."}, 1)
+        self.assertIn("ok.txt", out)
+        self.assertNotIn("secret.txt", out)
+        self.assertNotIn("needle-secret", out)
+
+    def test_list_dir_counts_all_entries_but_caps_output(self):
+        tmp = self._tmp_dir("danybot_listdir_")
+        for index in range(5):
+            (tmp / f"f{index}.txt").write_text("x", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        saved_cap = tools_module.MAX_LIST_ENTRIES
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        self.addCleanup(setattr, tools_module, "MAX_LIST_ENTRIES", saved_cap)
+        tools_module.CODER_ROOT = tmp
+        tools_module.MAX_LIST_ENTRIES = 2
+        out = _owner_tool("list_dir", {"path": "."}, 1)
+        self.assertIn("элементов 5", out)
+        self.assertIn("показано 2", out)
+        self.assertNotIn("f4.txt", out)
+        entries, total = tools_module._list_entries(tmp)
+        self.assertEqual(total, 5)
+        self.assertEqual(len(entries), 2)
+
+    def test_safe_eval_rejects_keyword_arguments(self):
+        out = tools_module.safe_eval("round(2.7, ndigits=0)")
+        self.assertIn("Именованные аргументы", out)
+        self.assertEqual(tools_module.safe_eval("round(2.7)"), "3")
+
+    def test_fetch_url_rejects_non_http_redirect(self):
+        class _RedirectClient:
+            def stream(self, _method, url, **_kwargs):
+                return _FakeStream(_FakeResp("", 302, location="file:///etc/passwd"))
+
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _RedirectClient()
+        ):
+            out = asyncio.run(
+                tools_module.execute_tool(
+                    "fetch_url", {"url": "https://93.184.216.34/"}, 1
+                )
+            )
+        self.assertIn("Схема заблокирована", out)
+
+    def test_web_search_reports_engine_failure_over_empty_result(self):
+        class _MixedClient:
+            def __init__(self):
+                self.calls = 0
+
+            def stream(self, _method, url, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return _FakeStream(_FakeResp("", 500))
+                return _FakeStream(_FakeResp("<html></html>"))
+
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _MixedClient()
+        ):
+            out = asyncio.run(
+                tools_module.execute_tool("web_search", {"query": "x"}, 1)
+            )
+        self.assertIn("Ошибка поиска", out)
+        self.assertNotEqual(out, "Ничего не найдено.")
+
+    def test_run_subagent_accepts_tools_as_string(self):
+        seen = {}
+
+        async def fake_run(tasks, **kwargs):
+            seen["tools"] = kwargs.get("tool_names")
+            return []
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        _owner_tool("run_subagent", {"task": "t", "tools": "evaluate"}, 1)
+        self.assertEqual(seen["tools"], ["evaluate"])
+        _owner_tool("run_subagent", {"task": "t", "tools": []}, 1)
+        self.assertIsNone(seen["tools"])
+
+    def test_get_time_weekday_is_deterministic(self):
+        import datetime
+
+        out = json.loads(asyncio.run(tools_module.execute_tool("get_time", {}, 1)))
+        expected = tools_module.WEEKDAYS[
+            datetime.datetime.fromisoformat(out["utc"]).weekday()
+        ]
+        self.assertEqual(out["weekday"], expected)
+
+    def test_evict_oldest_keeps_most_entries(self):
+        target = set(range(10))
+        core._evict_oldest(target, 5)
+        self.assertEqual(len(target), 5)
+        core._evict_oldest(target, 50)
+        self.assertEqual(len(target), 5)
+
+    def test_compose_prompt_variants(self):
+        self.assertEqual(core.compose_prompt("вопрос", None, 100), "вопрос")
+        self.assertEqual(core.compose_prompt("", "цитата", 100), "цитата")
+        merged = core.compose_prompt("вопрос", "цитата", 100)
+        self.assertIn("Сообщение, на которое ответили", merged)
+        self.assertTrue(merged.endswith("вопрос"))
+        long = core.compose_prompt("x" * 500, "y" * 500, 100)
+        self.assertLessEqual(len(long), 200)
+
+    def test_fetch_replied_message_handles_errors(self):
+        class _Boom:
+            is_reply = True
+
+            async def get_reply_message(self):
+                raise OSError("boom")
+
+        self.assertIsNone(asyncio.run(core.fetch_replied_message(_Boom())))
+        self.assertIsNone(asyncio.run(core.fetch_replied_text(_Boom())))
+
+        class _NoReply:
+            is_reply = False
+
+        self.assertIsNone(asyncio.run(core.fetch_replied_message(_NoReply())))
+        self.assertIsNone(asyncio.run(core.fetch_replied_text(_NoReply())))
+
+    def test_model_menu_reports_hidden_models(self):
+        saved_models = list(userbot.MODELS)
+        self.addCleanup(setattr, userbot, "MODELS", type(userbot.MODELS)(saved_models))
+        userbot.MODELS = [f"model-{i}" for i in range(bot.MODEL_MENU_LIMIT + 3)]
+        rows = bot._model_rows(1)
+        labels = [row[0].text for row in rows]
+        self.assertTrue(any("Ещё 3" in label for label in labels))
+        self.assertEqual(len(rows), bot.MODEL_MENU_LIMIT + 2)
+
+    def test_model_menu_has_no_overflow_row_when_short(self):
+        saved_models = list(userbot.MODELS)
+        self.addCleanup(setattr, userbot, "MODELS", type(userbot.MODELS)(saved_models))
+        userbot.MODELS = ["only-one"]
+        rows = bot._model_rows(1)
+        self.assertEqual(len(rows), 2)
+
+    def test_callback_models_action_lists_every_model(self):
+        saved_models = list(userbot.MODELS)
+        saved_owners = userbot.OWNER_IDS
+        self.addCleanup(setattr, userbot, "MODELS", type(userbot.MODELS)(saved_models))
+        self.addCleanup(setattr, userbot, "OWNER_IDS", saved_owners)
+        userbot.OWNER_IDS = {5}
+        userbot.MODELS = [f"model-{i}" for i in range(bot.MODEL_MENU_LIMIT + 2)]
+        event = _CallbackEvent("settings:models", 5, 5)
+        asyncio.run(bot.callback_handler(event))
+        joined = "\n".join(r[0] for r in event.replies if r[0])
+        self.assertIn(f"model-{bot.MODEL_MENU_LIMIT + 1}", joined)
+
+    def test_refresh_models_survives_bad_payload(self):
+        class _BadModels:
+            data = None
+
+        async def _list():
+            return _BadModels()
+
+        saved_ai = userbot.ai
+        saved_models = userbot.MODELS
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        userbot.ai = SimpleNamespace(models=SimpleNamespace(list=_list))
+        asyncio.run(userbot.refresh_models())
+        self.assertTrue(userbot.MODELS)
+
+    def test_refresh_models_ignores_entries_without_id(self):
+        class _Entry:
+            def __init__(self, ident):
+                self.id = ident
+
+        class _Payload:
+            data: ClassVar[list] = [_Entry("good"), _Entry(None), _Entry(5)]
+
+        async def _list():
+            return _Payload()
+
+        saved_ai = userbot.ai
+        saved_models = userbot.MODELS
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        userbot.ai = SimpleNamespace(models=SimpleNamespace(list=_list))
+        asyncio.run(userbot.refresh_models())
+        self.assertEqual(userbot.MODELS, ["good"])
 
 
 class StartupTest(BotTestCase):
