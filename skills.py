@@ -35,13 +35,23 @@ CREATE INDEX IF NOT EXISTS idx_skills_name ON skills(name);
 _initialized: set[str] = set()
 
 
+def _has_table(conn, name: str) -> bool:
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,)
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
 def _connect():
     if not DATA_DIR.is_dir():
         DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     key = str(DB_PATH)
-    if key not in _initialized:
+    if key not in _initialized or not _has_table(conn, "skills"):
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(_SCHEMA)

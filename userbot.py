@@ -566,7 +566,6 @@ async def stream_with_tools(
     working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
     all_parts: list[str] = []
-    content_parts: list[str] = []
     allowed = tools_module.tool_names_of(tools if tools is not None else TOOLS)
     while True:
         rounds += 1
@@ -685,7 +684,7 @@ async def stream_with_tools(
         results = await asyncio.gather(
             *(run_slot(s) for s in slots), return_exceptions=True
         )
-        for slot, result in zip(slots, results):
+        for slot, result in zip(slots, results, strict=True):
             if isinstance(result, asyncio.CancelledError):
                 raise result
             if isinstance(result, BaseException):
@@ -990,9 +989,7 @@ async def handler(event: Any):
     except HANDLER_ERRORS:
         logger.exception("Ошибка генерации ответа")
         if not delivery.get("delivered"):
-            await safe_reply(
-                event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-            )
+            await safe_reply(event, core.ERROR_NOTICE)
 
 
 async def disconnect_quietly(timeout=10):

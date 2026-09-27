@@ -421,13 +421,11 @@ async def handler(event: Any):
     except userbot.HANDLER_ERRORS:
         logger.exception("Бот: ошибка генерации ответа")
         if not delivery.get("delivered"):
-            await safe_reply(
-                event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-            )
+            await safe_reply(event, core.ERROR_NOTICE)
 
 
 def _settings_rows(chat_id):
-    rows = [
+    return [
         [Button.inline(f"Модель: {_current_model_label(chat_id)}", b"settings:model")],
         [
             Button.inline(
@@ -449,7 +447,6 @@ def _settings_rows(chat_id):
         [Button.inline("Очистить контекст", b"settings:clear")],
         [Button.inline("Системный промпт", b"settings:prompt")],
     ]
-    return rows
 
 
 MODEL_MENU_LIMIT = 20

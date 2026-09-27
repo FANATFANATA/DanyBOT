@@ -69,20 +69,26 @@ def is_configured() -> bool:
     return bool(_RUNTIME["enabled"] and _RUNTIME["ai"])
 
 
-_TOOLS_AVAILABLE = None
+_TOOLS_CACHE: dict[str, Any] = {"key": None, "items": []}
+
+
+def _available_tools():
+    import tools as tools_module
+
+    schema = tools_module.TOOLS
+    key = tuple(item["function"]["name"] for item in schema)
+    if _TOOLS_CACHE["key"] != key:
+        _TOOLS_CACHE["key"] = key
+        _TOOLS_CACHE["items"] = [
+            item
+            for item in schema
+            if item["function"]["name"] not in tools_module.SUBAGENT_EXCLUDED_TOOLS
+        ]
+    return cast(Any, _TOOLS_CACHE["items"])
 
 
 def _select_tools(tool_names):
-    global _TOOLS_AVAILABLE
-    if _TOOLS_AVAILABLE is None:
-        import tools as tools_module
-
-        _TOOLS_AVAILABLE = [
-            item
-            for item in tools_module.TOOLS
-            if item["function"]["name"] not in tools_module.SUBAGENT_EXCLUDED_TOOLS
-        ]
-    available = list(_TOOLS_AVAILABLE)
+    available = list(_available_tools())
     if not tool_names:
         return available
     wanted = {str(name).strip() for name in tool_names if str(name).strip()}
@@ -257,7 +263,7 @@ async def run_subagent(
             ),
             return_exceptions=True,
         )
-        for (call_id, name, _arguments), outcome in zip(calls, outcomes):
+        for (call_id, name, _arguments), outcome in zip(calls, outcomes, strict=True):
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
             if isinstance(outcome, BaseException):
@@ -266,9 +272,9 @@ async def run_subagent(
                 )
                 content_text = f"Ошибка инструмента {name}: {outcome}"
             else:
-                name, content_text, ran = outcome
+                used_name, content_text, ran = outcome
                 if ran:
-                    result["tools_used"].append(name)
+                    result["tools_used"].append(used_name)
             messages.append(
                 {
                     "role": "tool",
@@ -286,7 +292,7 @@ async def _gather_workers(fn, specs):
         *(fn(spec) for spec in specs), return_exceptions=True
     )
     out = []
-    for spec, outcome in zip(specs, results):
+    for spec, outcome in zip(specs, results, strict=True):
         if isinstance(outcome, asyncio.CancelledError):
             raise outcome
         if isinstance(outcome, BaseException):
@@ -334,7 +340,11 @@ async def run_subagents(
         return []
 
     limit = concurrency if concurrency is not None else _RUNTIME["concurrency"]
-    logger.info("Запуск %d субагентов (параллельно до %s)", len(specs), limit)
+    logger.info(
+        "Запуск %d субагентов (параллельно до %s)",
+        len(specs),
+        "без лимита" if limit is None else limit,
+    )
 
     async def worker(spec):
         return await run_subagent(

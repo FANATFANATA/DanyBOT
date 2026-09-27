@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -573,6 +574,22 @@ class ProxyParsingTest(BotTestCase):
         self.assertEqual(
             proxies.telethon_to_item({"proxy_type": "http", "addr": "h", "port": 2}),
             ("http", "h", 2),
+        )
+
+    def test_telethon_to_item_survives_broken_data(self):
+        self.assertIsNone(proxies.telethon_to_item({}))
+        self.assertIsNone(proxies.telethon_to_item({"proxy_type": "http"}))
+        self.assertIsNone(
+            proxies.telethon_to_item({"proxy_type": "http", "addr": "h", "port": "x"})
+        )
+        self.assertIsNone(
+            proxies.telethon_to_item({"proxy_type": None, "addr": "h", "port": 1})
+        )
+        self.assertEqual(
+            proxies.telethon_to_item(
+                {"proxy_type": "http", "addr": "h", "port": "3128"}
+            ),
+            ("http", "h", 3128),
         )
 
     def test_mark_bad_proxy_removes_only_target(self):
@@ -2340,6 +2357,100 @@ class CoreHelpersTest(BotTestCase):
         self.assertIn("Ошибка", edited[-1])
         self.assertNotIn((1, 555), store.recent_reply_ids)
 
+    def test_stream_answer_reports_error_once_without_output(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=556)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def stream_fn(*_args, **_kwargs):
+            raise KeyError("broken tool")
+
+        with self.assertRaises(KeyError):
+            asyncio.run(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                )
+            )
+        self.assertEqual(edited[-1], core.ERROR_NOTICE)
+
+    def test_stream_answer_marks_error_after_partial_answer(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=557)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def stream_fn(_messages, _model, _chat_id, on_delta, *_args, **_kwargs):
+            await on_delta("первая часть")
+            raise ValueError("поток оборвался")
+
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                )
+            )
+        self.assertEqual(edited[-1], f"первая часть\n\n{core.ERROR_NOTICE}")
+        self.assertNotIn((1, 557), store.recent_reply_ids)
+
+    def test_final_text_without_error_keeps_answer(self):
+        state = {"reasoning_parts": [], "tool_parts": []}
+        self.assertEqual(
+            core._final_text(state, lambda: "ответ", "ответ", None), "ответ"
+        )
+        self.assertEqual(
+            core._final_text(state, lambda: "…", "", None),
+            "(пустой ответ / empty answer)",
+        )
+        state["tool_parts"] = ["get_time"]
+        rendered = core._final_text(
+            state,
+            lambda: tools_module.render_response("", [], ["get_time"], "…"),
+            "",
+            None,
+        )
+        self.assertIn("get_time", rendered)
+
     def test_stream_answer_sends_message_when_placeholder_failed(self):
         store = _StoreStub()
         sent = []
@@ -2919,6 +3030,19 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(memory._tags_list(""), [])
         self.assertEqual(memory._clean_tags(["t" * 600]), "")
 
+    def test_schema_is_restored_when_table_is_gone(self):
+        memory.remember(1, "k", "v")
+        self.assertIn(str(memory.DB_PATH), memory._initialized)
+        conn = sqlite3.connect(str(memory.DB_PATH))
+        try:
+            conn.execute("DROP TABLE memories")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertTrue(memory.remember(1, "k2", "v2")["ok"])
+        self.assertEqual(memory.recall(1, "k2")["items"][0]["value"], "v2")
+        self.assertEqual(memory.list_memories(1)["count"], 1)
+
 
 class SkillsStoreTest(unittest.TestCase):
     def setUp(self):
@@ -2998,6 +3122,19 @@ class SkillsStoreTest(unittest.TestCase):
         self.assertEqual(skills._clean_tags(None), "")
         self.assertEqual(skills._clean_tags(" a , b ; a "), "a,b")
         self.assertEqual(skills._tags_list(""), [])
+
+    def test_schema_is_restored_when_table_is_gone(self):
+        skills.save_skill("n", "d", "b")
+        self.assertIn(str(skills.DB_PATH), skills._initialized)
+        conn = sqlite3.connect(str(skills.DB_PATH))
+        try:
+            conn.execute("DROP TABLE skills")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(skills.save_skill("n2", "d", "b")["action"], "created")
+        self.assertTrue(skills.load_skill("n2", touch=False)["ok"])
+        self.assertEqual(skills.stats()["count"], 1)
 
 
 class _FakeMessage:
@@ -3988,6 +4125,17 @@ class SubagentsTest(BotTestCase):
         self.assertTrue(all_tools)
         picked = subagents._select_tools(["evaluate"])
         self.assertTrue(any(t["function"]["name"] == "evaluate" for t in picked))
+
+    def test_select_tools_follows_schema_changes(self):
+        extra = {
+            "type": "function",
+            "function": {"name": "probe_time", "parameters": {"type": "object"}},
+        }
+        with mock.patch.object(tools_module, "TOOLS", [*tools_module.TOOLS, extra]):
+            names = [t["function"]["name"] for t in subagents._select_tools(None)]
+        self.assertIn("probe_time", names)
+        names_after = [t["function"]["name"] for t in subagents._select_tools(None)]
+        self.assertNotIn("probe_time", names_after)
 
     def test_loads_and_assistant_message(self):
         self.assertEqual(subagents._loads(""), {})

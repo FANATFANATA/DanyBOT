@@ -127,8 +127,8 @@ def _subprocess_env() -> dict[str, str]:
     return env
 
 
-def _resolve_path(raw, root=None):
-    base = (root or CODER_ROOT).resolve()
+def _resolve_path(raw):
+    base = CODER_ROOT.resolve()
     candidate = Path(str(raw).strip() if raw else ".")
     if not candidate.is_absolute():
         candidate = base / candidate
@@ -295,9 +295,12 @@ def render_response(
         parts.append(f"reasoning:\n{reasoning}")
     if show_tools:
         seen = []
+        marked = set()
         for tool in tool_parts:
-            if tool not in seen:
-                seen.append(tool)
+            if tool in marked:
+                continue
+            marked.add(tool)
+            seen.append(tool)
         if seen:
             parts.append("tools: " + ", ".join(seen))
     if answer:

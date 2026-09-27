@@ -183,7 +183,17 @@ def proxy_to_telethon(item):
 def telethon_to_item(proxy_dict):
     if not proxy_dict:
         return None
-    return (proxy_dict["proxy_type"], proxy_dict["addr"], proxy_dict["port"])
+    try:
+        protocol = proxy_dict["proxy_type"]
+        host = proxy_dict["addr"]
+        port = int(proxy_dict["port"])
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.debug("Некорректный прокси %r: %r", proxy_dict, exc)
+        return None
+    if not protocol or not host or port <= 0:
+        logger.debug("Некорректный прокси %r", proxy_dict)
+        return None
+    return (str(protocol), str(host), port)
 
 
 async def validate_one_mtproto(proxy_dict, timeout=12):

@@ -592,6 +592,8 @@ async def fetch_replied_text(message):
 
 QUOTE_HEADER = "Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
 
+ERROR_NOTICE = "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+
 
 def compose_prompt(prompt, replied_text, limit):
     if not replied_text:
@@ -852,11 +854,15 @@ def _final_text(state, render, full_answer, error):
     final_text = render()
     stripped = final_text.strip()
     if stripped and stripped != "…":
-        return final_text
-    if full_answer.strip():
-        return full_answer
-    if state["reasoning_parts"] or state["tool_parts"]:
-        return final_text
-    if error is not None:
-        return "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-    return "(пустой ответ / empty answer)"
+        text = final_text
+    elif full_answer.strip():
+        text = full_answer
+    elif state["reasoning_parts"] or state["tool_parts"]:
+        text = final_text
+    elif error is not None:
+        text = ERROR_NOTICE
+    else:
+        text = "(пустой ответ / empty answer)"
+    if error is not None and text != ERROR_NOTICE:
+        text = f"{text}\n\n{ERROR_NOTICE}"
+    return text
