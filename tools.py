@@ -20,6 +20,8 @@ from typing import Any
 import httpx
 from telethon.errors import RPCError
 
+import core
+
 logger = logging.getLogger("danybot.tools")
 
 SAFE_FUNCS = {
@@ -48,8 +50,10 @@ MAX_WRITE_BYTES = 500_000
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILES = 4000
+MAX_SEARCH_NODES = 40000
 MAX_SEARCH_FILE_BYTES = 2_000_000
 MAX_SEARCH_PATTERN = 250
+SEARCH_TIMEOUT = 30
 MAX_SCRIPT_BYTES = 200_000
 MAX_SCRIPT_OUTPUT = 4000
 MAX_SHELL_OUTPUT = 4000
@@ -253,13 +257,17 @@ def render_response(
         parts.append(answer)
     text = prefix + "\n\n".join(parts)
     if len(text) > MAX_RENDER_CHARS:
-        for drop in (0, 1):
-            if drop < len(parts):
-                kept = [p for i, p in enumerate(parts) if i != drop]
-                candidate = prefix + "\n\n".join(kept)
-                if len(candidate) <= MAX_RENDER_CHARS:
-                    text = candidate
-                    break
+        droppable = list(range(len(parts) - 1))
+        combos: list[tuple[int, ...]] = [()]
+        combos.extend((i,) for i in droppable)
+        if len(droppable) > 1:
+            combos.append(tuple(droppable))
+        for combo in combos:
+            kept = [p for i, p in enumerate(parts) if i not in combo]
+            candidate = prefix + "\n\n".join(kept)
+            if len(candidate) <= MAX_RENDER_CHARS:
+                text = candidate
+                break
     if len(text) > MAX_RENDER_CHARS:
         text = text[: MAX_RENDER_CHARS - 1] + "…"
     return text
@@ -773,7 +781,7 @@ class _OutputSink:
         if self.truncated:
             return
         room = self.cap - self.size
-        if len(chunk) >= room:
+        if len(chunk) > room:
             self.parts.append(chunk[:room])
             self.size = self.cap
             self.truncated = True
@@ -797,15 +805,29 @@ def _exit_code(proc) -> int:
     return proc.returncode if proc.returncode is not None else -1
 
 
+DRAIN_GRACE = 5
+
+
+def _close_pipes(proc) -> None:
+    close = getattr(getattr(proc, "_transport", None), "close", None)
+    if close is None:
+        return
+    with contextlib.suppress(Exception):
+        close()
+
+
 async def _collect_process(proc, timeout: int, cap: int) -> tuple[int, str, str, str]:
     out = _OutputSink(cap)
     err = _OutputSink(cap)
     drain = asyncio.gather(_drain(proc.stdout, out), _drain(proc.stderr, err))
     try:
         try:
-            await asyncio.wait_for(drain, timeout=timeout)
+            await asyncio.wait_for(asyncio.shield(drain), timeout=timeout)
         except asyncio.TimeoutError:
             await _kill_process(proc)
+            _close_pipes(proc)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(drain, timeout=DRAIN_GRACE)
             return -1, out.text(), err.text(), f"Таймаут {timeout}s: команда прервана."
         with contextlib.suppress(Exception):
             await asyncio.wait_for(proc.wait(), timeout=5)
@@ -865,30 +887,48 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
 
 
 _httpx_singleton = None
+_httpx_loop = None
+
+
+def _build_httpx_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        timeout=30,
+        follow_redirects=True,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
+    )
 
 
 def _get_httpx_client():
-    global _httpx_singleton
-    if _httpx_singleton is None or _httpx_singleton.is_closed:
-        _httpx_singleton = httpx.AsyncClient(
-            timeout=30,
-            follow_redirects=True,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-                ),
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            limits=httpx.Limits(max_keepalive_connections=20, keepalive_expiry=30.0),
-        )
+    global _httpx_singleton, _httpx_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if _httpx_singleton is not None and not _httpx_singleton.is_closed:
+        if loop is _httpx_loop:
+            return _httpx_singleton
+        stale, stale_loop = _httpx_singleton, _httpx_loop
+        _httpx_singleton = None
+        if stale_loop is not None and stale_loop.is_running():
+            with contextlib.suppress(RuntimeError):
+                stale_loop.create_task(stale.aclose())
+    _httpx_loop = loop
+    _httpx_singleton = _build_httpx_client()
     return _httpx_singleton
 
 
 async def close_httpx_client() -> None:
-    global _httpx_singleton
+    global _httpx_singleton, _httpx_loop
     client = _httpx_singleton
     _httpx_singleton = None
+    _httpx_loop = None
     if client is None:
         return
     with contextlib.suppress(Exception):
@@ -955,6 +995,13 @@ def _parse_ddg(text, limit):
 SEARCH_ENGINES = ((BRAVE_SEARCH_URL, _parse_brave), (DDG_SEARCH_URL, _parse_ddg))
 
 
+def _error_label(exc) -> str:
+    code = getattr(getattr(exc, "response", None), "status_code", None)
+    if code is not None:
+        return f"HTTP {code}"
+    return type(exc).__name__
+
+
 async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False):
     query = _str_arg(arguments, "query")
     if not query:
@@ -967,7 +1014,7 @@ async def _tool_web_search(arguments, chat_id, client, stats, unrestricted=False
             resp = await hc.get(url, params={"q": query}, timeout=20)
             resp.raise_for_status()
         except (httpx.HTTPError, OSError, ValueError) as exc:
-            errors.append(f"{url}: {exc}")
+            errors.append(f"{url}: {_error_label(exc)}")
             continue
         results = parser(resp.text, limit)
         if results:
@@ -1043,21 +1090,55 @@ async def _tool_fetch_url(arguments, chat_id, client, stats, unrestricted=False)
             else:
                 return "Слишком много перенаправлений."
     except TimeoutError:
-        return f"Таймаут {FETCH_TIMEOUT}s: загрузка прервана."
+        return f"Таймаут {FETCH_TIMEOUT + 5}s: загрузка прервана."
     page = raw.decode("utf-8", errors="replace")
-    cleaned = re.sub(
-        r"<script[^>]*>.*?</script>", " ", page, flags=re.DOTALL | re.IGNORECASE
-    )
-    cleaned = re.sub(
-        r"<style[^>]*>.*?</style>", " ", cleaned, flags=re.DOTALL | re.IGNORECASE
-    )
-    cleaned = re.sub(r"<[^>]+>", " ", cleaned)
-    cleaned = html.unescape(cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = _strip_page(page)
     text = cleaned[:max_chars]
     if truncated:
         text += "\n… (загрузка обрезана)"
     return text
+
+
+MAX_TAG_BYTES = 2000
+_SKIP_TAGS = ("script", "style")
+
+
+def _strip_page(raw: str) -> str:
+    out: list[str] = []
+    size = len(raw)
+    pos = 0
+    skip_name = ""
+    while pos < size:
+        lt = raw.find("<", pos)
+        if lt < 0:
+            break
+        limit = min(size, lt + MAX_TAG_BYTES)
+        gt = lt + 1
+        while gt < limit and raw[gt] != ">":
+            gt += 1
+        if gt >= limit:
+            pos = limit
+            continue
+        tag = raw[lt + 1 : gt]
+        closing = tag.startswith("/")
+        if closing:
+            tag = tag[1:]
+        cut = 0
+        while cut < len(tag) and (tag[cut].isalnum() or tag[cut] in "-_:."):
+            cut += 1
+        name = tag[:cut].lower()
+        if not skip_name:
+            out.append(raw[pos:lt])
+        if name in _SKIP_TAGS:
+            if closing:
+                if name == skip_name:
+                    skip_name = ""
+            elif not skip_name:
+                skip_name = name
+        pos = gt + 1
+    if not skip_name:
+        out.append(raw[pos:])
+    return re.sub(r"\s+", " ", html.unescape(" ".join(out))).strip()
 
 
 async def _read_capped(resp, cap: int) -> tuple[bytes, bool]:
@@ -1068,7 +1149,7 @@ async def _read_capped(resp, cap: int) -> tuple[bytes, bool]:
         if room <= 0:
             truncated = True
             break
-        if len(chunk) >= room:
+        if len(chunk) > room:
             buf.extend(chunk[:room])
             truncated = True
             break
@@ -1206,9 +1287,10 @@ async def _tool_write_file(arguments, chat_id, client, stats, unrestricted=False
     existed = path.exists()
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
         return f"Ошибка записи: {exc}"
+    if not core._write_text_atomic(path, content):
+        return f"Ошибка записи: {path}"
     action = "Перезаписан" if existed else "Создан"
     return f"{action}: {path} ({len(content)} символов)"
 
@@ -1239,11 +1321,16 @@ async def _tool_edit_file(arguments, chat_id, client, stats, unrestricted=False)
     if count > 1 and not replace_all:
         return f"Фрагмент встречается {count} раз, уточни old_string или replace_all."
     updated = raw.replace(old, new) if replace_all else raw.replace(old, new, 1)
-    try:
-        path.write_text(updated, encoding="utf-8")
-    except (OSError, ValueError) as exc:
-        return f"Ошибка записи: {exc}"
-    return f"Изменён: {path} (замен {count if replace_all else 1})"
+    size = len(updated.encode("utf-8"))
+    if size > MAX_WRITE_BYTES:
+        return f"Слишком большой объём: {size} байт"
+    if not core._write_text_atomic(path, updated):
+        return f"Ошибка записи: {path}"
+    return f"Изменён: {path} (замен {count if replace_all else 1}, {size} байт)"
+
+
+def _list_entries(path: Path) -> list[Path]:
+    return sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
 
 
 async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
@@ -1255,7 +1342,7 @@ async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
     if path.is_file():
         return f"Это файл: {path}. Используй read_file."
     try:
-        entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
+        entries = await asyncio.to_thread(_list_entries, path)
     except OSError as exc:
         return f"Ошибка чтения каталога: {exc}"
     rows = []
@@ -1279,10 +1366,16 @@ async def _tool_list_dir(arguments, chat_id, client, stats, unrestricted=False):
 def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
     matches: list[str] = []
     scanned = 0
+    visited = 0
     candidates = [root] if root.is_file() else root.rglob(glob_pat)
     for item in candidates:
-        if len(matches) >= limit or scanned >= MAX_SEARCH_FILES:
+        if (
+            len(matches) >= limit
+            or scanned >= MAX_SEARCH_FILES
+            or visited >= MAX_SEARCH_NODES
+        ):
             break
+        visited += 1
         if not item.is_file():
             continue
         try:
@@ -1317,7 +1410,13 @@ async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=Fal
         rx = re.compile(pattern)
     except re.error as exc:
         return f"Некорректное выражение: {exc}"
-    matches = await asyncio.to_thread(_scan_files, path, glob_pat, rx, limit)
+    try:
+        matches = await asyncio.wait_for(
+            asyncio.to_thread(_scan_files, path, glob_pat, rx, limit),
+            timeout=SEARCH_TIMEOUT,
+        )
+    except TimeoutError:
+        return f"Таймаут поиска: {SEARCH_TIMEOUT}s"
     if not matches:
         return "Совпадений не найдено."
     return "\n".join(matches)
@@ -1340,8 +1439,8 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
         with tempfile.NamedTemporaryFile(
             "w", suffix=".py", delete=False, encoding="utf-8"
         ) as handle:
-            handle.write(code)
             script_path = Path(handle.name)
+            handle.write(code)
         proc = await asyncio.create_subprocess_exec(
             sys.executable,
             str(script_path),

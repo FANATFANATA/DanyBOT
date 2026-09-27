@@ -64,6 +64,8 @@ def _bool_command(name, arg):
 
 VISIBILITY_COMMANDS = ("reasoning", "reasoning_status", "tools", "tools_status")
 
+OWNER_COMMANDS = ("clear", "model")
+
 VISIBILITY_LABELS = {
     "reasoning": "Рассуждения / Reasoning",
     "tools": "Инструменты / Tools",
@@ -274,22 +276,35 @@ def _replace_with_retry(tmp_name, path) -> None:
             time.sleep(_REPLACE_DELAY)
 
 
+def _build_payload(builder) -> str:
+    attempt = 0
+    while True:
+        try:
+            return builder()
+        except RuntimeError:
+            attempt += 1
+            if attempt >= _REPLACE_ATTEMPTS:
+                raise
+            time.sleep(_REPLACE_DELAY)
+
+
 def _write_text_atomic(path, text) -> bool:
     tmp_name = None
     try:
         with _write_lock(path):
+            payload = _build_payload(text) if callable(text) else text
             handle, tmp_name = tempfile.mkstemp(
                 dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
             )
             os.close(handle)
             with open(tmp_name, "w", encoding="utf-8") as stream:
-                stream.write(text)
+                stream.write(payload)
             if path.is_file():
                 os.chmod(tmp_name, stat.S_IMODE(path.stat().st_mode))
             _replace_with_retry(tmp_name, path)
             tmp_name = None
         return True
-    except (OSError, TypeError, ValueError):
+    except (OSError, TypeError, ValueError, RuntimeError):
         return False
     finally:
         if tmp_name is not None:
@@ -298,15 +313,16 @@ def _write_text_atomic(path, text) -> bool:
 
 
 def save_state_file(path, state):
-    data = {
-        "model_overrides": {str(k): v for k, v in state["model_overrides"].items()},
-        "coder_chats": sorted(state.get("coder_chats", [])),
-        "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
-        "tools_hidden": sorted(state.get("tools_hidden", [])),
-    }
-    return _write_text_atomic(
-        path, json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    )
+    def snapshot():
+        data = {
+            "model_overrides": {str(k): v for k, v in state["model_overrides"].items()},
+            "coder_chats": sorted(state.get("coder_chats", [])),
+            "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
+            "tools_hidden": sorted(state.get("tools_hidden", [])),
+        }
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    return _write_text_atomic(path, snapshot)
 
 
 def load_history_file(path, dm_limit, group_limit):
@@ -330,10 +346,11 @@ def load_history_file(path, dm_limit, group_limit):
 
 
 def save_history_file(path, history):
-    data = {str(k): list(v) for k, v in history.items()}
-    return _write_text_atomic(
-        path, json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-    )
+    def snapshot():
+        data = {str(k): list(v) for k, v in history.items()}
+        return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    return _write_text_atomic(path, snapshot)
 
 
 _MODE_KEYS = (
@@ -592,11 +609,14 @@ def handle_command_state(
     cmd = command[0]
     if cmd == "clear":
         limit = dm_limit if is_private else group_limit
-        chat_history[chat_id] = deque(maxlen=limit)
+        hist = chat_history.setdefault(chat_id, deque(maxlen=limit))
+        hist.clear()
         return ("Контекст очищен. / Context cleared.", False, True)
     if cmd == "model":
         val = command[1]
         if val:
+            if models_list and val not in models_list:
+                return (models_text(val, models_list), False, False)
             model_overrides[chat_id] = val
             return (f"Модель установлена / Model set: {val}", True, False)
         current = model_overrides.get(chat_id, default_model)
@@ -737,6 +757,7 @@ async def stream_answer(
     owner_id=None,
     logger=None,
     stats=None,
+    delivery=None,
 ):
     import userbot as userbot_module
 
@@ -749,6 +770,7 @@ async def stream_answer(
         state["edit_id"] = self_edit_id
     error = None
     result = None
+    delivered = False
     caught = (*STREAM_ERRORS, userbot_module.OpenAIError, RPCError)
     try:
         try:
@@ -779,18 +801,21 @@ async def stream_answer(
         final_text = _final_text(state, render, full_answer, error)
         if state["edit_id"] is not None:
             edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
+            delivered = bool(edited)
             if not edited and placeholder_id is not None:
                 if logger is not None:
                     logger.warning(
                         "финальный edit не удался, отправляю ответ новым сообщением"
                     )
-                await reply_fn(event, final_text)
+                delivered = bool(await reply_fn(event, final_text))
         elif not is_self:
-            await reply_fn(event, final_text)
+            delivered = bool(await reply_fn(event, final_text))
     finally:
         if placeholder_id is not None:
             store.recent_reply_ids.discard((chat_id, placeholder_id))
     if error is not None:
+        if delivery is not None:
+            delivery["delivered"] = delivered
         raise error
     return full_answer
 

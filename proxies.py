@@ -14,7 +14,7 @@ from telethon.errors import RPCError
 from telethon.sessions import MemorySession
 from telethon.tl.functions.help import GetConfigRequest
 
-from core import _env_bool, _env_int
+from core import AUTO_OFF_WORDS, _env_bool, _env_int, _write_text_atomic
 
 logger = logging.getLogger("danybot.proxy")
 
@@ -97,12 +97,10 @@ MAX_CACHED_RAW = 5000
 
 
 def _cache_write(path, text) -> bool:
-    try:
-        path.write_text(text, encoding="utf-8")
+    if _write_text_atomic(path, text):
         return True
-    except (OSError, TypeError, ValueError) as exc:
-        logger.warning("Не удалось записать кэш %s: %s", path.name, exc)
-        return False
+    logger.warning("Не удалось записать кэш %s", path.name)
+    return False
 
 
 def parse_proxy_lines(text: str, protocol: str):
@@ -348,7 +346,7 @@ def proxies_enabled():
     raw = os.getenv("PROXY_ENABLED")
     if raw is None:
         return True
-    return raw.strip().lower() not in ("0", "false", "no", "")
+    return raw.strip().lower() not in (*AUTO_OFF_WORDS, "")
 
 
 async def get_proxy_candidates(limit=40, deadline=180.0):
@@ -379,11 +377,6 @@ async def get_proxy_candidates(limit=40, deadline=180.0):
                 candidates.append(d)
 
     return candidates
-
-
-async def get_proxy():
-    c = await get_proxy_candidates(limit=5)
-    return c[0] if c else None
 
 
 async def main():

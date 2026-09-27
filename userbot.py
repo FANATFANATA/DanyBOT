@@ -168,7 +168,7 @@ HANDLER_ERRORS: tuple[type[BaseException], ...] = (
     OpenAIError,
 )
 
-SANITIZED_TOOLS = ("run_shell", "execute_script")
+SANITIZED_TOOLS = ("run_shell", "execute_script", "run_subagent")
 
 
 def _read_extra_system(path):
@@ -653,8 +653,14 @@ async def stream_with_tools(
         async def run_slot(slot):
             try:
                 args = json.loads(slot["arguments"] or "{}")
-            except (json.JSONDecodeError, ValueError):
-                args = {}
+            except (json.JSONDecodeError, ValueError) as exc:
+                snippet = str(slot["arguments"])[:200]
+                return f"Некорректный JSON аргументов: {exc}. Args: {snippet}"
+            if not isinstance(args, dict):
+                return (
+                    "Аргументы должны быть объектом JSON, получено: "
+                    f"{type(args).__name__}"
+                )
             verify_model = TOOL_VERIFY_MODEL or model
             if (
                 verify_tools
@@ -662,6 +668,8 @@ async def stream_with_tools(
                 and not await verify_tool_call(slot["name"], args, verify_model)
             ):
                 return None
+            if on_tool is not None:
+                await on_tool(slot["name"])
             result = await execute_tool(
                 slot["name"],
                 args,
@@ -693,8 +701,6 @@ async def stream_with_tools(
                     }
                 )
                 continue
-            if on_tool is not None:
-                await on_tool(slot["name"])
             working.append(
                 {
                     "role": "tool",
@@ -848,6 +854,9 @@ async def handler(event: Any):
         return
 
     if command:
+        if command[0] in core.OWNER_COMMANDS and sender_id not in OWNER_IDS:
+            await safe_reply(event, "Команда доступна только владельцу.")
+            return
         resp = core.handle_command_state(
             command,
             chat_id,
@@ -905,12 +914,12 @@ async def handler(event: Any):
     replied_text = await core.fetch_replied_text(message)
 
     if replied_text:
+        quoted = replied_text[: max(1, MAX_REQUEST_LEN // 2)]
         if prompt:
-            prompt = (
-                f"Сообщение, на которое ответили:\n{replied_text}\n\nЗапрос: {prompt}"
-            )
+            header = f"Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
+            prompt = header + prompt[: max(1, MAX_REQUEST_LEN - len(header))]
         else:
-            prompt = replied_text
+            prompt = quoted
 
     if not prompt:
         return
@@ -943,6 +952,7 @@ async def handler(event: Any):
         prefix = f"{model}:\n\n"
         self_edit_id = None
 
+    delivery: dict[str, bool] = {}
     try:
         full_answer = await core.stream_answer(
             STORE,
@@ -966,16 +976,23 @@ async def handler(event: Any):
             owner_id=sender_id,
             logger=logger,
             stats=_bot_stats,
+            delivery=delivery,
         )
 
         async with ctx_lock:
-            hist.append({"role": "assistant", "content": full_answer})
+            if chat_id in chat_history:
+                chat_history[chat_id].append(
+                    {"role": "assistant", "content": full_answer}
+                )
+            else:
+                hist.append({"role": "assistant", "content": full_answer})
         HISTORY_SAVER.mark_dirty()
     except HANDLER_ERRORS:
         logger.exception("Ошибка генерации ответа")
-        await safe_reply(
-            event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-        )
+        if not delivery.get("delivered"):
+            await safe_reply(
+                event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+            )
 
 
 async def disconnect_quietly(timeout=10):

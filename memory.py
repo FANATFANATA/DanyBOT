@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import time
@@ -13,6 +14,7 @@ MAX_VALUE = 20000
 MAX_TAGS = 500
 MAX_QUERY = 200
 MAX_LIMIT = 200
+MAX_ROWS_PER_CHAT = 2000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS memories (
@@ -40,9 +42,25 @@ def _connect():
     conn.row_factory = sqlite3.Row
     key = str(DB_PATH)
     if key not in _initialized:
-        conn.executescript(_SCHEMA)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+        except sqlite3.Error:
+            conn.close()
+            raise
         _initialized.add(key)
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def _prune(conn, chat_id: int) -> None:
+    conn.execute(
+        "DELETE FROM memories WHERE chat_id=? AND id NOT IN ("
+        "SELECT id FROM memories WHERE chat_id=? ORDER BY updated_at DESC, id DESC LIMIT ?"
+        ")",
+        (int(chat_id), int(chat_id), MAX_ROWS_PER_CHAT),
+    )
 
 
 def _now():
@@ -95,26 +113,18 @@ def remember(chat_id: int, key: str, value: str, tags: Any = None) -> dict:
     now = _now()
     with closing(_connect()) as conn:
         cur = conn.execute(
-            "SELECT id, created_at FROM memories WHERE chat_id=? AND key=?",
-            (int(chat_id), key),
+            "INSERT INTO memories (chat_id, key, value, tags, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(chat_id, key) DO UPDATE SET "
+            "value=excluded.value, tags=excluded.tags, updated_at=excluded.updated_at "
+            "RETURNING id, created_at",
+            (int(chat_id), key, value, tags_clean, now, now),
         )
         row = cur.fetchone()
-        if row:
-            conn.execute(
-                "UPDATE memories SET value=?, tags=?, updated_at=? WHERE id=?",
-                (value, tags_clean, now, row["id"]),
-            )
-            action = "updated"
-            mem_id = row["id"]
-        else:
-            cur = conn.execute(
-                "INSERT INTO memories (chat_id, key, value, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (int(chat_id), key, value, tags_clean, now, now),
-            )
-            action = "created"
-            mem_id = cur.lastrowid
+        _prune(conn, int(chat_id))
         conn.commit()
-    return {"ok": True, "action": action, "id": mem_id, "key": key}
+    action = "created" if row["created_at"] == now else "updated"
+    return {"ok": True, "action": action, "id": row["id"], "key": key}
 
 
 def recall(chat_id: int, key: str = "", query: str = "", limit: int = 10) -> dict:
@@ -184,7 +194,7 @@ def stats(chat_id: int) -> dict:
             "SELECT COUNT(*) AS n FROM memories WHERE chat_id=?", (int(chat_id),)
         )
         n = cur.fetchone()["n"]
-    return {"ok": True, "chat_id": int(chat_id), "count": n, "db": str(DB_PATH)}
+    return {"ok": True, "chat_id": int(chat_id), "count": n, "db": DB_PATH.name}
 
 
 def dumps(data):

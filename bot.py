@@ -267,6 +267,9 @@ async def handler(event: Any):
         return
 
     if command:
+        if command[0] in core.OWNER_COMMANDS and sender_id not in userbot.OWNER_IDS:
+            await safe_reply(event, "Команда доступна только владельцу.")
+            return
         resp = core.handle_command_state(
             command,
             chat_id,
@@ -327,21 +330,22 @@ async def handler(event: Any):
 
     logger.info("Бот: запрос из чата %s от %s: %s", chat_id, sender_id, text[:100])
 
+    limit = userbot.MAX_REQUEST_LEN
     prompt = _strip_mention(text.strip())
 
     if replied_text:
+        quoted = replied_text[: max(1, limit // 2)]
         if prompt:
-            prompt = (
-                f"Сообщение, на которое ответили:\n{replied_text}\n\nЗапрос: {prompt}"
-            )
+            header = f"Сообщение, на которое ответили:\n{quoted}\n\nЗапрос: "
+            prompt = header + prompt[: max(1, limit - len(header))]
         else:
-            prompt = replied_text
+            prompt = quoted
 
     if not prompt:
         return
 
-    if len(prompt) > userbot.MAX_REQUEST_LEN:
-        prompt = prompt[: userbot.MAX_REQUEST_LEN]
+    if len(prompt) > limit:
+        prompt = prompt[:limit]
 
     model = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     mode = "coder" if coder_active else "bot"
@@ -383,6 +387,7 @@ async def handler(event: Any):
         prefix = ""
         self_edit_id = None
 
+    delivery: dict[str, bool] = {}
     try:
         full_answer = await core.stream_answer(
             STORE,
@@ -406,16 +411,23 @@ async def handler(event: Any):
             owner_id=sender_id,
             logger=logger,
             stats=_bot_stats,
+            delivery=delivery,
         )
 
         async with ctx_lock:
-            hist.append({"role": "assistant", "content": full_answer})
+            if chat_id in chat_history:
+                chat_history[chat_id].append(
+                    {"role": "assistant", "content": full_answer}
+                )
+            else:
+                hist.append({"role": "assistant", "content": full_answer})
         HISTORY_SAVER.mark_dirty()
     except userbot.HANDLER_ERRORS:
         logger.exception("Бот: ошибка генерации ответа")
-        await safe_reply(
-            event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
-        )
+        if not delivery.get("delivered"):
+            await safe_reply(
+                event, "Ошибка при обращении к DanyAPI. / DanyAPI request error."
+            )
 
 
 def _settings_rows(chat_id):
@@ -465,17 +477,17 @@ def _model_digest(name: str) -> str:
     return hashlib.sha256(name.encode("utf-8")).hexdigest()[:12]
 
 
-def _resolve_picked_model(arg: str) -> str:
+def _resolve_picked_model(arg: str) -> str | None:
     if arg.startswith("#"):
         digest = arg[1:]
         for name in userbot.MODELS:
             if _model_digest(name).startswith(digest):
                 return name
-        return arg
+        return None
     for name in userbot.MODELS:
         if name == arg:
             return name
-    return arg
+    return None
 
 
 def _current_model_label(chat_id):
@@ -545,11 +557,16 @@ async def callback_handler(event: Any):
         if chat_id > 0:
             limit = userbot.DM_HISTORY_LIMIT
         async with ctx_lock:
-            chat_history[chat_id] = deque(maxlen=limit)
+            chat_history.setdefault(chat_id, deque(maxlen=limit)).clear()
         save_history()
     elif action == "pick" and arg:
+        picked = _resolve_picked_model(arg)
+        if picked is None:
+            await _answer(event, "Модель больше недоступна.", alert=True)
+            await _edit_settings(event, chat_id)
+            return
         async with ctx_lock:
-            model_overrides[chat_id] = _resolve_picked_model(arg)
+            model_overrides[chat_id] = picked
         save_state()
         await _answer(event, "Модель обновлена.")
         await _edit_settings(event, chat_id)

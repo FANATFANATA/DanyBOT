@@ -1,3 +1,4 @@
+import contextlib
 import json
 import sqlite3
 import time
@@ -14,6 +15,7 @@ MAX_BODY = 50000
 MAX_TAGS = 500
 MAX_QUERY = 200
 MAX_LIMIT = 200
+MAX_SKILLS = 2000
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS skills (
@@ -40,9 +42,25 @@ def _connect():
     conn.row_factory = sqlite3.Row
     key = str(DB_PATH)
     if key not in _initialized:
-        conn.executescript(_SCHEMA)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.executescript(_SCHEMA)
+        except sqlite3.Error:
+            conn.close()
+            raise
         _initialized.add(key)
+    with contextlib.suppress(sqlite3.Error):
+        conn.execute("PRAGMA busy_timeout=10000")
     return conn
+
+
+def _prune(conn) -> None:
+    conn.execute(
+        "DELETE FROM skills WHERE id NOT IN ("
+        "SELECT id FROM skills ORDER BY uses DESC, updated_at DESC, id DESC LIMIT ?"
+        ")",
+        (MAX_SKILLS,),
+    )
 
 
 def _now():
@@ -97,24 +115,20 @@ def save_skill(name: str, description: str, body: str, tags: Any = None) -> dict
     tags_clean = _clean_tags(tags)
     now = _now()
     with closing(_connect()) as conn:
-        cur = conn.execute("SELECT id FROM skills WHERE name=?", (name,))
+        cur = conn.execute(
+            "INSERT INTO skills (name, description, body, tags, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET "
+            "description=excluded.description, body=excluded.body, "
+            "tags=excluded.tags, updated_at=excluded.updated_at "
+            "RETURNING id, created_at",
+            (name, description, body, tags_clean, now, now),
+        )
         row = cur.fetchone()
-        if row:
-            conn.execute(
-                "UPDATE skills SET description=?, body=?, tags=?, updated_at=? WHERE id=?",
-                (description, body, tags_clean, now, row["id"]),
-            )
-            action = "updated"
-            skill_id = row["id"]
-        else:
-            cur = conn.execute(
-                "INSERT INTO skills (name, description, body, tags, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                (name, description, body, tags_clean, now, now),
-            )
-            action = "created"
-            skill_id = cur.lastrowid
+        _prune(conn)
         conn.commit()
-    return {"ok": True, "action": action, "id": skill_id, "name": name}
+    action = "created" if row["created_at"] == now else "updated"
+    return {"ok": True, "action": action, "id": row["id"], "name": name}
 
 
 def load_skill(name: str, touch: bool = True) -> dict:
@@ -128,9 +142,9 @@ def load_skill(name: str, touch: bool = True) -> dict:
             return {"ok": False, "error": f"Скилл не найден: {name}"}
         uses = int(row["uses"] or 0)
         if touch:
-            uses += 1
-            conn.execute("UPDATE skills SET uses=? WHERE id=?", (uses, row["id"]))
+            conn.execute("UPDATE skills SET uses=uses+1 WHERE id=?", (row["id"],))
             conn.commit()
+            uses += 1
         data = _row_to_dict(row)
         data["uses"] = uses
         return {"ok": True, "skill": data}
@@ -179,7 +193,7 @@ def stats() -> dict:
     with closing(_connect()) as conn:
         cur = conn.execute("SELECT COUNT(*) AS n FROM skills")
         n = cur.fetchone()["n"]
-    return {"ok": True, "count": n, "db": str(DB_PATH)}
+    return {"ok": True, "count": n, "db": DB_PATH.name}
 
 
 def dumps(data):

@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest import mock
 
+import httpx
 from telethon.crypto import AuthKey
 from telethon.errors import AuthKeyError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
@@ -50,6 +51,10 @@ LOG_FILE = PROJECT_DIR / "toolrun.log"
 BOT_AUTH_VALUE = "bot-token"
 NO_AUTH = ""
 _log_lines: list[str] = []
+
+
+def _raise_oserror(*_args, **_kwargs):
+    raise OSError(28, "No space left on device")
 
 
 def log_open():
@@ -599,7 +604,7 @@ class ProxyToggleTest(BotTestCase):
             self.assertTrue(proxies.proxies_enabled())
 
     def test_disabled_values(self):
-        for value in ("0", "false", "no", "", "FALSE", "No", " "):
+        for value in ("0", "false", "no", "", "FALSE", "No", " ", "off", "OFF"):
             with (
                 self.subTest(value=value),
                 mock.patch.dict(os.environ, {"PROXY_ENABLED": value}),
@@ -1445,6 +1450,109 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(answer, "отказ")
         self.assertEqual(tools_seen, [])
         self.assertEqual(self.tool_calls_made, [])
+
+    def test_broken_tool_arguments_are_reported(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(
+                                    tc_id="c1", name="evaluate", arguments="{not json"
+                                )
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="починено"))],
+            ]
+        )
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "q"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        self.assertEqual(answer, "починено")
+        self.assertEqual(self.tool_calls_made, [])
+        second = fake_ai.chat.completions.calls[1]["messages"]
+        tool_msgs = [m for m in second if m.get("role") == "tool"]
+        self.assertTrue(tool_msgs)
+        self.assertIn("Некорректный JSON", tool_msgs[0]["content"])
+
+    def test_non_object_tool_arguments_are_reported(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(tc_id="c1", name="evaluate", arguments="[1]")
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="ок"))],
+            ]
+        )
+        asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "q"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        self.assertEqual(self.tool_calls_made, [])
+        second = fake_ai.chat.completions.calls[1]["messages"]
+        tool_msgs = [m for m in second if m.get("role") == "tool"]
+        self.assertIn("объектом JSON", tool_msgs[0]["content"])
+
+    def test_subagent_output_is_sanitized(self):
+        self.assertIn("run_subagent", userbot.SANITIZED_TOOLS)
+
+    def test_approved_tool_is_reported_before_result(self):
+        self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(tc_id="c1", name="evaluate", arguments="{}")
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="готово"))],
+            ]
+        )
+        seen = []
+
+        async def on_tool(name):
+            seen.append(name)
+
+        async def allow(name, args, model, unrestricted=False):
+            return True
+
+        with mock.patch.object(userbot, "verify_tool_call", allow):
+            asyncio.run(
+                userbot.stream_with_tools(
+                    [{"role": "user", "content": "q"}],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                    on_tool,
+                    tools=userbot.TOOLS,
+                    verify_tools=True,
+                )
+            )
+        self.assertEqual(seen, ["evaluate"])
 
     def test_tool_round_limit_reached(self):
         endless = [
@@ -2327,6 +2435,53 @@ class CoreHelpersTest(BotTestCase):
         )
         self.assertEqual(resp, ("Контекст очищен. / Context cleared.", False, True))
         self.assertEqual(len(hist[1]), 0)
+
+    def test_handle_command_state_clear_keeps_deque_identity(self):
+        hist = {1: deque([{"role": "user", "content": "x"}], maxlen=5)}
+        original = hist[1]
+        core.handle_command_state(
+            ("clear", None), 1, True, hist, {}, 5, 5, "m", [], "h"
+        )
+        self.assertIs(hist[1], original)
+        original.append({"role": "assistant", "content": "late"})
+        self.assertEqual(len(hist[1]), 1)
+
+    def test_handle_command_state_rejects_unknown_model(self):
+        overrides = {}
+        resp = core.handle_command_state(
+            ("model", "ghost"),
+            1,
+            True,
+            {},
+            overrides,
+            5,
+            5,
+            "m",
+            ["real-one"],
+            "h",
+        )
+        self.assertIsNotNone(resp)
+        text = resp[0] if resp else ""
+        self.assertIn("Доступные модели", text)
+        self.assertEqual(overrides, {})
+        self.assertFalse(resp[1] if resp else True)
+
+    def test_handle_command_state_accepts_model_when_list_unknown(self):
+        overrides = {}
+        resp = core.handle_command_state(
+            ("model", "anything"),
+            1,
+            True,
+            {},
+            overrides,
+            5,
+            5,
+            "m",
+            [],
+            "h",
+        )
+        self.assertEqual(overrides[1], "anything")
+        self.assertTrue(resp[1] if resp else False)
 
     def test_handle_command_state_model(self):
         overrides = {}
@@ -4267,6 +4422,25 @@ class UserbotHandlerTest(BotTestCase):
         )
         self.assertNotIn("ХВОСТ", self._group_prompt())
 
+    def test_long_replied_text_does_not_eat_the_request(self):
+        saved = userbot.MAX_REQUEST_LEN
+        self.addCleanup(setattr, userbot, "MAX_REQUEST_LEN", saved)
+        userbot.MAX_REQUEST_LEN = 200
+        replied = _FakeMessage("Ц" * 5000, msg_id=11, out=True)
+        self._run(
+            self._event(
+                ".db иди дальше",
+                msg_id=12,
+                is_reply=True,
+                reply_msg=replied,
+                chat_id=self.GROUP,
+                is_private=False,
+            )
+        )
+        prompt = self._group_prompt()
+        self.assertIn("иди дальше", prompt)
+        self.assertLessEqual(len(prompt), 260)
+
     def test_trigger_only_message_replies_with_replied_text(self):
         replied = _FakeMessage("только реплай", msg_id=9, out=True)
         self._run(
@@ -4377,13 +4551,38 @@ class UserbotHandlerTest(BotTestCase):
         self.assertIn("показаны", show.sent[0])
 
     def test_model_command_sets_and_shows(self):
-        set_event = self._event(".db model my-model", msg_id=28)
+        saved_models = userbot.MODELS
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        userbot.MODELS = ["my-model"]
+        set_event = self._event(".db model my-model", msg_id=28, sender_id=self.OWNER)
         self._run(set_event)
         self.assertIn("my-model", set_event.sent[0])
         self.assertEqual(userbot.model_overrides[self.DM], "my-model")
-        show = self._event(".db model", msg_id=29)
+        show = self._event(".db model", msg_id=29, sender_id=self.OWNER)
         self._run(show)
         self.assertIn("my-model", show.sent[0])
+
+    def test_model_command_rejects_unknown_model(self):
+        saved_models = userbot.MODELS
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        userbot.MODELS = ["known-model"]
+        event = self._event(".db model nope", msg_id=35, sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("Доступные модели", event.sent[0])
+        self.assertEqual(userbot.model_overrides.get(self.DM), None)
+
+    def test_model_command_rejected_for_stranger(self):
+        event = self._event(".db model evil", msg_id=33)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertEqual(userbot.model_overrides.get(self.DM), None)
+
+    def test_clear_command_rejected_for_stranger(self):
+        userbot.chat_history[self.DM] = deque([{"role": "user", "content": "x"}])
+        event = self._event(".db clear", msg_id=34)
+        self._run(event)
+        self.assertIn("владельцу", event.sent[0])
+        self.assertEqual(len(userbot.chat_history[self.DM]), 1)
 
     def test_models_command_lists_models(self):
         event = self._event(".db models", msg_id=30)
@@ -4392,7 +4591,7 @@ class UserbotHandlerTest(BotTestCase):
 
     def test_clear_command_resets_history(self):
         userbot.chat_history[self.DM] = deque([{"role": "user", "content": "x"}])
-        event = self._event(".db clear", msg_id=31)
+        event = self._event(".db clear", msg_id=31, sender_id=self.OWNER)
         self._run(event)
         self.assertEqual(len(userbot.chat_history[self.DM]), 0)
         self.assertIn("Контекст очищен", event.sent[0])
@@ -4514,6 +4713,165 @@ class HardeningTest(BotTestCase):
         self.assertIn("Ошибка инструмента", out)
         self.assertEqual(list(tmp.iterdir()), [])
 
+    def test_execute_script_cleans_temp_file_when_write_fails(self):
+        tmp = self._tmp_dir("danybot_tmpdir2_")
+        saved_tempdir = tempfile.tempdir
+        self.addCleanup(setattr, tempfile, "tempdir", saved_tempdir)
+        tempfile.tempdir = str(tmp)
+        real = tempfile.NamedTemporaryFile
+
+        def failing(*args, **kwargs):
+            handle = real(*args, **kwargs)
+            handle.write = _raise_oserror
+            return handle
+
+        self.addCleanup(setattr, tempfile, "NamedTemporaryFile", real)
+        tempfile.NamedTemporaryFile = failing
+        out = asyncio.run(
+            tools_module.execute_tool("execute_script", {"code": "print(1)"}, 1)
+        )
+        self.assertIn("Ошибка", out)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_write_file_keeps_original_when_write_fails(self):
+        tmp = self._tmp_dir("danybot_atomic_")
+        target = tmp / "keep.txt"
+        target.write_text("ORIGINAL", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        saved_write = tools_module.core._write_text_atomic
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        self.addCleanup(setattr, tools_module.core, "_write_text_atomic", saved_write)
+        tools_module.CODER_ROOT = tmp
+        tools_module.core._write_text_atomic = lambda *_a, **_k: False
+        out = asyncio.run(
+            tools_module.execute_tool(
+                "write_file", {"path": "keep.txt", "content": "LOST"}, 1
+            )
+        )
+        self.assertIn("Ошибка записи", out)
+        self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL")
+
+    def test_edit_file_keeps_original_when_write_fails(self):
+        tmp = self._tmp_dir("danybot_atomic2_")
+        target = tmp / "keep.txt"
+        target.write_text("ORIGINAL", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        saved_write = tools_module.core._write_text_atomic
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        self.addCleanup(setattr, tools_module.core, "_write_text_atomic", saved_write)
+        tools_module.CODER_ROOT = tmp
+        tools_module.core._write_text_atomic = lambda *_a, **_k: False
+        out = asyncio.run(
+            tools_module.execute_tool(
+                "edit_file",
+                {"path": "keep.txt", "old_string": "ORIGINAL", "new_string": "NEW"},
+                1,
+            )
+        )
+        self.assertIn("Ошибка записи", out)
+        self.assertEqual(target.read_text(encoding="utf-8"), "ORIGINAL")
+
+    def test_edit_file_rejects_oversized_result(self):
+        tmp = self._tmp_dir("danybot_cap_")
+        target = tmp / "a.txt"
+        target.write_text("tiny", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        saved_cap = tools_module.MAX_WRITE_BYTES
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        self.addCleanup(setattr, tools_module, "MAX_WRITE_BYTES", saved_cap)
+        tools_module.CODER_ROOT = tmp
+        tools_module.MAX_WRITE_BYTES = 64
+        out = asyncio.run(
+            tools_module.execute_tool(
+                "edit_file",
+                {"path": "a.txt", "old_string": "tiny", "new_string": "x" * 500},
+                1,
+            )
+        )
+        self.assertIn("Слишком большой", out)
+        self.assertEqual(target.read_text(encoding="utf-8"), "tiny")
+
+    def test_render_keeps_answer_when_only_answer_fits(self):
+        text = tools_module.render_response(
+            "p" * 800 + "\n\n", ["р" * 3000], ["a", "b", "c"], "ОТВЕТ"
+        )
+        self.assertIn("ОТВЕТ", text)
+        self.assertLessEqual(len(text), tools_module.MAX_RENDER_CHARS)
+
+    def test_strip_page_drops_script_and_style_keeps_text(self):
+        raw = (
+            "<html><head><style>a{b}</style></head><body><p>Hello</p>"
+            "<script>var x=1;</script><p>World</p></body></html>"
+        )
+        self.assertEqual(tools_module._strip_page(raw), "Hello World")
+
+    def test_strip_page_survives_pathological_input(self):
+        raw = "<scriptaaaa" * 20000
+        started = time.monotonic()
+        out = tools_module._strip_page(raw)
+        self.assertEqual(out, "")
+        self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_strip_page_keeps_text_between_blocks(self):
+        self.assertEqual(
+            tools_module._strip_page("<style>.a{}</style>mid<style>.b{}</style>end"),
+            "mid end",
+        )
+
+    def test_output_exactly_at_cap_is_not_marked_truncated(self):
+        sink = tools_module._OutputSink(10)
+        sink.feed(b"0123456789")
+        self.assertFalse(sink.truncated)
+        self.assertEqual(sink.text(), "0123456789")
+
+    def test_output_over_cap_is_marked_truncated(self):
+        sink = tools_module._OutputSink(10)
+        sink.feed(b"0123456789A")
+        self.assertTrue(sink.truncated)
+        self.assertEqual(sink.text(), "0123456789")
+
+    def test_scan_files_stops_on_directory_flood(self):
+        tmp = self._tmp_dir("danybot_scan_")
+        deep = tmp
+        for i in range(300):
+            deep = deep / f"d{i}"
+            deep.mkdir()
+        (deep / "hit.txt").write_text("needle", encoding="utf-8")
+        saved = tools_module.MAX_SEARCH_NODES
+        self.addCleanup(setattr, tools_module, "MAX_SEARCH_NODES", saved)
+        tools_module.MAX_SEARCH_NODES = 10
+        out = asyncio.run(
+            tools_module.execute_tool("search_files", {"pattern": "needle"}, 1)
+        )
+        self.assertIn("Совпадений не найдено", out)
+
+    def test_scan_files_finds_match_within_node_budget(self):
+        tmp = self._tmp_dir("danybot_scan2_")
+        (tmp / "hit.txt").write_text("needle", encoding="utf-8")
+        saved = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
+        tools_module.CODER_ROOT = tmp
+        out = asyncio.run(
+            tools_module.execute_tool("search_files", {"pattern": "needle"}, 1)
+        )
+        self.assertIn("hit.txt", out)
+
+    def test_web_search_error_hides_query(self):
+        class _Boom:
+            def get(self, *_args, **kwargs):
+                raise httpx.ConnectError("failed for https://x.test/?q=secret-token")
+
+        with (
+            mock.patch.object(tools_module, "_get_httpx_client", lambda: _Boom()),
+            self.assertLogs(tools_module.logger, "WARNING") as captured,
+        ):
+            out = asyncio.run(
+                tools_module.execute_tool("web_search", {"query": "secret-token"}, 1)
+            )
+        joined = "\n".join(captured.output)
+        self.assertNotIn("secret-token", joined)
+        self.assertNotIn("secret-token", out)
+
     def test_async_saver_keeps_dirty_when_write_is_cancelled(self):
         saver = core.AsyncSaver(lambda: None, delay=0.01)
         dirty = []
@@ -4575,6 +4933,76 @@ class HardeningTest(BotTestCase):
         written = next(iter(data["model_overrides"].values()))
         self.assertIn(written, {f"m{index}" for index in range(8)})
         self.assertEqual([p.name for p in tmp.iterdir()], ["state.json"])
+
+    def test_history_save_survives_concurrent_growth(self):
+        tmp = self._tmp_dir("danybot_hgrow_")
+        target = tmp / "history.json"
+        history: dict[int, deque] = {1: deque(maxlen=5)}
+        failed = []
+        stop = False
+
+        def writer():
+            while not stop:
+                if not core.save_history_file(target, history):
+                    failed.append(1)
+
+        def grower():
+            for index in range(400):
+                history[index + 2] = deque(
+                    [{"role": "user", "content": str(index)}], maxlen=5
+                )
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = [pool.submit(writer) for _ in range(3)]
+            pool.submit(grower).result()
+            stop = True
+            for item in futures:
+                item.result()
+        self.assertEqual(failed, [])
+        data = json.loads(target.read_text(encoding="utf-8"))
+        self.assertIsInstance(data, dict)
+        self.assertEqual([p.name for p in tmp.iterdir()], ["history.json"])
+
+    def test_build_payload_retries_on_runtime_error(self):
+        calls = {"n": 0}
+
+        def builder():
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise RuntimeError("dictionary changed size during iteration")
+            return "payload"
+
+        self.assertEqual(core._build_payload(builder), "payload")
+        self.assertEqual(calls["n"], 3)
+
+    def test_build_payload_gives_up_after_retries(self):
+        def builder():
+            raise RuntimeError("dictionary changed size during iteration")
+
+        with self.assertRaises(RuntimeError):
+            core._build_payload(builder)
+
+    def test_write_text_atomic_accepts_builder(self):
+        tmp = self._tmp_dir("danybot_builder_")
+        target = tmp / "out.txt"
+        calls = {"n": 0}
+
+        def builder():
+            calls["n"] += 1
+            return f"value-{calls['n']}"
+
+        self.assertTrue(core._write_text_atomic(target, builder))
+        self.assertEqual(target.read_text(encoding="utf-8"), "value-1")
+
+    def test_write_text_atomic_reports_builder_failure(self):
+        tmp = self._tmp_dir("danybot_builder2_")
+        target = tmp / "out.txt"
+
+        def builder():
+            raise OSError("disk full")
+
+        self.assertFalse(core._write_text_atomic(target, builder))
+        self.assertEqual(list(tmp.iterdir()), [])
 
     def test_trim_tool_history_keeps_tool_pairs(self):
         messages: list[dict[str, Any]] = [{"role": "system", "content": "s"}]
