@@ -39,6 +39,7 @@ last_chat_activity: dict[int, float] = {}
 
 STORE: core.ModeStore = core.ModeStore(globals())
 SESSIONS = core.SessionRegistry()
+TASKS = core.TaskJournal(lambda: save_state())
 
 bot_username = ""
 bot_id = 0
@@ -78,7 +79,8 @@ BOT_HELP_TEXT = (
     "DanyBOT - команды / commands:\n"
     "/help /start - справка / help\n"
     "/clear - очистить контекст / clear context\n"
-    "/settings - настройки, инлайн-меню / settings, inline menu\n\n"
+    "/settings - настройки, инлайн-меню / settings, inline menu\n"
+    "/task - журнал последней задачи / last task log\n\n"
     "Модель, рассуждения, инструменты, кодер-режим и системный\n"
     "промпт - в меню /settings.\n\n"
     "Также работает / Also works: @упоминание, реплай боту."
@@ -113,11 +115,11 @@ def get_bot_client():
 
 
 def load_state():
-    core.load_state_into(STORE, STATE_FILE, logger)
+    core.load_state_into(STORE, STATE_FILE, logger, journal=TASKS)
 
 
 def save_state():
-    core.save_state_from(STORE, STATE_FILE, logger)
+    core.save_state_from(STORE, STATE_FILE, logger, journal=TASKS)
 
 
 def load_history():
@@ -279,6 +281,7 @@ async def handler(event: Any):
             userbot.DANYAPI_MODEL,
             userbot.MODELS,
             BOT_HELP_TEXT,
+            task_text=TASKS.report(chat_id),
         )
         if resp is not None:
             text_out, save_s, save_h = resp
@@ -386,31 +389,53 @@ async def handler(event: Any):
     else:
         tool_menu = tools_module.PUBLIC_TOOLS
     limit_ctx = userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
+    TASKS.begin(chat_id, prompt, model=model, coder=coder_active, owner=is_owner)
+    progress: dict[str, str] = {"reason": ""}
+
+    def on_progress(rounds, calls_made, reason=""):
+        if reason:
+            progress["reason"] = reason
+        TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
 
     async def generate():
-        answer = await core.stream_answer(
-            STORE,
-            event=event,
-            chat_id=chat_id,
-            is_self=is_self,
-            messages=messages,
-            model=model,
-            prefix=prefix,
-            self_edit_id=self_edit_id,
-            render_fn=core.make_render(
-                userbot.render_response, reasoning_hidden, tools_hidden, chat_id
-            ),
-            edit_fn=edit_text,
-            reply_fn=safe_reply,
-            action=cast(Any, get_bot_client().action(chat_id, "typing")),
-            stream_fn=userbot.stream_with_tools,
-            tool_client=get_bot_client(),
-            tools=tool_menu,
-            edit_interval=userbot.EDIT_INTERVAL,
-            owner_id=sender_id,
-            logger=logger,
-            stats=_bot_stats,
-            delivery=delivery,
+        try:
+            answer = await core.stream_answer(
+                STORE,
+                event=event,
+                chat_id=chat_id,
+                is_self=is_self,
+                messages=messages,
+                model=model,
+                prefix=prefix,
+                self_edit_id=self_edit_id,
+                render_fn=core.make_render(
+                    userbot.render_response, reasoning_hidden, tools_hidden, chat_id
+                ),
+                edit_fn=edit_text,
+                reply_fn=safe_reply,
+                action=cast(Any, get_bot_client().action(chat_id, "typing")),
+                stream_fn=userbot.stream_with_tools,
+                tool_client=get_bot_client(),
+                tools=tool_menu,
+                edit_interval=userbot.EDIT_INTERVAL,
+                owner_id=sender_id,
+                logger=logger,
+                stats=_bot_stats,
+                delivery=delivery,
+                progress_fn=on_progress,
+            )
+        except asyncio.CancelledError:
+            TASKS.finish(
+                chat_id, core.TASK_INTERRUPTED, reason="прерван новым запросом"
+            )
+            raise
+        except userbot.HANDLER_ERRORS as exc:
+            TASKS.finish(chat_id, core.TASK_FAILED, reason=type(exc).__name__)
+            raise
+        TASKS.finish(
+            chat_id,
+            core.TASK_STOPPED if progress["reason"] else core.TASK_DONE,
+            reason=progress["reason"],
         )
         if answer.strip():
             async with ctx_lock:
@@ -420,7 +445,9 @@ async def handler(event: Any):
             HISTORY_SAVER.mark_dirty()
         return answer
 
-    task = SESSIONS.start(chat_id, generate(), logger=logger)
+    task = SESSIONS.start(
+        chat_id, generate(), logger=logger, scope="owner" if is_owner else "other"
+    )
     try:
         await task
     except asyncio.CancelledError:
@@ -521,7 +548,8 @@ def _settings_text(chat_id):
         f"Рассуждения / Reasoning: {_state_label(chat_id, reasoning_hidden)}\n"
         f"Инструменты / Tools: {_state_label(chat_id, tools_hidden)}\n"
         f"Кодер-режим / Coder: {_on_off_label(chat_id, coder_chats)}\n"
-        f"Контекст / Context: {ctx_len}/{limit}"
+        f"Контекст / Context: {ctx_len}/{limit}\n"
+        f"Задача / Task: {core.task_state_label(TASKS.get(chat_id))}"
     )
 
 
@@ -669,6 +697,10 @@ async def start_bot():
                             types.BotCommand(
                                 command="settings",
                                 description="Настройки / Settings",
+                            ),
+                            types.BotCommand(
+                                command="task",
+                                description="Журнал задач / Task log",
                             ),
                         ],
                     )

@@ -191,11 +191,16 @@ class BotTestCase(unittest.TestCase):
     def setUp(self):
         patch_paths(self)
         self._snap = snapshot_mode_state()
+        saved_journals = {mod: mod.TASKS.snapshot() for mod in (userbot, bot)}
 
         def restore_snap():
             restore_mode_state(self._snap)
+            for mod, saved in saved_journals.items():
+                mod.TASKS.restore(saved)
 
         self.addCleanup(restore_snap)
+        for mod in (userbot, bot):
+            mod.TASKS.restore({})
 
 
 class _NullAsyncContext:
@@ -1582,7 +1587,11 @@ class StreamToolsTest(BotTestCase):
                     lambda p: self.collect([], p),
                 )
             )
-        self.assertEqual(answer, "Достигнут лимит циклов инструментов: 2.")
+        self.assertEqual(
+            answer,
+            "Достигнут лимит циклов инструментов: 2. "
+            "Раундов: 3, вызовов инструментов: 2.",
+        )
 
     def test_repeated_call_asks_for_another_approach(self):
         endless = [
@@ -1682,6 +1691,49 @@ class StreamToolsTest(BotTestCase):
             )
         )
         self.assertEqual(answer, "всё")
+
+    def test_progress_callback_reports_counters_and_reason(self):
+        endless = [
+            make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
+        ]
+        self.install_ai([endless] * 5)
+        seen = []
+        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 2):
+            answer = asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                    on_progress=lambda rounds, tools, reason="": seen.append(
+                        (rounds, tools, reason)
+                    ),
+                )
+            )
+        self.assertIn("лимит циклов", answer)
+        self.assertEqual(seen[0], (1, 1, ""))
+        self.assertEqual(seen[-1][0], 3)
+        self.assertEqual(seen[-1][1], 2)
+        self.assertIn("лимит циклов", seen[-1][2])
+
+    def test_progress_callback_failure_is_ignored(self):
+        def boom(_rounds, _tools, _reason=""):
+            raise RuntimeError("journal down")
+
+        fake_ai = self.install_ai([[make_chunk(make_delta(content="ок"))]])
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+                on_progress=boom,
+            )
+        )
+        self.assertEqual(answer, "ок")
+        self.assertTrue(fake_ai.chat.completions.calls)
 
     def test_loop_stop_reason_rules(self):
         now = time.monotonic()
@@ -3084,6 +3136,160 @@ class ContractDirTest(BotTestCase):
                 self.assertEqual(userbot._resolve_contract_dir(), candidates[0])
 
 
+class TaskJournalTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        self.saves = []
+
+    def _journal(self, limit=40):
+        self.saves = []
+        journal = core.TaskJournal(lambda: self.saves.append(1), limit=limit)
+        return journal
+
+    def test_begin_finish_and_report(self):
+        journal = self._journal()
+        journal.begin(5, "починить тест", model="m", coder=True)
+        self.assertEqual((journal.get(5) or {}).get("status"), core.TASK_RUNNING)
+        self.assertIn("В работе", journal.report(5))
+        journal.progress(5, rounds=4, tools=7)
+        self.assertEqual((journal.get(5) or {}).get("tools"), 7)
+        journal.finish(5, core.TASK_DONE)
+        record = journal.get(5) or {}
+        self.assertEqual(record.get("status"), core.TASK_DONE)
+        self.assertIn("Завершена", journal.report(5))
+        self.assertIn("Раундов: 4", journal.report(5))
+        self.assertTrue(self.saves)
+
+    def test_progress_without_task_is_ignored(self):
+        journal = self._journal()
+        journal.progress(1, rounds=2)
+        self.assertIsNone(journal.get(1))
+        self.assertFalse(self.saves)
+
+    def test_report_for_unknown_chat(self):
+        journal = self._journal()
+        self.assertEqual(journal.report(9), "Задач в этом чате не было.")
+
+    def test_stop_reason_and_counters_in_settings_label(self):
+        journal = self._journal()
+        journal.begin(1, "задача", model="m")
+        journal.finish(
+            1, core.TASK_STOPPED, reason="лимит раундов", rounds=40, tools=39
+        )
+        label = core.task_state_label(journal.get(1))
+        self.assertIn("лимиту", label)
+        self.assertIn("40 раундов", label)
+        self.assertEqual(core.task_state_label(None), "нет")
+
+    def test_restore_marks_running_as_interrupted(self):
+        journal = self._journal()
+        journal.begin(3, "долгая задача", model="m")
+        data = journal.snapshot()
+        fresh = self._journal()
+        self.assertEqual(fresh.restore(data), 1)
+        record = fresh.get(3) or {}
+        self.assertEqual(record.get("status"), core.TASK_INTERRUPTED)
+        self.assertIn("перезапущен", record.get("reason", ""))
+
+    def test_restore_survives_broken_payload(self):
+        journal = self._journal()
+        self.assertEqual(journal.restore("broken"), 0)
+        self.assertEqual(journal.restore(None), 0)
+        self.assertEqual(
+            journal.restore({"x": "нет", "1": {"status": "выдумка"}, "2": None}), 0
+        )
+        self.assertEqual(journal.restore({"1": {"status": "done", "rounds": "7"}}), 1)
+        self.assertEqual((journal.get(1) or {}).get("rounds"), 7)
+        self.assertEqual((journal.get(1) or {}).get("tools"), 0)
+        rows = [{"chat_id": 4, "status": "interrupted", "prompt": "из списка"}]
+        self.assertEqual(journal.restore(rows), 1)
+        self.assertIn("из списка", journal.report(4))
+
+    def test_prompt_and_reason_are_trimmed(self):
+        journal = self._journal()
+        journal.begin(1, "x" * 5000, model="m" * 500)
+        record = journal.get(1) or {}
+        self.assertEqual(len(record.get("prompt", "")), core.TASK_PROMPT_CHARS)
+        self.assertEqual(len(record.get("model", "")), 80)
+        journal.finish(1, core.TASK_STOPPED, reason="y" * 5000)
+        self.assertEqual(
+            len((journal.get(1) or {}).get("reason", "")), core.TASK_REASON_CHARS
+        )
+
+    def test_oldest_records_are_trimmed(self):
+        journal = self._journal(limit=3)
+        for chat_id in range(5):
+            journal.begin(chat_id, f"задача {chat_id}")
+            journal.finish(chat_id, core.TASK_DONE)
+        self.assertEqual(len(journal.snapshot()), 3)
+        self.assertIsNone(journal.get(0))
+        self.assertIsNotNone(journal.get(4))
+
+    def test_recent_orders_by_update_time(self):
+        journal = self._journal()
+        for chat_id in range(3):
+            journal.begin(chat_id, f"задача {chat_id}")
+        journal.progress(1, rounds=1)
+        recent = journal.recent(2)
+        self.assertEqual([row["prompt"] for row in recent], ["задача 1", "задача 2"])
+
+    def test_state_file_keeps_tasks(self):
+        for mod, patch_paths_attr in ((userbot, "STATE_FILE"), (bot, "STATE_FILE")):
+            self.assertIs(
+                getattr(mod, patch_paths_attr), getattr(mod, patch_paths_attr)
+            )
+        userbot.TASKS.begin(21, "задача владельца", model="m", coder=True)
+        userbot.save_state()
+        data = json.loads(userbot.STATE_FILE.read_text(encoding="utf-8"))
+        self.assertIn("21", data["tasks"])
+        self.assertEqual(data["tasks"]["21"]["status"], core.TASK_RUNNING)
+        userbot.TASKS.restore({})
+        userbot.load_state()
+        self.assertEqual(
+            (userbot.TASKS.get(21) or {}).get("status"), core.TASK_INTERRUPTED
+        )
+        self.assertIn("перезапущен", (userbot.TASKS.get(21) or {}).get("reason", ""))
+        userbot.TASKS.restore({})
+
+    def test_load_state_tolerates_missing_journal_key(self):
+        userbot.STATE_FILE.write_text(
+            json.dumps(
+                {
+                    "model_overrides": {"1": "m"},
+                    "coder_chats": [1],
+                    "reasoning_hidden": [],
+                    "tools_hidden": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        userbot.load_state()
+        self.assertEqual(userbot.model_overrides, {1: "m"})
+        self.assertEqual(userbot.coder_chats, {1})
+
+    def test_command_state_reports_task(self):
+        out = core.handle_command_state(
+            ("task", None),
+            1,
+            True,
+            {},
+            {},
+            10,
+            10,
+            "m",
+            [],
+            "help",
+            task_text="Задача: Завершена",
+        )
+        self.assertIsNotNone(out)
+        self.assertEqual(cast(Any, out)[0], "Задача: Завершена")
+        empty = core.handle_command_state(
+            ("task", None), 1, True, {}, {}, 10, 10, "m", [], "help"
+        )
+        self.assertIsNotNone(empty)
+        self.assertIn("Журнала задач", cast(Any, empty)[0])
+
+
 class SessionRegistryTest(BotTestCase):
     def test_start_cancels_previous_in_same_chat(self):
         registry = core.SessionRegistry()
@@ -3729,6 +3935,168 @@ class BotHandlerTest(BotTestCase):
         self._run(self._group_event("@danybot привет"))
         self.assertGreaterEqual(self.saver.dirty, 1)
 
+    def test_lower_authority_waits_for_owner_run(self):
+        registry = core.SessionRegistry()
+        order = []
+
+        async def scenario():
+            async def owner_run():
+                await asyncio.sleep(0.05)
+                order.append("owner")
+
+            async def other_run():
+                order.append("other")
+
+            owner_task = registry.start(4, owner_run(), scope="owner")
+            other_task = registry.start(4, other_run(), scope="other")
+            await asyncio.gather(owner_task, other_task)
+            self.assertEqual(registry.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(order, ["owner", "other"])
+
+    def test_owner_run_supersedes_other_run(self):
+        registry = core.SessionRegistry()
+        finished = []
+
+        async def scenario():
+            async def waiter(name):
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    finished.append(name)
+                    raise
+
+            async def quick():
+                finished.append("quick")
+
+            other_task = registry.start(4, waiter("other"), scope="other")
+            await asyncio.sleep(0)
+            owner_task = registry.start(4, quick(), scope="owner")
+            await owner_task
+            with self.assertRaises(asyncio.CancelledError):
+                await other_task
+
+        asyncio.run(scenario())
+        self.assertEqual(sorted(finished), ["other", "quick"])
+
+    def test_other_run_supersedes_other_run(self):
+        registry = core.SessionRegistry()
+        finished = []
+
+        async def scenario():
+            async def waiter(name):
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    finished.append(name)
+                    raise
+
+            async def quick():
+                finished.append("quick")
+
+            first = registry.start(4, waiter("first"), scope="other")
+            await asyncio.sleep(0)
+            second = registry.start(4, quick(), scope="other")
+            await second
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+
+        asyncio.run(scenario())
+        self.assertEqual(sorted(finished), ["first", "quick"])
+
+    def test_queued_run_is_dropped_when_cancelled(self):
+        registry = core.SessionRegistry()
+
+        async def scenario():
+            ran = []
+
+            async def owner_run():
+                await asyncio.sleep(5)
+
+            async def other_run():
+                ran.append(1)
+
+            owner_task = registry.start(4, owner_run(), scope="owner")
+            await asyncio.sleep(0)
+            other_task = registry.start(4, other_run(), scope="other")
+            await asyncio.sleep(0)
+            other_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await other_task
+            owner_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await owner_task
+            self.assertEqual(ran, [])
+            self.assertEqual(registry.running_chats(), 0)
+
+        asyncio.run(scenario())
+
+    def test_stranger_does_not_break_owner_request(self):
+        self.addCleanup(bot.SESSIONS.cancel_all)
+        started = asyncio.Event()
+        finished = []
+        calls = []
+
+        async def stream(*_args, **_kwargs):
+            calls.append(1)
+            started.set()
+            try:
+                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                finished.append("cancelled")
+                raise
+            finished.append("done")
+            return "ответ"
+
+        core.stream_answer = stream
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                bot.handler(
+                    self._group_event(
+                        "@danybot долгий", chat_id=66, sender_id=self.OWNER
+                    )
+                )
+            )
+            await started.wait()
+            other = asyncio.ensure_future(
+                bot.handler(
+                    self._group_event("@danybot привет", chat_id=66, sender_id=1)
+                )
+            )
+            await asyncio.gather(task, other)
+            self.assertEqual(_task_outcome(task), "None")
+            self.assertEqual(_task_outcome(other), "None")
+            self.assertEqual(bot.SESSIONS.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(finished, ["done", "done"])
+
+    def test_task_command_reports_journal(self):
+        bot.TASKS.begin(55, "проверка журнала", model="m")
+        bot.TASKS.finish(55, core.TASK_DONE)
+        event = self._group_event("/task", chat_id=55, sender_id=self.OWNER)
+        self._run(event)
+        self.assertIn("Завершена", event.sent[0])
+        self.assertIn("проверка журнала", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_task_command_without_history(self):
+        event = self._group_event("/task", chat_id=56, sender_id=1)
+        self._run(event)
+        self.assertIn("не было", event.sent[0])
+
+    def test_settings_show_task_state(self):
+        event = self._run(self._group_event("/settings", sender_id=self.OWNER))
+        self.assertIn("Задача / Task: нет", event.sent[0])
+        bot.TASKS.begin(57, "задача", model="m")
+        bot.TASKS.finish(57, core.TASK_STOPPED, reason="лимит", rounds=3, tools=2)
+        text = bot._settings_text(57)
+        self.assertIn("остановлена по лимиту", text)
+        self.assertIn("3 раундов", text)
+
     def test_new_message_cancels_running_request(self):
         self.addCleanup(bot.SESSIONS.cancel_all)
         started = asyncio.Event()
@@ -4044,6 +4412,8 @@ class CoderModeTest(BotTestCase):
         for name in menu:
             self.assertIn(f"/{name}", help_block)
         for name in ("settings",):
+            self.assertIn(name, menu)
+        for name in ("task",):
             self.assertIn(name, menu)
 
     def test_bot_handler_uses_coder_tools(self):
@@ -4973,6 +5343,87 @@ class UserbotHandlerTest(BotTestCase):
             if item["role"] == "user"
         ]
         return entries[-1] if entries else ""
+
+    def test_task_journal_records_finished_run(self):
+        self._run(self._event(".db привет", sender_id=self.OWNER))
+        record = userbot.TASKS.get(self.DM) or {}
+        self.assertEqual(record.get("status"), core.TASK_DONE)
+        self.assertIn("привет", record.get("prompt", ""))
+        self.assertTrue(record.get("owner"))
+        self.assertFalse(record.get("coder"))
+        self.assertEqual(record.get("rounds"), 0)
+
+    def test_task_journal_records_failure(self):
+        async def failing(*_args, **_kwargs):
+            raise userbot.OpenAIError("boom")
+
+        core.stream_answer = failing
+        self._run(self._event(".db привет"))
+        record = userbot.TASKS.get(self.DM) or {}
+        self.assertEqual(record.get("status"), core.TASK_FAILED)
+        self.assertEqual(record.get("reason"), "OpenAIError")
+
+    def test_task_journal_records_interruption(self):
+        started = asyncio.Event()
+
+        async def slow(*_args, **_kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            return "долгий ответ"
+
+        core.stream_answer = slow
+        self.addCleanup(userbot.SESSIONS.cancel_all)
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                userbot.handler(self._event(".db долгий", chat_id=888))
+            )
+            await started.wait()
+            userbot.SESSIONS.cancel(888, reason="тест")
+            await _wait_done(task)
+            self.assertEqual(_task_outcome(task), "None")
+
+        asyncio.run(scenario())
+        record = userbot.TASKS.get(888) or {}
+        self.assertEqual(record.get("status"), core.TASK_INTERRUPTED)
+        self.assertIn("прерван", record.get("reason", ""))
+
+    def test_task_journal_counts_rounds_from_progress(self):
+        seen = {}
+
+        async def with_progress(*_args, **kwargs):
+            progress = kwargs.get("progress_fn")
+            seen["has"] = progress is not None
+            if progress is not None:
+                progress(5, 9, "")
+            return "ответ"
+
+        core.stream_answer = with_progress
+        self._run(self._event(".db привет", chat_id=999))
+        record = userbot.TASKS.get(999) or {}
+        self.assertTrue(seen["has"])
+        self.assertEqual(record.get("rounds"), 5)
+        self.assertEqual(record.get("tools"), 9)
+
+    def test_task_journal_marks_stopped_run(self):
+        async def with_progress(*_args, **kwargs):
+            progress = kwargs.get("progress_fn")
+            cast(Any, progress)(4, 4, "Достигнут лимит циклов инструментов: 4.")
+            return "Достигнут лимит циклов инструментов: 4."
+
+        core.stream_answer = with_progress
+        self._run(self._event(".db привет", chat_id=1000))
+        record = userbot.TASKS.get(1000) or {}
+        self.assertEqual(record.get("status"), core.TASK_STOPPED)
+        self.assertIn("лимит циклов", record.get("reason", ""))
+
+    def test_task_command_in_userbot(self):
+        userbot.TASKS.begin(self.DM, "старая задача", model="m")
+        userbot.TASKS.finish(self.DM, core.TASK_INTERRUPTED, reason="прервана")
+        event = self._run(self._event(".db task", sender_id=self.OWNER))
+        self.assertIn("Прервана", event.sent[0])
+        self.assertIn("старая задача", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
 
     def test_falls_back_to_prompt_when_live_history_empty(self):
         saved = userbot.fetch_live_messages

@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import math
 import os
 import re
 import stat
@@ -123,6 +124,7 @@ SUB_ALIASES = {
     "tools": ("tools",),
     "prompt": ("prompt",),
     "settings": ("settings",),
+    "task": ("task",),
 }
 
 _SUB_LOOKUP = {
@@ -175,6 +177,7 @@ BOT_COMMANDS = {
     "reasoning": ("reasoning",),
     "tools": ("tools",),
     "prompt": ("prompt",),
+    "task": ("task",),
 }
 
 _BOT_CMD_LOOKUP = {
@@ -236,6 +239,7 @@ def parse_state_data(data):
         "coder_chats": {int(x) for x in data.get("coder_chats", [])},
         "reasoning_hidden": {int(x) for x in data.get("reasoning_hidden", [])},
         "tools_hidden": {int(x) for x in data.get("tools_hidden", [])},
+        "tasks": data.get("tasks", {}),
     }
 
 
@@ -320,6 +324,8 @@ def save_state_file(path, state):
             "reasoning_hidden": sorted(state.get("reasoning_hidden", [])),
             "tools_hidden": sorted(state.get("tools_hidden", [])),
         }
+        if state.get("tasks"):
+            data["tasks"] = state["tasks"]
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     return _write_text_atomic(path, snapshot)
@@ -467,7 +473,7 @@ class ModeStore:
             object.__setattr__(self, name, value)
 
 
-def load_state_into(store, state_file, logger=None):
+def load_state_into(store, state_file, logger=None, journal=None):
     state = load_state_file(state_file)
     if state is None:
         if logger is not None and state_file.exists():
@@ -479,18 +485,20 @@ def load_state_into(store, state_file, logger=None):
     store.coder_chats = state["coder_chats"]
     store.reasoning_hidden = state["reasoning_hidden"]
     store.tools_hidden = state["tools_hidden"]
+    if journal is not None:
+        journal.restore(state.get("tasks"))
 
 
-def save_state_from(store, state_file, logger):
-    if not save_state_file(
-        state_file,
-        {
-            "model_overrides": store.model_overrides,
-            "coder_chats": store.coder_chats,
-            "reasoning_hidden": store.reasoning_hidden,
-            "tools_hidden": store.tools_hidden,
-        },
-    ):
+def save_state_from(store, state_file, logger, journal=None):
+    payload = {
+        "model_overrides": store.model_overrides,
+        "coder_chats": store.coder_chats,
+        "reasoning_hidden": store.reasoning_hidden,
+        "tools_hidden": store.tools_hidden,
+    }
+    if journal is not None:
+        payload["tasks"] = journal.snapshot()
+    if not save_state_file(state_file, payload):
         logger.warning("Не удалось сохранить %s", state_file.name)
 
 
@@ -598,6 +606,45 @@ INTERRUPTED_NOTICE = "Запрос прерван новым сообщение�
 
 EMPTY_ANSWER = "(пустой ответ / empty answer)"
 
+TASK_RUNNING = "running"
+TASK_DONE = "done"
+TASK_INTERRUPTED = "interrupted"
+TASK_STOPPED = "stopped"
+TASK_FAILED = "failed"
+
+TASK_STATUSES = frozenset(
+    {TASK_RUNNING, TASK_DONE, TASK_INTERRUPTED, TASK_STOPPED, TASK_FAILED}
+)
+
+TASK_LABELS = {
+    TASK_RUNNING: "В работе",
+    TASK_DONE: "Завершена",
+    TASK_INTERRUPTED: "Прервана",
+    TASK_STOPPED: "Остановлена по лимиту",
+    TASK_FAILED: "Упала с ошибкой",
+}
+
+TASK_SHORT_LABELS = {
+    TASK_RUNNING: "в работе",
+    TASK_DONE: "завершена",
+    TASK_INTERRUPTED: "прервана",
+    TASK_STOPPED: "остановлена по лимиту",
+    TASK_FAILED: "упала",
+}
+
+
+def task_state_label(task) -> str:
+    if not task:
+        return "нет"
+    label = TASK_SHORT_LABELS.get(task["status"], str(task["status"])[:20])
+    if task["rounds"] or task["tools"]:
+        return f"{label} ({task['rounds']} раундов, {task['tools']} вызовов)"
+    return label
+
+
+TASK_PROMPT_CHARS = 800
+TASK_REASON_CHARS = 200
+
 
 def compose_prompt(prompt, replied_text, limit):
     if not replied_text:
@@ -641,6 +688,7 @@ def handle_command_state(
     default_model,
     models_list,
     help_text,
+    task_text="",
 ) -> tuple[str, bool, bool] | None:
     cmd = command[0]
     if cmd == "clear":
@@ -662,6 +710,8 @@ def handle_command_state(
         return (models_text(current, models_list), False, False)
     if cmd == "help":
         return (help_text, False, False)
+    if cmd == "task":
+        return (task_text or "Журнала задач пока нет. / No tasks yet.", False, False)
     return None
 
 
@@ -775,24 +825,50 @@ def is_own_cancellation() -> bool:
     return task is not None and task.cancelling() > 0
 
 
+async def _run_after(coro, previous):
+    while not previous.done():
+        try:
+            await asyncio.wait({previous})
+        except asyncio.CancelledError:
+            if is_own_cancellation():
+                coro.close()
+                raise
+    return await coro
+
+
 class SessionRegistry:
     def __init__(self):
-        self._tasks: dict[Any, Any] = {}
+        self._tasks: dict[Any, dict[str, Any]] = {}
 
     def _drop(self, chat_id, task) -> None:
-        if self._tasks.get(chat_id) is task:
+        entry = self._tasks.get(chat_id)
+        if entry is not None and entry["task"] is task:
             self._tasks.pop(chat_id, None)
 
-    def start(self, chat_id, coro, logger=None):
-        self.cancel(chat_id, reason="новый запрос", logger=logger)
-        task = asyncio.ensure_future(coro)
-        self._tasks[chat_id] = task
+    def start(self, chat_id, coro, logger=None, scope="other"):
+        entry = self._tasks.get(chat_id) or {}
+        current = entry.get("task")
+        if current is None or current.done():
+            task = asyncio.ensure_future(coro)
+        elif scope != "owner" and entry.get("scope") == "owner":
+            if logger is not None:
+                logger.info(
+                    "Запрос в чате %s ждёт завершения работы владельца", chat_id
+                )
+            task = asyncio.ensure_future(_run_after(coro, current))
+        else:
+            self.cancel(chat_id, reason="новый запрос", logger=logger)
+            task = asyncio.ensure_future(coro)
+        self._tasks[chat_id] = {"task": task, "scope": scope}
         task.add_done_callback(lambda done: self._drop(chat_id, done))
         return task
 
     def cancel(self, chat_id, reason="", logger=None) -> bool:
-        task = self._tasks.pop(chat_id, None)
-        if task is None or task.done():
+        entry = self._tasks.pop(chat_id, None)
+        if entry is None:
+            return False
+        task = entry["task"]
+        if task.done():
             return False
         task.cancel()
         if logger is not None:
@@ -807,11 +883,198 @@ class SessionRegistry:
         return stopped
 
     def is_running(self, chat_id) -> bool:
-        task = self._tasks.get(chat_id)
-        return task is not None and not task.done()
+        entry = self._tasks.get(chat_id)
+        return entry is not None and not entry["task"].done()
 
     def running_chats(self) -> int:
-        return sum(1 for task in list(self._tasks.values()) if not task.done())
+        return sum(
+            1 for entry in list(self._tasks.values()) if not entry["task"].done()
+        )
+
+
+class TaskJournal:
+    def __init__(self, save=None, limit: int = 40):
+        self._save = save
+        self._limit = max(1, limit)
+        self._lock = threading.Lock()
+        self._tasks: dict[int, dict[str, Any]] = {}
+
+    def _persist(self) -> None:
+        if self._save is not None:
+            self._save()
+
+    def begin(self, chat_id, prompt, model="", coder=False, owner=False):
+        record = {
+            "prompt": str(prompt or "")[:TASK_PROMPT_CHARS],
+            "model": str(model or "")[:80],
+            "coder": bool(coder),
+            "owner": bool(owner),
+            "status": TASK_RUNNING,
+            "reason": "",
+            "rounds": 0,
+            "tools": 0,
+            "started": time.time(),
+            "updated": time.time(),
+        }
+        with self._lock:
+            self._tasks[chat_id] = record
+            self._trim()
+        self._persist()
+        return record
+
+    def progress(self, chat_id, persist: bool = False, **fields) -> None:
+        with self._lock:
+            record = self._tasks.get(chat_id)
+            if record is None:
+                return
+            for key, value in fields.items():
+                if key in record:
+                    record[key] = value
+            record["updated"] = time.time()
+        if persist:
+            self._persist()
+
+    def finish(self, chat_id, status, reason="", **fields):
+        with self._lock:
+            record = self._tasks.get(chat_id)
+            if record is None:
+                return None
+            record["status"] = status
+            record["reason"] = str(reason or "")[:TASK_REASON_CHARS]
+            for key, value in fields.items():
+                if key in record:
+                    record[key] = value
+            record["updated"] = time.time()
+            snapshot = dict(record)
+        self._persist()
+        return snapshot
+
+    def get(self, chat_id):
+        with self._lock:
+            record = self._tasks.get(chat_id)
+            return dict(record) if record else None
+
+    def recent(self, limit: int = 5):
+        with self._lock:
+            items = sorted(
+                self._tasks.values(), key=lambda r: r["updated"], reverse=True
+            )
+        return [dict(item) for item in items[: max(1, limit)]]
+
+    def _trim(self) -> None:
+        if len(self._tasks) <= self._limit:
+            return
+        ordered = sorted(self._tasks.items(), key=lambda kv: kv[1]["updated"])
+        for chat_id, _record in ordered[: len(self._tasks) - self._limit]:
+            self._tasks.pop(chat_id, None)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                str(chat_id): dict(record) for chat_id, record in self._tasks.items()
+            }
+
+    def restore(self, data) -> int:
+        restored = 0
+        now = time.time()
+        rows: list[tuple[Any, Any]] = []
+        if isinstance(data, dict):
+            rows = list(data.items())
+        elif isinstance(data, list):
+            rows = [(row.get("chat_id"), row) for row in data if isinstance(row, dict)]
+        with self._lock:
+            self._tasks.clear()
+            for chat_id, record in rows:
+                clean = _clean_task_record(record)
+                if clean is None:
+                    continue
+                if clean["status"] == TASK_RUNNING:
+                    clean["status"] = TASK_INTERRUPTED
+                    clean["reason"] = "процесс перезапущен"
+                    clean["updated"] = now
+                try:
+                    key = int(chat_id)
+                except (TypeError, ValueError):
+                    continue
+                self._tasks[key] = clean
+                restored += 1
+            self._trim()
+        return restored
+
+    def report(self, chat_id) -> str:
+        record = self.get(chat_id)
+        if record is None:
+            return "Задач в этом чате не было."
+        return _task_report(record)
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(result):
+        return default
+    return result
+
+
+def _clean_task_record(record) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    status = str(record.get("status", ""))[:20]
+    if status not in TASK_STATUSES:
+        return None
+    clean = {
+        "prompt": str(record.get("prompt", ""))[:TASK_PROMPT_CHARS],
+        "model": str(record.get("model", ""))[:80],
+        "coder": bool(record.get("coder", False)),
+        "owner": bool(record.get("owner", False)),
+        "status": status,
+        "reason": str(record.get("reason", ""))[:TASK_REASON_CHARS],
+        "rounds": _safe_int(record.get("rounds")),
+        "tools": _safe_int(record.get("tools")),
+        "started": _safe_float(record.get("started")),
+        "updated": _safe_float(record.get("updated")),
+    }
+    return clean
+
+
+def _task_report(record) -> str:
+    started = _fmt_time(record["started"])
+    updated = _fmt_time(record["updated"])
+    flags = "".join(
+        (
+            " · кодер-режим" if record.get("coder") else "",
+            " · владелец" if record.get("owner") else "",
+        )
+    )
+    lines = [
+        f"Задача: {TASK_LABELS.get(record['status'], record['status'])}",
+        f"Модель: {record['model'] or '?'}{flags}",
+        f"Начата: {started} · обновлена: {updated}",
+        f"Раундов: {record['rounds']} · вызовов инструментов: {record['tools']}",
+    ]
+    if record["reason"]:
+        lines.append(f"Причина: {record['reason']}")
+    if record["prompt"]:
+        lines.append(f"Текст: {record['prompt']}")
+    return "\n".join(lines)
+
+
+def _fmt_time(value) -> str:
+    if not value:
+        return "?"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+    except (OSError, OverflowError, ValueError):
+        return "?"
 
 
 async def stream_answer(
@@ -836,6 +1099,7 @@ async def stream_answer(
     logger=None,
     stats=None,
     delivery=None,
+    progress_fn=None,
 ):
     import userbot as userbot_module
 
@@ -888,6 +1152,7 @@ async def stream_answer(
                     sanitize_tools=not unrestricted,
                     unrestricted=unrestricted,
                     stats=stats,
+                    on_progress=progress_fn,
                 )
         except caught as exc:
             error = exc

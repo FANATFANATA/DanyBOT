@@ -208,6 +208,7 @@ START_TIME = time.monotonic()
 
 STORE: core.ModeStore = core.ModeStore(globals())
 SESSIONS = core.SessionRegistry()
+TASKS = core.TaskJournal(lambda: save_state())
 
 
 def make_session(name: str):
@@ -247,11 +248,11 @@ ai = AsyncOpenAI(
 
 
 def load_state():
-    core.load_state_into(STORE, STATE_FILE, logger)
+    core.load_state_into(STORE, STATE_FILE, logger, journal=TASKS)
 
 
 def save_state():
-    core.save_state_from(STORE, STATE_FILE, logger)
+    core.save_state_from(STORE, STATE_FILE, logger, journal=TASKS)
 
 
 def load_history():
@@ -378,12 +379,14 @@ def settings_report(chat_id):
     reasoning_state = "скрыто" if chat_id in reasoning_hidden else "видно"
     tools_state = "скрыто" if chat_id in tools_hidden else "видно"
     contract = load_contract()
+    task_state = core.task_state_label(TASKS.get(chat_id))
     return (
         "Настройки / Settings\n"
         f"Модель / Model: {current}\n"
         f"Рассуждения / Reasoning: {reasoning_state}\n"
         f"Инструменты / Tools: {tools_state}\n"
         f"Контекст / Context: {ctx_len}/{limit}\n"
+        f"Задача / Task: {task_state}\n"
         f"Контракт / Contract: {'включён' if contract else 'выключен'} "
         f"({len(contract)} символов)"
     )
@@ -570,6 +573,7 @@ async def stream_with_tools(
     sanitize_tools=True,
     unrestricted=False,
     stats=None,
+    on_progress=None,
 ):
     working: list[dict[str, Any]] = [dict(m) for m in messages]
     rounds = 0
@@ -579,11 +583,16 @@ async def stream_with_tools(
     seen_calls: dict[tuple[str, str], int] = {}
     stuck = 0
     last_cause = ""
+    calls_made = 0
     while True:
         rounds += 1
         stop = _loop_stop_reason(rounds, started, stuck, last_cause)
         if stop:
-            return _finish_loop(all_parts, stop)
+            _report_progress(on_progress, rounds, calls_made, stop)
+            return _finish_loop(
+                all_parts,
+                f"{stop} Раундов: {rounds}, вызовов инструментов: {calls_made}.",
+            )
         working = core.trim_tool_history(working, TOOL_CONTEXT_MESSAGES)
         tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
@@ -637,6 +646,7 @@ async def stream_with_tools(
             with contextlib.suppress(Exception):
                 await stream.close()
         if not tool_calls:
+            _report_progress(on_progress, rounds, calls_made)
             return "".join(all_parts)
         working.append(
             {
@@ -656,6 +666,8 @@ async def stream_with_tools(
             }
         )
         slots = [slot for _idx, slot in sorted(tool_calls.items())]
+        calls_made += len(slots)
+        _report_progress(on_progress, rounds, calls_made)
 
         async def run_slot(slot):
             key = (slot["name"], slot["arguments"])
@@ -746,6 +758,13 @@ async def stream_with_tools(
         else:
             stuck += 1
             last_cause = ", ".join(dict.fromkeys(causes)) or "без прогресса"
+
+
+def _report_progress(on_progress, rounds, calls_made, reason="") -> None:
+    if on_progress is None:
+        return
+    with contextlib.suppress(Exception):
+        on_progress(rounds, calls_made, reason)
 
 
 def _loop_stop_reason(rounds, started, stuck, cause) -> str:
@@ -935,6 +954,7 @@ async def handler(event: Any):
             DANYAPI_MODEL,
             MODELS,
             HELP_TEXT,
+            task_text=TASKS.report(chat_id),
         )
         if resp is not None:
             text_out, save_s, save_h = resp
@@ -1014,31 +1034,54 @@ async def handler(event: Any):
 
     delivery: dict[str, bool] = {}
     tool_menu = TOOLS if sender_id in OWNER_IDS else tools_module.PUBLIC_TOOLS
+    owner = sender_id in OWNER_IDS
+    TASKS.begin(chat_id, prompt, model=model, owner=owner)
+    progress: dict[str, str] = {"reason": ""}
+
+    def on_progress(rounds, calls_made, reason=""):
+        if reason:
+            progress["reason"] = reason
+        TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
 
     async def generate():
-        answer = await core.stream_answer(
-            STORE,
-            event=event,
-            chat_id=chat_id,
-            is_self=is_self,
-            messages=messages,
-            model=model,
-            prefix=prefix,
-            self_edit_id=self_edit_id,
-            render_fn=core.make_render(
-                render_response, reasoning_hidden, tools_hidden, chat_id
-            ),
-            edit_fn=edit_text,
-            reply_fn=safe_reply,
-            action=cast(Any, get_client().action(chat_id, "typing")),
-            stream_fn=stream_with_tools,
-            tool_client=None,
-            tools=tool_menu,
-            edit_interval=EDIT_INTERVAL,
-            owner_id=sender_id,
-            logger=logger,
-            stats=_bot_stats,
-            delivery=delivery,
+        try:
+            answer = await core.stream_answer(
+                STORE,
+                event=event,
+                chat_id=chat_id,
+                is_self=is_self,
+                messages=messages,
+                model=model,
+                prefix=prefix,
+                self_edit_id=self_edit_id,
+                render_fn=core.make_render(
+                    render_response, reasoning_hidden, tools_hidden, chat_id
+                ),
+                edit_fn=edit_text,
+                reply_fn=safe_reply,
+                action=cast(Any, get_client().action(chat_id, "typing")),
+                stream_fn=stream_with_tools,
+                tool_client=None,
+                tools=tool_menu,
+                edit_interval=EDIT_INTERVAL,
+                owner_id=sender_id,
+                logger=logger,
+                stats=_bot_stats,
+                delivery=delivery,
+                progress_fn=on_progress,
+            )
+        except asyncio.CancelledError:
+            TASKS.finish(
+                chat_id, core.TASK_INTERRUPTED, reason="прерван новым запросом"
+            )
+            raise
+        except HANDLER_ERRORS as exc:
+            TASKS.finish(chat_id, core.TASK_FAILED, reason=type(exc).__name__)
+            raise
+        TASKS.finish(
+            chat_id,
+            core.TASK_STOPPED if progress["reason"] else core.TASK_DONE,
+            reason=progress["reason"],
         )
         if answer.strip():
             async with ctx_lock:
@@ -1048,7 +1091,9 @@ async def handler(event: Any):
             HISTORY_SAVER.mark_dirty()
         return answer
 
-    task = SESSIONS.start(chat_id, generate(), logger=logger)
+    task = SESSIONS.start(
+        chat_id, generate(), logger=logger, scope="owner" if owner else "other"
+    )
     try:
         await task
     except asyncio.CancelledError:
