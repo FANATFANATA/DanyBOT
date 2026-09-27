@@ -38,6 +38,7 @@ seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
 
 STORE: core.ModeStore = core.ModeStore(globals())
+SESSIONS = core.SessionRegistry()
 
 bot_username = ""
 bot_id = 0
@@ -223,8 +224,9 @@ async def handler(event: Any):
                 f"Корень: {tools_module.CODER_ROOT}\n"
                 "Выключить: /coder off",
             )
-        else:
-            await safe_reply(event, "Кодер-режим ВЫКЛ.")
+            return
+        SESSIONS.cancel(chat_id, reason="кодер выключен", logger=logger)
+        await safe_reply(event, "Кодер-режим ВЫКЛ.")
         return
 
     if command and command[0] == "prompt":
@@ -383,8 +385,10 @@ async def handler(event: Any):
         tool_menu = tools_module.BOT_TOOLS
     else:
         tool_menu = tools_module.PUBLIC_TOOLS
-    try:
-        full_answer = await core.stream_answer(
+    limit_ctx = userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
+
+    async def generate():
+        answer = await core.stream_answer(
             STORE,
             event=event,
             chat_id=chat_id,
@@ -408,16 +412,21 @@ async def handler(event: Any):
             stats=_bot_stats,
             delivery=delivery,
         )
-
-        if full_answer.strip():
-            limit_ctx = (
-                userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
-            )
+        if answer.strip():
             async with ctx_lock:
                 chat_history.setdefault(chat_id, deque(maxlen=limit_ctx)).append(
-                    {"role": "assistant", "content": full_answer}
+                    {"role": "assistant", "content": answer}
                 )
             HISTORY_SAVER.mark_dirty()
+        return answer
+
+    task = SESSIONS.start(chat_id, generate(), logger=logger)
+    try:
+        await task
+    except asyncio.CancelledError:
+        if core.is_own_cancellation():
+            raise
+        logger.info("Бот: запрос в чате %s прерван, жду новый", chat_id)
     except userbot.HANDLER_ERRORS:
         logger.exception("Бот: ошибка генерации ответа")
         if not delivery.get("delivered"):
@@ -553,6 +562,8 @@ async def callback_handler(event: Any):
     elif action == "coder":
         await _toggle(chat_id, coder_chats)
         save_state()
+        if chat_id not in coder_chats:
+            SESSIONS.cancel(chat_id, reason="кодер выключен", logger=logger)
     elif action == "clear":
         limit = userbot.GROUP_HISTORY_LIMIT
         if chat_id > 0:
@@ -699,6 +710,7 @@ async def start_bot():
 
 
 async def disconnect_quietly(timeout=10):
+    SESSIONS.cancel_all(reason="остановка", logger=logger)
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if bot_client is None:

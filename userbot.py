@@ -96,7 +96,10 @@ DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
 LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
-MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 0)
+MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 40)
+MAX_TOOL_SECONDS = max(30, _env_int("MAX_TOOL_SECONDS", 900))
+MAX_TOOL_STUCK = max(1, _env_int("MAX_TOOL_STUCK", 6))
+MAX_TOOL_REPEATS = max(1, _env_int("MAX_TOOL_REPEATS", 3))
 TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 60))
 REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
@@ -109,17 +112,21 @@ CODER_SYSTEM_PROMPT = _env_str(
     "Доступны инструменты read_file, write_file, edit_file, list_dir, "
     "search_files, execute_script, run_shell, web_search, fetch_url, get_time, "
     "memory_remember, memory_recall, memory_forget, memory_list, "
-    "save_skill, load_skill, list_skills, delete_skill. "
+    "save_skill, load_skill, list_skills, delete_skill, run_subagent. "
     "Правила цикла: задача считается выполненной только когда ты реально всё "
     "сделал и проверил результат инструментами; не заканчивай ход, пока задача "
     "не выполнена; никогда не пиши 'сейчас сделаю', 'сейчас посмотрю', 'давай "
     "проверю' - вместо этого сразу вызывай нужный инструмент; после каждого "
     "результата анализируй его и вызывай следующий инструмент, пока не дойдёшь "
-    "до конца; при ошибке инструмента исправь причину и повтори, не сдавайся "
-    "после первой неудачи; не выдумывай содержимое файлов и вывод команд, всегда "
+    "до конца; при ошибке инструмента исправь причину и повтори, но если "
+    "ошибка повторяется - меняй подход, а не повторяй тот же вызов; отказ "
+    "проверки безопасности означает, что вызов запрещён, - не повторяй его, "
+    "разберись с причиной; не выдумывай содержимое файлов и вывод команд, всегда "
     "получай их инструментами; текстовый ответ без вызова инструмента означает "
-    "завершение задачи, поэтому пиши его только когда всё готово; в финале дай "
-    "краткий отчёт: что сделано, какие файлы изменены, результат проверки. "
+    "завершение задачи, поэтому пиши его только когда всё готово; перед финальным "
+    "ответом обязательно запусти проверку через execute_script или run_shell и "
+    "покажи её вывод, а если проверка невозможна - прямо скажи почему; в финале "
+    "дай краткий отчёт: что сделано, какие файлы изменены, результат проверки. "
     "Отвечай на языке последнего сообщения.",
 )
 
@@ -200,6 +207,7 @@ last_chat_activity: dict[int, float] = {}
 START_TIME = time.monotonic()
 
 STORE: core.ModeStore = core.ModeStore(globals())
+SESSIONS = core.SessionRegistry()
 
 
 def make_session(name: str):
@@ -567,14 +575,15 @@ async def stream_with_tools(
     rounds = 0
     all_parts: list[str] = []
     allowed = tools_module.tool_names_of(tools if tools is not None else TOOLS)
+    started = time.monotonic()
+    seen_calls: dict[tuple[str, str], int] = {}
+    stuck = 0
+    last_cause = ""
     while True:
         rounds += 1
-        if 0 < MAX_TOOL_ROUNDS < rounds:
-            return (
-                "".join(all_parts)
-                if all_parts
-                else "Достигнут лимит циклов инструментов."
-            )
+        stop = _loop_stop_reason(rounds, started, stuck, last_cause)
+        if stop:
+            return _finish_loop(all_parts, stop)
         working = core.trim_tool_history(working, TOOL_CONTEXT_MESSAGES)
         tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
@@ -649,15 +658,36 @@ async def stream_with_tools(
         slots = [slot for _idx, slot in sorted(tool_calls.items())]
 
         async def run_slot(slot):
+            key = (slot["name"], slot["arguments"])
+            seen_calls[key] = seen_calls.get(key, 0) + 1
+            repeats = seen_calls[key]
             try:
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError) as exc:
                 snippet = str(slot["arguments"])[:200]
-                return f"Некорректный JSON аргументов: {exc}. Args: {snippet}"
+                return (
+                    f"Некорректный JSON аргументов: {exc}. Args: {snippet}",
+                    "некорректные аргументы",
+                    False,
+                )
             if not isinstance(args, dict):
                 return (
-                    "Аргументы должны быть объектом JSON, получено: "
-                    f"{type(args).__name__}"
+                    (
+                        "Аргументы должны быть объектом JSON, получено: "
+                        f"{type(args).__name__}"
+                    ),
+                    "некорректные аргументы",
+                    False,
+                )
+            if repeats > MAX_TOOL_REPEATS:
+                return (
+                    (
+                        f"Вызов {slot['name']} с этими аргументами уже повторялся "
+                        f"{repeats - 1} раз и результат не изменился. Измени подход, "
+                        "разбей задачу или собери недостающие данные."
+                    ),
+                    "повтор того же вызова",
+                    False,
                 )
             verify_model = TOOL_VERIFY_MODEL or model
             if (
@@ -665,7 +695,11 @@ async def stream_with_tools(
                 and not unrestricted
                 and not await verify_tool_call(slot["name"], args, verify_model)
             ):
-                return None
+                return (
+                    "Вызов отклонён проверкой безопасности. Не повторяй его.",
+                    "отказ проверки безопасности",
+                    False,
+                )
             if on_tool is not None:
                 await on_tool(slot["name"])
             result = await execute_tool(
@@ -678,34 +712,60 @@ async def stream_with_tools(
                 allowed,
             )
             if slot["name"] in SANITIZED_TOOLS and sanitize_tools and not unrestricted:
-                return await sanitize_tool_output(result, model)
-            return result
+                cleaned = await sanitize_tool_output(result, model)
+                return (cleaned, None, True)
+            return (result, None, True)
 
         results = await asyncio.gather(
             *(run_slot(s) for s in slots), return_exceptions=True
         )
-        for slot, result in zip(slots, results, strict=True):
-            if isinstance(result, asyncio.CancelledError):
-                raise result
-            if isinstance(result, BaseException):
-                logger.warning("Инструмент %s упал: %r", slot["name"], result)
-                result = f"Ошибка инструмента {slot['name']}: {result}"
-            if result is None:
-                working.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": slot["id"],
-                        "content": "Вызов отклонён проверкой безопасности.",
-                    }
-                )
-                continue
+        progressed = False
+        causes: list[str] = []
+        for slot, outcome in zip(slots, results, strict=True):
+            if isinstance(outcome, asyncio.CancelledError):
+                raise outcome
+            if isinstance(outcome, BaseException):
+                logger.warning("Инструмент %s упал: %r", slot["name"], outcome)
+                content = f"Ошибка инструмента {slot['name']}: {outcome}"
+                causes.append(f"ошибка {slot['name']}")
+            else:
+                content, cause, ok = outcome
+                if cause:
+                    causes.append(cause)
+                progressed = progressed or ok
             working.append(
                 {
                     "role": "tool",
                     "tool_call_id": slot["id"],
-                    "content": result,
+                    "content": content,
                 }
             )
+        if progressed:
+            stuck = 0
+            last_cause = ""
+        else:
+            stuck += 1
+            last_cause = ", ".join(dict.fromkeys(causes)) or "без прогресса"
+
+
+def _loop_stop_reason(rounds, started, stuck, cause) -> str:
+    if MAX_TOOL_SECONDS > 0 and time.monotonic() - started > MAX_TOOL_SECONDS:
+        return f"Достигнут лимит времени цикла инструментов: {MAX_TOOL_SECONDS}s."
+    if 0 < MAX_TOOL_ROUNDS < rounds:
+        return f"Достигнут лимит циклов инструментов: {MAX_TOOL_ROUNDS}."
+    if stuck >= MAX_TOOL_STUCK:
+        return (
+            f"Цикл инструментов не продвинулся {stuck} раундов подряд "
+            f"({cause}). Остановился, чтобы не тратить токены впустую."
+        )
+    return ""
+
+
+def _finish_loop(parts, reason) -> str:
+    answer = "".join(parts)
+    if answer.strip():
+        return f"{answer}\n\n{reason}"
+    return reason
 
 
 async def _get_sender(event):
@@ -954,8 +1014,9 @@ async def handler(event: Any):
 
     delivery: dict[str, bool] = {}
     tool_menu = TOOLS if sender_id in OWNER_IDS else tools_module.PUBLIC_TOOLS
-    try:
-        full_answer = await core.stream_answer(
+
+    async def generate():
+        answer = await core.stream_answer(
             STORE,
             event=event,
             chat_id=chat_id,
@@ -979,13 +1040,21 @@ async def handler(event: Any):
             stats=_bot_stats,
             delivery=delivery,
         )
-
-        if full_answer.strip():
+        if answer.strip():
             async with ctx_lock:
                 chat_history.setdefault(chat_id, deque(maxlen=limit)).append(
-                    {"role": "assistant", "content": full_answer}
+                    {"role": "assistant", "content": answer}
                 )
             HISTORY_SAVER.mark_dirty()
+        return answer
+
+    task = SESSIONS.start(chat_id, generate(), logger=logger)
+    try:
+        await task
+    except asyncio.CancelledError:
+        if core.is_own_cancellation():
+            raise
+        logger.info("Запрос в чате %s прерван, жду новый", chat_id)
     except HANDLER_ERRORS:
         logger.exception("Ошибка генерации ответа")
         if not delivery.get("delivered"):
@@ -993,6 +1062,7 @@ async def handler(event: Any):
 
 
 async def disconnect_quietly(timeout=10):
+    SESSIONS.cancel_all(reason="остановка", logger=logger)
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if client is None:

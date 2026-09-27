@@ -87,8 +87,18 @@ def _available_tools():
     return cast(Any, _TOOLS_CACHE["items"])
 
 
-def _select_tools(tool_names):
-    available = list(_available_tools())
+def _full_tools():
+    import tools as tools_module
+
+    return [
+        item
+        for item in [*tools_module.FILE_TOOLS, *tools_module.TOOLS]
+        if item["function"]["name"] not in tools_module.SUBAGENT_EXCLUDED_UNRESTRICTED
+    ]
+
+
+def _select_tools(tool_names, unrestricted=False):
+    available = _full_tools() if unrestricted else list(_available_tools())
     if not tool_names:
         return available
     wanted = {str(name).strip() for name in tool_names if str(name).strip()}
@@ -114,8 +124,9 @@ async def _call_tool(
     stats,
     allowed,
     verify,
+    unrestricted=False,
 ):
-    if verifier is not None and verify:
+    if verifier is not None and verify and not unrestricted:
         try:
             approved = await verifier(name, arguments, use_model)
         except (OSError, ValueError, TypeError):
@@ -124,7 +135,7 @@ async def _call_tool(
             return name, "Вызов отклонён проверкой безопасности.", False
     try:
         output = await tools_module.execute_tool(
-            name, arguments, chat_id, client, stats, False, allowed
+            name, arguments, chat_id, client, stats, unrestricted, allowed
         )
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         output = f"Ошибка инструмента {name}: {exc}"
@@ -162,6 +173,7 @@ async def run_subagent(
     subagent_name="universal",
     verify=True,
     stats=None,
+    unrestricted=False,
 ):
     result = {
         "name": subagent_name,
@@ -181,7 +193,7 @@ async def run_subagent(
     import tools as tools_module
 
     ai = _RUNTIME["ai"]
-    selected_tools = _select_tools(tool_names)
+    selected_tools = _select_tools(tool_names, unrestricted=unrestricted)
     use_model = model or _RUNTIME["model"]
     rounds_limit = max_rounds if max_rounds is not None else _RUNTIME["max_rounds"]
     verifier = cast(Any, _RUNTIME["verifier"])
@@ -258,6 +270,7 @@ async def run_subagent(
                     tool_stats,
                     allowed,
                     verify,
+                    unrestricted,
                 )
                 for _call_id, name, arguments in calls
             ),
@@ -325,6 +338,7 @@ async def run_subagents(
     max_rounds=None,
     verify=True,
     stats=None,
+    unrestricted=False,
 ):
     if isinstance(tasks, str):
         tasks = [tasks]
@@ -358,6 +372,7 @@ async def run_subagents(
             subagent_name=spec.get("name", "universal"),
             verify=verify,
             stats=stats,
+            unrestricted=spec.get("unrestricted", unrestricted),
         )
 
     if limit is None:

@@ -54,6 +54,7 @@ MAX_SEARCH_NODES = 40000
 MAX_SEARCH_FILE_BYTES = 2_000_000
 MAX_SEARCH_PATTERN = 250
 SEARCH_TIMEOUT = 30
+MAX_SHELL_TIMEOUT = 300
 MAX_SCRIPT_BYTES = 200_000
 MAX_SCRIPT_OUTPUT = 4000
 MAX_SHELL_OUTPUT = 4000
@@ -373,7 +374,7 @@ TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
-                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 300},
                     "cwd": {
                         "type": "string",
                         "description": "Рабочий каталог внутри разрешённого корня",
@@ -572,7 +573,10 @@ TOOLS: list[dict[str, Any]] = [
             "description": (
                 "Запустить одного или нескольких универсальных субагентов. "
                 "Субагенты работают автономно и параллельно, каждый со своим "
-                "набором инструментов. Вернуть результаты всех задач."
+                "набором инструментов. По умолчанию доступны чтение, поиск, "
+                "время, статистика, веб, память и скиллы. В кодер-режиме "
+                "владельца субагент наследует инструменты сессии, кроме "
+                "run_subagent. Вернуть результаты всех задач."
             ),
             "parameters": {
                 "type": "object",
@@ -709,7 +713,7 @@ FILE_TOOLS: list[dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "code": {"type": "string"},
-                    "timeout": {"type": "integer", "minimum": 1, "maximum": 120},
+                    "timeout": {"type": "integer", "minimum": 1, "maximum": 300},
                     "cwd": {
                         "type": "string",
                         "description": "Рабочий каталог внутри разрешённого корня",
@@ -771,6 +775,8 @@ PUBLIC_TOOLS: list[dict[str, Any]] = [
 SUBAGENT_EXCLUDED_TOOLS = frozenset(
     {"run_subagent", "run_shell", *FILE_TOOL_NAMES, *MEMORY_TOOL_NAMES}
 )
+
+SUBAGENT_EXCLUDED_UNRESTRICTED = frozenset({"run_subagent"})
 
 
 def _entity_json(entity) -> str:
@@ -932,7 +938,7 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
     command = _str_arg(arguments, "command")
     if not command:
         return "Пустая команда."
-    timeout = _int_arg(arguments, "timeout", 30, 1, 120)
+    timeout = _int_arg(arguments, "timeout", 30, 1, MAX_SHELL_TIMEOUT)
     workdir, err = _resolve_workdir(_str_arg(arguments, "cwd"))
     if err:
         return err
@@ -1332,6 +1338,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
         max_rounds=_opt_int_arg(arguments, "max_rounds", 1, 20),
         verify=not unrestricted,
         stats=stats,
+        unrestricted=unrestricted,
     )
     return _subagent_report(results)
 
@@ -1467,17 +1474,22 @@ def _is_safe_glob(pattern: str) -> bool:
     return ".." not in re.split(r"[\\/]+", pattern)
 
 
-def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
+def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> tuple[list[str], str]:
     matches: list[str] = []
     scanned = 0
     visited = 0
+    skipped_big = 0
+    note = ""
     candidates = [root] if root.is_file() else root.rglob(glob_pat)
     for item in candidates:
-        if (
-            len(matches) >= limit
-            or scanned >= MAX_SEARCH_FILES
-            or visited >= MAX_SEARCH_NODES
-        ):
+        if len(matches) >= limit:
+            note = f"достигнут лимит результатов {limit}"
+            break
+        if scanned >= MAX_SEARCH_FILES:
+            note = f"просмотрено не больше {MAX_SEARCH_FILES} файлов"
+            break
+        if visited >= MAX_SEARCH_NODES:
+            note = f"обойдено не больше {MAX_SEARCH_NODES} элементов"
             break
         visited += 1
         if not item.is_file():
@@ -1490,6 +1502,7 @@ def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
             continue
         try:
             if item.stat().st_size > MAX_SEARCH_FILE_BYTES:
+                skipped_big += 1
                 continue
             scanned += 1
             text = item.read_text(encoding="utf-8", errors="ignore")
@@ -1500,7 +1513,9 @@ def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> list[str]:
                 matches.append(f"{item}:{idx}: {line.strip()[:200]}")
                 if len(matches) >= limit:
                     break
-    return matches
+    if skipped_big and not note:
+        note = f"пропущено файлов больше {MAX_SEARCH_FILE_BYTES} байт: {skipped_big}"
+    return matches, note
 
 
 async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=False):
@@ -1523,15 +1538,16 @@ async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=Fal
     except re.error as exc:
         return f"Некорректное выражение: {exc}"
     try:
-        matches = await asyncio.wait_for(
+        matches, note = await asyncio.wait_for(
             asyncio.to_thread(_scan_files, path, glob_pat, rx, limit),
             timeout=SEARCH_TIMEOUT,
         )
     except TimeoutError:
         return f"Таймаут поиска: {SEARCH_TIMEOUT}s"
-    if not matches:
-        return "Совпадений не найдено."
-    return "\n".join(matches)
+    text = "\n".join(matches) if matches else "Совпадений не найдено."
+    if note:
+        text = f"{text}\n\nПоиск неполный: {note}. Сузить path, glob или pattern."
+    return text
 
 
 async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=False):
@@ -1541,7 +1557,7 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
     encoded = code.encode("utf-8")
     if len(encoded) > MAX_SCRIPT_BYTES:
         return f"Слишком большой объём: {len(encoded)} байт"
-    timeout = _int_arg(arguments, "timeout", 30, 1, 120)
+    timeout = _int_arg(arguments, "timeout", 30, 1, MAX_SHELL_TIMEOUT)
     workdir, err = _resolve_workdir(_str_arg(arguments, "cwd"))
     if err:
         return err

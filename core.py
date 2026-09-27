@@ -594,6 +594,10 @@ QUOTE_HEADER = "Сообщение, на которое ответили:\n{quot
 
 ERROR_NOTICE = "Ошибка при обращении к DanyAPI. / DanyAPI request error."
 
+INTERRUPTED_NOTICE = "Запрос прерван новым сообщением. / Request interrupted."
+
+EMPTY_ANSWER = "(пустой ответ / empty answer)"
+
 
 def compose_prompt(prompt, replied_text, limit):
     if not replied_text:
@@ -766,6 +770,50 @@ def trim_tool_history(messages, max_messages, head_size=1):
     return [*head, *tail]
 
 
+def is_own_cancellation() -> bool:
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+class SessionRegistry:
+    def __init__(self):
+        self._tasks: dict[Any, Any] = {}
+
+    def _drop(self, chat_id, task) -> None:
+        if self._tasks.get(chat_id) is task:
+            self._tasks.pop(chat_id, None)
+
+    def start(self, chat_id, coro, logger=None):
+        self.cancel(chat_id, reason="новый запрос", logger=logger)
+        task = asyncio.ensure_future(coro)
+        self._tasks[chat_id] = task
+        task.add_done_callback(lambda done: self._drop(chat_id, done))
+        return task
+
+    def cancel(self, chat_id, reason="", logger=None) -> bool:
+        task = self._tasks.pop(chat_id, None)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        if logger is not None:
+            logger.info("Прерван запрос в чате %s: %s", chat_id, reason or "причина")
+        return True
+
+    def cancel_all(self, reason="остановка", logger=None) -> int:
+        stopped = 0
+        for chat_id in list(self._tasks):
+            if self.cancel(chat_id, reason=reason, logger=logger):
+                stopped += 1
+        return stopped
+
+    def is_running(self, chat_id) -> bool:
+        task = self._tasks.get(chat_id)
+        return task is not None and not task.done()
+
+    def running_chats(self) -> int:
+        return sum(1 for task in list(self._tasks.values()) if not task.done())
+
+
 async def stream_answer(
     store,
     *,
@@ -802,6 +850,22 @@ async def stream_answer(
     result = None
     delivered = False
     caught = (*STREAM_ERRORS, userbot_module.OpenAIError, RPCError)
+
+    async def deliver(text) -> bool:
+        nonlocal delivered
+        if state["edit_id"] is not None:
+            edited = await edit_fn(chat_id, state["edit_id"], text, logger=logger)
+            delivered = bool(edited)
+            if not edited and placeholder_id is not None:
+                if logger is not None:
+                    logger.warning(
+                        "финальный edit не удался, отправляю ответ новым сообщением"
+                    )
+                delivered = bool(await reply_fn(event, text))
+        elif not is_self:
+            delivered = bool(await reply_fn(event, text))
+        return delivered
+
     try:
         try:
             async with action:
@@ -827,19 +891,20 @@ async def stream_answer(
                 )
         except caught as exc:
             error = exc
+        except asyncio.CancelledError:
+            partial = "".join(state["answer_parts"])
+            text = _final_text(state, render, partial, None)
+            if text.strip() in ("", "…", EMPTY_ANSWER):
+                text = INTERRUPTED_NOTICE
+            else:
+                text = f"{text}\n\n{INTERRUPTED_NOTICE}"
+            if logger is not None:
+                logger.info("Ответ в чате %s прерван", chat_id)
+            with contextlib.suppress(Exception):
+                await deliver(text)
+            raise
         full_answer = result or "".join(state["answer_parts"])
-        final_text = _final_text(state, render, full_answer, error)
-        if state["edit_id"] is not None:
-            edited = await edit_fn(chat_id, state["edit_id"], final_text, logger=logger)
-            delivered = bool(edited)
-            if not edited and placeholder_id is not None:
-                if logger is not None:
-                    logger.warning(
-                        "финальный edit не удался, отправляю ответ новым сообщением"
-                    )
-                delivered = bool(await reply_fn(event, final_text))
-        elif not is_self:
-            delivered = bool(await reply_fn(event, final_text))
+        await deliver(_final_text(state, render, full_answer, error))
     finally:
         if placeholder_id is not None:
             store.recent_reply_ids.discard((chat_id, placeholder_id))
@@ -862,7 +927,7 @@ def _final_text(state, render, full_answer, error):
     elif error is not None:
         text = ERROR_NOTICE
     else:
-        text = "(пустой ответ / empty answer)"
+        text = EMPTY_ANSWER
     if error is not None and text != ERROR_NOTICE:
         text = f"{text}\n\n{ERROR_NOTICE}"
     return text

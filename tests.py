@@ -1582,7 +1582,120 @@ class StreamToolsTest(BotTestCase):
                     lambda p: self.collect([], p),
                 )
             )
-        self.assertEqual(answer, "Достигнут лимит циклов инструментов.")
+        self.assertEqual(answer, "Достигнут лимит циклов инструментов: 2.")
+
+    def test_repeated_call_asks_for_another_approach(self):
+        endless = [
+            make_chunk(
+                make_delta(
+                    tool_calls=[
+                        make_tc(
+                            tc_id="c1",
+                            name="evaluate",
+                            arguments='{"expression":"1+1"}',
+                        )
+                    ]
+                )
+            )
+        ]
+        fake_ai = self.install_ai([endless] * 5)
+        with (
+            mock.patch.object(userbot, "MAX_TOOL_REPEATS", 2),
+            mock.patch.object(userbot, "MAX_TOOL_STUCK", 99),
+            mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 4),
+        ):
+            answer = asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                )
+            )
+        self.assertIn("лимит циклов", answer)
+        self.assertEqual(len(self.tool_calls_made), 2)
+        hints = [
+            m["content"]
+            for call in fake_ai.chat.completions.calls
+            for m in call["messages"]
+            if m.get("role") == "tool" and "Измени подход" in m["content"]
+        ]
+        self.assertTrue(hints)
+
+    def test_denied_calls_stop_the_loop(self):
+        endless = [
+            make_chunk(
+                make_delta(
+                    tool_calls=[
+                        make_tc(
+                            tc_id="c1",
+                            name="run_shell",
+                            arguments='{"command":"echo hi"}',
+                        )
+                    ]
+                )
+            )
+        ]
+        self.install_ai([endless] * 10)
+
+        async def deny(name, args, model, unrestricted=False):
+            return False
+
+        with (
+            mock.patch.object(userbot, "verify_tool_call", deny),
+            mock.patch.object(userbot, "MAX_TOOL_STUCK", 2),
+        ):
+            answer = asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                    verify_tools=True,
+                )
+            )
+        self.assertIn("не продвинулся", answer)
+        self.assertIn("отказ проверки безопасности", answer)
+        self.assertEqual(self.tool_calls_made, [])
+
+    def test_failing_tool_is_reported_without_stopping_immediately(self):
+        endless = [
+            make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
+        ]
+        self.install_ai([endless, [make_chunk(make_delta(content="всё"))]])
+
+        async def boom(name, args, chat_id, *rest, **kwargs):
+            raise RuntimeError("tool down")
+
+        saved = userbot.execute_tool
+        userbot.execute_tool = boom
+        self.addCleanup(setattr, userbot, "execute_tool", saved)
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        self.assertEqual(answer, "всё")
+
+    def test_loop_stop_reason_rules(self):
+        now = time.monotonic()
+        with mock.patch.object(userbot, "MAX_TOOL_SECONDS", 10):
+            self.assertIn("времени", userbot._loop_stop_reason(1, now - 11, 0, ""))
+        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 3):
+            self.assertIn("циклов", userbot._loop_stop_reason(4, now, 0, ""))
+        with mock.patch.object(userbot, "MAX_TOOL_STUCK", 2):
+            stop = userbot._loop_stop_reason(1, now, 2, "отказ проверки безопасности")
+        self.assertIn("не продвинулся", stop)
+        self.assertIn("отказ проверки безопасности", stop)
+        self.assertEqual(userbot._loop_stop_reason(1, now, 0, ""), "")
+        self.assertEqual(userbot._finish_loop([], "стоп"), "стоп")
+        self.assertEqual(userbot._finish_loop(["часть"], "стоп"), "часть\n\nстоп")
 
     def test_unrestricted_request_skips_verification(self):
         self.install_ai(
@@ -1999,6 +2112,22 @@ class _StoreStub:
         self.tools_hidden = set()
         self.seen_msg_keys = set()
         self.last_chat_activity = {}
+
+
+def _task_outcome(task):
+    if not task.done():
+        return "pending"
+    if task.cancelled():
+        return "cancelled"
+    return repr(task.exception())
+
+
+async def _wait_done(task, attempts=50):
+    for _ in range(attempts):
+        if task.done():
+            return True
+        await asyncio.sleep(0.005)
+    return task.done()
 
 
 def _owner_tool(name, arguments, chat_id=-100, **kwargs):
@@ -2440,7 +2569,7 @@ class CoreHelpersTest(BotTestCase):
         )
         self.assertEqual(
             core._final_text(state, lambda: "…", "", None),
-            "(пустой ответ / empty answer)",
+            core.EMPTY_ANSWER,
         )
         state["tool_parts"] = ["get_time"]
         rendered = core._final_text(
@@ -2955,6 +3084,205 @@ class ContractDirTest(BotTestCase):
                 self.assertEqual(userbot._resolve_contract_dir(), candidates[0])
 
 
+class SessionRegistryTest(BotTestCase):
+    def test_start_cancels_previous_in_same_chat(self):
+        registry = core.SessionRegistry()
+        results = {}
+
+        async def scenario():
+            async def slow():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    results["slow"] = "cancelled"
+                    raise
+
+            async def fast():
+                results["fast"] = "done"
+
+            first = registry.start(7, slow())
+            await asyncio.sleep(0)
+            second = registry.start(7, fast())
+            await second
+            with self.assertRaises(asyncio.CancelledError):
+                await first
+            self.assertEqual(registry.running_chats(), 0)
+            self.assertFalse(registry.is_running(7))
+
+        asyncio.run(scenario())
+        self.assertEqual(results, {"slow": "cancelled", "fast": "done"})
+
+    def test_other_chats_are_not_touched(self):
+        registry = core.SessionRegistry()
+
+        async def scenario():
+            async def waiter():
+                await asyncio.sleep(0)
+
+            first = registry.start(1, waiter())
+            second = registry.start(2, waiter())
+            await asyncio.gather(first, second)
+            self.assertFalse(registry.is_running(1))
+            self.assertFalse(registry.is_running(2))
+            self.assertEqual(registry.running_chats(), 0)
+
+        asyncio.run(scenario())
+
+    def test_cancel_and_cancel_all(self):
+        registry = core.SessionRegistry()
+        outcomes = []
+
+        async def scenario():
+            async def waiter():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    outcomes.append("cancelled")
+                    raise
+
+            registry.start(1, waiter())
+            registry.start(2, waiter())
+            await asyncio.sleep(0)
+            self.assertFalse(registry.cancel(9))
+            self.assertTrue(registry.cancel(1))
+            self.assertEqual(registry.running_chats(), 1)
+            self.assertEqual(registry.cancel_all(), 1)
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        self.assertEqual(outcomes, ["cancelled", "cancelled"])
+
+    def test_is_own_cancellation(self):
+        async def scenario():
+            self.assertFalse(core.is_own_cancellation())
+
+        asyncio.run(scenario())
+
+        async def outer():
+            observed = []
+
+            async def waiter():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    observed.append(core.is_own_cancellation())
+                    raise
+
+            task = asyncio.ensure_future(waiter())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(observed, [True])
+
+        asyncio.run(outer())
+
+    def test_stream_answer_marks_interruption_with_partial_text(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=901)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def scenario():
+            async def stream_fn(_m, _model, _chat, on_delta, *_args, **_kwargs):
+                await on_delta("успел написать")
+                await asyncio.sleep(5)
+
+            task = asyncio.ensure_future(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                )
+            )
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        self.assertEqual(edited[-1], f"успел написать\n\n{core.INTERRUPTED_NOTICE}")
+        self.assertNotIn((1, 901), store.recent_reply_ids)
+
+    def test_stream_answer_marks_bare_interruption(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=902)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def scenario():
+            async def stream_fn(*_args, **_kwargs):
+                await asyncio.sleep(5)
+
+            task = asyncio.ensure_future(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                )
+            )
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        self.assertEqual(edited[-1], core.INTERRUPTED_NOTICE)
+
+    def test_disconnect_quietly_cancels_sessions(self):
+        async def scenario():
+            async def waiter():
+                await asyncio.sleep(5)
+
+            for mod in (userbot, bot):
+                mod.SESSIONS.start(1, waiter())
+            self.assertEqual(userbot.SESSIONS.running_chats(), 1)
+            self.assertEqual(bot.SESSIONS.running_chats(), 1)
+            await userbot.disconnect_quietly()
+            await bot.disconnect_quietly()
+            self.assertEqual(userbot.SESSIONS.running_chats(), 0)
+            self.assertEqual(bot.SESSIONS.running_chats(), 0)
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+
+
 class MemoryStoreTest(unittest.TestCase):
     def setUp(self):
         tmp = Path(tempfile.mkdtemp(prefix="danybot_memory_"))
@@ -3400,6 +3728,112 @@ class BotHandlerTest(BotTestCase):
     def test_history_saver_marked_dirty(self):
         self._run(self._group_event("@danybot привет"))
         self.assertGreaterEqual(self.saver.dirty, 1)
+
+    def test_new_message_cancels_running_request(self):
+        self.addCleanup(bot.SESSIONS.cancel_all)
+        started = asyncio.Event()
+        calls = []
+        finished = []
+
+        async def stream(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                started.set()
+                await asyncio.sleep(5)
+                finished.append(1)
+            return "быстрый ответ"
+
+        core.stream_answer = stream
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                bot.handler(
+                    self._group_event(
+                        "@danybot долгий", chat_id=77, sender_id=self.OWNER
+                    )
+                )
+            )
+            await started.wait()
+            await bot.handler(
+                self._group_event("@danybot новый", chat_id=77, sender_id=self.OWNER)
+            )
+            await _wait_done(task)
+            self.assertEqual(_task_outcome(task), "None")
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(bot.SESSIONS.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(finished, [])
+
+    def test_coder_off_cancels_running_request(self):
+        self.addCleanup(bot.SESSIONS.cancel_all)
+        self.addCleanup(bot.coder_chats.clear)
+        bot.coder_chats.add(77)
+        started = asyncio.Event()
+        finished = []
+
+        async def stream(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            finished.append(1)
+            return "долгий ответ"
+
+        core.stream_answer = stream
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                bot.handler(
+                    self._group_event(
+                        "@danybot долгий", chat_id=77, sender_id=self.OWNER
+                    )
+                )
+            )
+            await started.wait()
+            await bot.handler(
+                self._group_event("/coder off", chat_id=77, sender_id=self.OWNER)
+            )
+            await _wait_done(task)
+            self.assertEqual(_task_outcome(task), "None")
+            self.assertNotIn(77, bot.coder_chats)
+            self.assertEqual(bot.SESSIONS.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(finished, [])
+
+    def test_coder_toggle_button_cancels_running_request(self):
+        self.addCleanup(bot.SESSIONS.cancel_all)
+        self.addCleanup(bot.coder_chats.clear)
+        bot.coder_chats.add(88)
+        started = asyncio.Event()
+        finished = []
+
+        async def stream(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            finished.append(1)
+            return "долгий ответ"
+
+        core.stream_answer = stream
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                bot.handler(
+                    self._group_event(
+                        "@danybot долгий", chat_id=88, sender_id=self.OWNER
+                    )
+                )
+            )
+            await started.wait()
+            await bot.callback_handler(
+                _CallbackEvent(b"settings:coder", 88, self.OWNER)
+            )
+            await _wait_done(task)
+            self.assertEqual(_task_outcome(task), "None")
+            self.assertNotIn(88, bot.coder_chats)
+            self.assertEqual(bot.SESSIONS.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(finished, [])
 
     def test_help_command_for_owner(self):
         event = self._group_event("/help", sender_id=self.OWNER)
@@ -4137,6 +4571,66 @@ class SubagentsTest(BotTestCase):
         names_after = [t["function"]["name"] for t in subagents._select_tools(None)]
         self.assertNotIn("probe_time", names_after)
 
+    def test_select_tools_unrestricted_inherits_session_tools(self):
+        names = {t["function"]["name"] for t in subagents._select_tools(None, True)}
+        self.assertTrue(names & set(tools_module.FILE_TOOL_NAMES))
+        self.assertIn("run_shell", names)
+        self.assertIn("save_skill", names)
+        self.assertNotIn("run_subagent", names)
+        picked = {
+            t["function"]["name"] for t in subagents._select_tools(["read_file"], True)
+        }
+        self.assertEqual(picked, {"read_file"})
+
+    def test_call_tool_unrestricted_bypasses_verifier_and_owner_gate(self):
+        seen = {}
+
+        async def fake_execute(
+            name, args, chat_id, client, stats, unrestricted, allowed
+        ):
+            seen["name"] = name
+            seen["unrestricted"] = unrestricted
+            return "готово"
+
+        async def boom(*_args, **_kwargs):
+            raise AssertionError("верификатор не должен вызываться")
+
+        saved = tools_module.execute_tool
+        tools_module.execute_tool = fake_execute
+        self.addCleanup(setattr, tools_module, "execute_tool", saved)
+        result = asyncio.run(
+            subagents._call_tool(
+                tools_module,
+                boom,
+                "run_shell",
+                {"command": "echo hi"},
+                "m",
+                1,
+                None,
+                None,
+                {"run_shell"},
+                True,
+                True,
+            )
+        )
+        self.assertEqual(result[1], "готово")
+        self.assertTrue(seen["unrestricted"])
+        self.assertEqual(seen["name"], "run_shell")
+
+    def test_unrestricted_subagent_runs_owner_tool(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "get_time", "{}")]),
+                ("время получено", None),
+            ]
+        )
+        subagents.configure(ai=ai, model="m", verifier=self._deny, enabled=True)
+        result = asyncio.run(
+            subagents.run_subagent("скажи время", verify=True, unrestricted=True)
+        )
+        self.assertEqual(result["result"], "время получено")
+        self.assertEqual(result["tools_used"], ["get_time"])
+
     def test_loads_and_assistant_message(self):
         self.assertEqual(subagents._loads(""), {})
         self.assertEqual(subagents._loads("nope"), {})
@@ -4816,6 +5310,11 @@ class HardeningTest(BotTestCase):
         self.addCleanup(shutil.rmtree, tmp, True)
         return tmp
 
+    def _use_coder_root(self, path):
+        saved = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved)
+        tools_module.CODER_ROOT = path
+
     def test_render_keeps_answer_with_long_prefix(self):
         text = tools_module.render_response(
             "я" * 4000 + "\n\nmodel:\n\n", [], [], "ОТВЕТ " * 400
@@ -5013,11 +5512,45 @@ class HardeningTest(BotTestCase):
             deep = deep / f"d{i}"
             deep.mkdir()
         (deep / "hit.txt").write_text("needle", encoding="utf-8")
+        self._use_coder_root(tmp)
         saved = tools_module.MAX_SEARCH_NODES
         self.addCleanup(setattr, tools_module, "MAX_SEARCH_NODES", saved)
         tools_module.MAX_SEARCH_NODES = 10
         out = _owner_tool("search_files", {"pattern": "needle"}, 1)
         self.assertIn("Совпадений не найдено", out)
+        self.assertIn("Поиск неполный", out)
+        self.assertIn("элементов", out)
+
+    def test_scan_files_reports_huge_files_and_result_cap(self):
+        tmp = self._tmp_dir("danybot_scan3_")
+        (tmp / "big.txt").write_text("needle " + "x" * 100, encoding="utf-8")
+        (tmp / "a_first.txt").write_text("needle", encoding="utf-8")
+        (tmp / "z_last.txt").write_text("needle", encoding="utf-8")
+        self._use_coder_root(tmp)
+        saved = tools_module.MAX_SEARCH_FILE_BYTES
+        self.addCleanup(setattr, tools_module, "MAX_SEARCH_FILE_BYTES", saved)
+        tools_module.MAX_SEARCH_FILE_BYTES = 10
+        out = _owner_tool("search_files", {"pattern": "needle"}, 1)
+        self.assertIn("a_first.txt", out)
+        self.assertIn("z_last.txt", out)
+        self.assertNotIn("big.txt", out)
+        self.assertIn("Поиск неполный", out)
+        self.assertIn("байт", out)
+        capped = _owner_tool("search_files", {"pattern": "needle", "limit": 1}, 1)
+        self.assertIn("a_first.txt", capped)
+        self.assertNotIn("z_last.txt", capped)
+        self.assertIn("Поиск неполный", capped)
+        self.assertIn("результатов", capped)
+
+    def test_scan_files_ignores_files_outside_root(self):
+        tmp = self._tmp_dir("danybot_scan4_")
+        root = tmp / "root"
+        root.mkdir()
+        (tmp / "outside.txt").write_text("needle", encoding="utf-8")
+        self._use_coder_root(root)
+        out = _owner_tool("search_files", {"pattern": "needle"}, 1)
+        self.assertIn("Совпадений не найдено", out)
+        self.assertNotIn("Поиск неполный", out)
 
     def test_scan_files_finds_match_within_node_budget(self):
         tmp = self._tmp_dir("danybot_scan2_")
