@@ -1,3 +1,5 @@
+aiogram
+aiohttp-socks
 telethon
 openai
 python-dotenv

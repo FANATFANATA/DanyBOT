@@ -6,12 +6,26 @@ import re
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, cast
+from types import SimpleNamespace
+from typing import Any
 
-from telethon import Button, TelegramClient, events
-from telethon.errors import AuthKeyError, RPCError
-from telethon.sessions import StringSession
-from telethon.tl import functions, types
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import (
+    TelegramAPIError,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
+from aiogram.types import (
+    BotCommand,
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiogram.utils.token import TokenValidationError
+from telethon.errors import FloodWaitError, RPCError
 
 import core
 import proxies
@@ -25,6 +39,10 @@ handle_bot_commands = core.handle_bot_commands
 STATE_FILE = Path(__file__).parent / "state_bot.json"
 HISTORY_FILE = Path(__file__).parent / "history_bot.json"
 CALLBACK_MAX_BYTES = 64
+TYPING_INTERVAL = 4.0
+CONNECT_TIMEOUT = 25
+POLL_TIMEOUT = 10
+PROXY_SCHEMES = {"socks5": "socks5", "socks4": "socks4", "http": "http"}
 
 model_overrides: dict[int, str] = {}
 coder_chats: set[int] = set()
@@ -43,6 +61,254 @@ TASKS = core.TaskJournal(lambda: save_state())
 
 bot_username = ""
 bot_id = 0
+
+
+async def _tg_call(awaitable):
+    try:
+        return await awaitable
+    except TelegramRetryAfter as exc:
+        raise FloodWaitError(None, capture=max(1, int(exc.retry_after))) from exc
+    except TelegramNetworkError as exc:
+        raise OSError(str(exc)) from exc
+    except TelegramAPIError as exc:
+        raise RPCError(request=None, message=str(exc)) from exc
+
+
+def _sender_id(message) -> int:
+    user = getattr(message, "from_user", None)
+    if user is None:
+        return 0
+    return int(user.id)
+
+
+def _chat_ref(key) -> int | str:
+    if isinstance(key, int):
+        return key
+    text = str(key).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return text
+
+
+def _entity_view(view) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=getattr(view, "id", None),
+        title=getattr(view, "title", None),
+        username=getattr(view, "username", None),
+        first_name=getattr(view, "first_name", "") or "",
+        last_name=getattr(view, "last_name", "") or "",
+    )
+
+
+def _menu_commands() -> list[BotCommand]:
+    return [
+        BotCommand(command="help", description="Справка / Help"),
+        BotCommand(command="clear", description="Очистить контекст / Clear context"),
+        BotCommand(command="settings", description="Настройки / Settings"),
+        BotCommand(command="task", description="Журнал задач / Task log"),
+    ]
+
+
+class TypingAction:
+    def __init__(self, bot, chat_id, action_name, interval=TYPING_INTERVAL):
+        self._bot = bot
+        self._chat_id = chat_id
+        self._action = action_name
+        self._interval = interval
+        self._task = None
+
+    async def __aenter__(self):
+        self._task = asyncio.create_task(self._loop())
+        return self
+
+    async def __aexit__(self, *_args) -> bool:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        return False
+
+    async def _loop(self) -> None:
+        while True:
+            try:
+                await _tg_call(self._bot.send_chat_action(self._chat_id, self._action))
+            except (RPCError, OSError, ValueError, TypeError) as exc:
+                logger.debug("Индикатор набора не отправлен: %r", exc)
+                return
+            await asyncio.sleep(self._interval)
+
+
+class SentMessage:
+    def __init__(self, message):
+        self.id = message.message_id
+        self.message = message
+
+
+class BotMessage:
+    def __init__(self, message):
+        self._message = message
+
+    @property
+    def id(self) -> int:
+        return self._message.message_id
+
+    @property
+    def message(self) -> str | None:
+        return self._message.text
+
+    @property
+    def out(self) -> bool:
+        return False
+
+    @property
+    def sender_id(self) -> int:
+        return _sender_id(self._message)
+
+    @property
+    def is_reply(self) -> bool:
+        return self._message.reply_to_message is not None
+
+    async def get_reply_message(self):
+        replied = self._message.reply_to_message
+        if replied is None:
+            return None
+        return BotMessage(replied)
+
+
+class BotEvent:
+    def __init__(self, message):
+        self._message = message
+        self.message = BotMessage(message)
+        self.chat_id = message.chat.id
+        self.sender_id = _sender_id(message)
+        self.is_private = getattr(message.chat, "type", "") == "private"
+
+    async def reply(self, text, buttons=None):
+        sent = await _tg_call(self._message.answer(text, reply_markup=buttons))
+        return SentMessage(sent)
+
+    async def get_sender(self):
+        return self._message.from_user
+
+
+class BotCallbackEvent:
+    def __init__(self, query: CallbackQuery):
+        self._query = query
+        self.data = query.data
+        message = query.message
+        self.chat_id = message.chat.id if message is not None else None
+        self.sender_id = _sender_id(query)
+
+    async def answer(self, text=None, alert=False) -> None:
+        await _tg_call(self._query.answer(text=text, show_alert=alert))
+
+    async def edit(self, text, buttons=None) -> None:
+        message = self._query.message
+        if not isinstance(message, Message):
+            return
+        await _tg_call(message.edit_text(text=text, reply_markup=buttons))
+
+    async def reply(self, text, buttons=None):
+        message = self._query.message
+        if not isinstance(message, Message):
+            return None
+        sent = await _tg_call(message.answer(text, reply_markup=buttons))
+        return SentMessage(sent)
+
+
+class BotClient:
+    def __init__(self, bot):
+        self.bot = bot
+
+    async def resolve(self):
+        return await _tg_call(self.bot.get_me())
+
+    async def set_commands(self) -> None:
+        try:
+            await _tg_call(self.bot.set_my_commands(_menu_commands()))
+        except (RPCError, OSError, ValueError, TypeError) as exc:
+            logger.warning("Не удалось задать меню команд: %s", exc)
+
+    async def poll(self) -> None:
+        await build_dispatcher().start_polling(
+            self.bot,
+            polling_timeout=POLL_TIMEOUT,
+            handle_signals=False,
+            close_bot_session=False,
+        )
+
+    async def edit_message(self, chat_id, msg_id, text):
+        return await _tg_call(
+            self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id)
+        )
+
+    def action(self, chat_id, action_name="typing") -> TypingAction:
+        return TypingAction(self.bot, chat_id, action_name)
+
+    async def get_me(self) -> SimpleNamespace:
+        me = await _tg_call(self.bot.get_me())
+        return _entity_view(me)
+
+    async def get_entity(self, key) -> SimpleNamespace:
+        entity = _entity_view(await _tg_call(self.bot.get_chat(_chat_ref(key))))
+        try:
+            entity.participants_count = await _tg_call(
+                self.bot.get_chat_member_count(entity.id)
+            )
+        except (RPCError, OSError, ValueError, TypeError):
+            entity.participants_count = None
+        return entity
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self.bot.session.close()
+
+
+bot_client: BotClient | None = None
+START_TIME = time.monotonic()
+
+
+def _bot_stats(chat_id):
+    return {
+        "uptime_seconds": round(time.monotonic() - START_TIME, 1),
+        "context_messages": len(chat_history.get(chat_id, deque())),
+        "model": model_overrides.get(chat_id, userbot.DANYAPI_MODEL),
+    }
+
+
+def get_bot_client() -> BotClient:
+    global bot_client
+    if bot_client is None:
+        bot_client = BotClient(Bot(token=userbot.BOT_TOKEN, session=AiohttpSession()))
+    return bot_client
+
+
+def build_dispatcher() -> Dispatcher:
+    dispatcher = Dispatcher()
+
+    async def on_message(message: Message) -> None:
+        await handler(BotEvent(message))
+
+    async def on_callback(query: CallbackQuery) -> None:
+        await callback_handler(BotCallbackEvent(query))
+
+    dispatcher.message.register(on_message)
+    dispatcher.callback_query.register(on_callback)
+    return dispatcher
+
+
+def _proxy_url(proxy) -> str | None:
+    item = proxies.telethon_to_item(proxy)
+    if item is None:
+        return None
+    protocol, host, port = item
+    return f"{PROXY_SCHEMES.get(protocol.lower(), 'socks5')}://{host}:{port}"
+
+
+def _connect(proxy) -> BotClient:
+    url = _proxy_url(proxy)
+    session = AiohttpSession(proxy=url) if url else AiohttpSession()
+    return BotClient(Bot(token=userbot.BOT_TOKEN, session=session))
 
 
 _MENTION_RX = None
@@ -85,33 +351,6 @@ BOT_HELP_TEXT = (
     "промпт - в меню /settings.\n\n"
     "Также работает / Also works: @упоминание, реплай боту."
 )
-
-
-bot_client = None
-START_TIME = time.monotonic()
-
-
-def _bot_stats(chat_id):
-    return {
-        "uptime_seconds": round(time.monotonic() - START_TIME, 1),
-        "context_messages": len(chat_history.get(chat_id, deque())),
-        "model": model_overrides.get(chat_id, userbot.DANYAPI_MODEL),
-    }
-
-
-def get_bot_client():
-    global bot_client
-    if bot_client is None:
-        bot_client = TelegramClient(
-            StringSession(),
-            userbot.API_ID,
-            userbot.API_HASH,
-            connection_retries=2,
-            request_retries=1,
-            retry_delay=0,
-            timeout=10,
-        )
-    return bot_client
 
 
 def load_state():
@@ -413,7 +652,7 @@ async def handler(event: Any):
                 ),
                 edit_fn=edit_text,
                 reply_fn=safe_reply,
-                action=cast(Any, get_bot_client().action(chat_id, "typing")),
+                action=get_bot_client().action(chat_id, "typing"),
                 stream_fn=userbot.stream_with_tools,
                 tool_client=get_bot_client(),
                 tools=tool_menu,
@@ -460,54 +699,81 @@ async def handler(event: Any):
             await safe_reply(event, core.ERROR_NOTICE)
 
 
-def _settings_rows(chat_id):
-    return [
-        [Button.inline(f"Модель: {_current_model_label(chat_id)}", b"settings:model")],
-        [
-            Button.inline(
-                f"Рассуждения: {_state_label(chat_id, reasoning_hidden)}",
-                b"settings:reasoning",
-            )
-        ],
-        [
-            Button.inline(
-                f"Инструменты: {_state_label(chat_id, tools_hidden)}", b"settings:tools"
-            )
-        ],
-        [
-            Button.inline(
-                f"Кодер-режим: {_on_off_label(chat_id, coder_chats)}",
-                b"settings:coder",
-            )
-        ],
-        [Button.inline("Очистить контекст", b"settings:clear")],
-        [Button.inline("Системный промпт", b"settings:prompt")],
-    ]
+def _settings_rows(chat_id) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Модель: {_current_model_label(chat_id)}",
+                    callback_data="settings:model",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Рассуждения: {_state_label(chat_id, reasoning_hidden)}",
+                    callback_data="settings:reasoning",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Инструменты: {_state_label(chat_id, tools_hidden)}",
+                    callback_data="settings:tools",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=f"Кодер-режим: {_on_off_label(chat_id, coder_chats)}",
+                    callback_data="settings:coder",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Очистить контекст", callback_data="settings:clear"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Системный промпт", callback_data="settings:prompt"
+                )
+            ],
+        ]
+    )
 
 
 MODEL_MENU_LIMIT = 20
 
 
-def _model_rows(chat_id):
+def _model_rows(chat_id) -> InlineKeyboardMarkup:
     current = model_overrides.get(chat_id, userbot.DANYAPI_MODEL)
     rows = []
     for name in userbot.MODELS[:MODEL_MENU_LIMIT]:
         marker = " *" if name == current else ""
-        rows.append([Button.inline(f"{name}{marker}", _pick_data(name))])
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{name}{marker}", callback_data=_pick_data(name)
+                )
+            ]
+        )
     hidden = len(userbot.MODELS) - MODEL_MENU_LIMIT
     if hidden > 0:
         rows.append(
-            [Button.inline(f"Ещё {hidden} (список /models)", b"settings:models")]
+            [
+                InlineKeyboardButton(
+                    text=f"Ещё {hidden} (список /models)",
+                    callback_data="settings:models",
+                )
+            ]
         )
-    rows.append([Button.inline("Назад", b"settings:main")])
-    return rows
+    rows.append([InlineKeyboardButton(text="Назад", callback_data="settings:main")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _pick_data(name: str) -> bytes:
-    raw = f"settings:pick:{name}".encode()
-    if len(raw) <= CALLBACK_MAX_BYTES:
+def _pick_data(name: str) -> str:
+    raw = f"settings:pick:{name}"
+    if len(raw.encode("utf-8")) <= CALLBACK_MAX_BYTES:
         return raw
-    return f"settings:pick:#{_model_digest(name)}".encode()
+    return f"settings:pick:#{_model_digest(name)}"
 
 
 def _model_digest(name: str) -> str:
@@ -562,7 +828,7 @@ async def _edit_settings(event, chat_id, text=None, buttons=None) -> None:
     try:
         await event.edit(
             text if text is not None else _settings_text(chat_id),
-            buttons=buttons if buttons is not None else _settings_rows(chat_id),
+            buttons if buttons is not None else _settings_rows(chat_id),
         )
     except (RPCError, OSError, ValueError, TypeError, OverflowError) as exc:
         logger.debug("Не удалось обновить меню настроек: %r", exc)
@@ -651,94 +917,66 @@ async def _proxy_candidates():
         return []
 
 
+async def _close_client(client) -> None:
+    if client is not None:
+        await client.close()
+
+
 async def start_bot():
-    global bot_username, bot_id
+    global bot_client, bot_username, bot_id
     if not userbot.BOT_TOKEN:
         logger.error("ENABLE_BOT=1, но BOT_TOKEN не задан")
-        return
-    if not userbot.API_ID or not userbot.API_HASH:
-        logger.error("ENABLE_BOT=1, но API_ID/API_HASH не заданы в .env")
         return
 
     load_state()
     load_history()
 
-    cli = get_bot_client()
     candidates = await _proxy_candidates()
     if not candidates:
         logger.warning("Бот: нет прокси, пробую напрямую")
         candidates = [None]
 
+    client = None
     for idx, proxy in enumerate(candidates):
         if proxy:
             logger.info("Бот: пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
+        attempt = None
         try:
-            if proxy:
-                cli.set_proxy(proxy)
-            start_coro = cast(Any, cli.start(bot_token=userbot.BOT_TOKEN))
-            await asyncio.wait_for(start_coro, timeout=25)
-            me = await cli.get_me()
-            bot_username = getattr(me, "username", "") or ""
-            bot_id = getattr(me, "id", 0) or 0
-            logger.info("Бот запущен как @%s", bot_username or "?")
-            try:
-                await cli(
-                    functions.bots.SetBotCommandsRequest(
-                        scope=types.BotCommandScopeDefault(),
-                        lang_code="",
-                        commands=[
-                            types.BotCommand(
-                                command="help", description="Справка / Help"
-                            ),
-                            types.BotCommand(
-                                command="clear",
-                                description="Очистить контекст / Clear context",
-                            ),
-                            types.BotCommand(
-                                command="settings",
-                                description="Настройки / Settings",
-                            ),
-                            types.BotCommand(
-                                command="task",
-                                description="Журнал задач / Task log",
-                            ),
-                        ],
-                    )
-                )
-            except (RPCError, OSError, ValueError, TypeError) as exc:
-                logger.warning("Не удалось задать меню команд: %s", exc)
-            break
-        except AuthKeyError as exc:
+            attempt = _connect(proxy)
+            me = await asyncio.wait_for(attempt.resolve(), timeout=CONNECT_TIMEOUT)
+        except (TelegramUnauthorizedError, TokenValidationError) as exc:
             logger.error("Токен бота невалиден: %s", exc)
+            await _close_client(attempt)
             return
         except (
-            RPCError,
-            ConnectionError,
+            TelegramAPIError,
+            TelegramNetworkError,
             OSError,
             TimeoutError,
-            EOFError,
-            BufferError,
             RuntimeError,
             TypeError,
             ValueError,
         ) as exc:
             logger.warning(
-                "Бот: не удалось подключиться через %s: %s",
-                proxy,
-                type(exc).__name__,
+                "Бот: не удалось подключиться через %s: %s", proxy, type(exc).__name__
             )
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
+            await _close_client(attempt)
             if proxy:
                 proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
-    else:
+            continue
+        bot_username = getattr(me, "username", "") or ""
+        bot_id = int(getattr(me, "id", 0) or 0)
+        client = attempt
+        break
+
+    if client is None:
         logger.error("Бот: не удалось подключиться ни через один прокси")
         return
 
-    cli.add_event_handler(handler, events.NewMessage(incoming=None))
-    cli.add_event_handler(callback_handler, events.CallbackQuery())
-
-    await cast(Any, cli.run_until_disconnected())
+    bot_client = client
+    await client.set_commands()
+    logger.info("Бот запущен как @%s (id %s)", bot_username or "?", bot_id)
+    await client.poll()
 
 
 async def disconnect_quietly(timeout=10):
@@ -748,4 +986,4 @@ async def disconnect_quietly(timeout=10):
     if bot_client is None:
         return
     with contextlib.suppress(Exception):
-        await asyncio.wait_for(cast(Any, bot_client.disconnect()), timeout=timeout)
+        await asyncio.wait_for(bot_client.close(), timeout=timeout)

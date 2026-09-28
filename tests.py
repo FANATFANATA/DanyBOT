@@ -13,12 +13,29 @@ import time
 import unittest
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, cast
 from unittest import mock
 
 import httpx
+from aiogram import Bot
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramNetworkError,
+    TelegramRetryAfter,
+    TelegramUnauthorizedError,
+)
+from aiogram.types import (
+    CallbackQuery,
+    Chat,
+    InaccessibleMessage,
+    Message,
+    Update,
+    User,
+)
+from aiogram.utils.token import TokenValidationError
 from telethon.crypto import AuthKey
 from telethon.errors import AuthKeyError, FloodWaitError, RPCError
 from telethon.sessions import StringSession
@@ -175,16 +192,28 @@ def restore_mode_state(snap):
 
 
 def btn_data(btn):
-    data = getattr(btn, "data", None)
-    if data is None:
-        data = getattr(getattr(btn, "type", None), "data", None)
+    data = getattr(btn, "callback_data", None)
     if isinstance(data, bytes):
         return data.decode("utf-8")
     return str(data)
 
 
-def rows_data(rows):
-    return {btn_data(btn) for row in rows for btn in row}
+def rows_data(markup):
+    return {btn_data(btn) for btn in rows_data_buttons(markup)}
+
+
+def rows_data_buttons(markup):
+    return [btn for row in markup.inline_keyboard for btn in row]
+
+
+def menu_commands():
+    return [item.command for item in bot._menu_commands()]
+
+
+def menu_block():
+    source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
+    start = source.index("return [", source.index("def _menu_commands()"))
+    return source[start : source.index("]", start)]
 
 
 class BotTestCase(unittest.TestCase):
@@ -3101,17 +3130,11 @@ class ContractPromptTest(BotTestCase):
                 self.assertEqual(bot.handle_bot_commands(text), ("prompt", None))
 
     def test_prompt_reachable_from_settings_menu(self):
-        rows = bot._settings_rows(self.CHAT_ID)
-        data = {btn_data(btn) for row in rows for btn in row}
+        data = rows_data(bot._settings_rows(self.CHAT_ID))
         self.assertIn("settings:prompt", data)
-        source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
-        menu_block = source[
-            source.index("SetBotCommandsRequest") : source.index(
-                "]", source.index("SetBotCommandsRequest")
-            )
-        ]
-        self.assertIn('command="settings"', menu_block)
-        self.assertNotIn('command="prompt"', menu_block)
+        block = menu_block()
+        self.assertIn('command="settings"', block)
+        self.assertNotIn('command="prompt"', block)
 
 
 class ContractDirTest(BotTestCase):
@@ -4192,9 +4215,7 @@ class BotHandlerTest(BotTestCase):
                 )
             )
             await started.wait()
-            await bot.callback_handler(
-                _CallbackEvent(b"settings:coder", 88, self.OWNER)
-            )
+            await bot.callback_handler(_CallbackEvent("settings:coder", 88, self.OWNER))
             await _wait_done(task)
             self.assertEqual(_task_outcome(task), "None")
             self.assertNotIn(88, bot.coder_chats)
@@ -4400,13 +4421,7 @@ class CoderModeTest(BotTestCase):
 
     def test_menu_covers_every_help_command(self):
         source = (PROJECT_DIR / "bot.py").read_text(encoding="utf-8")
-        start = source.index("SetBotCommandsRequest")
-        menu_block = source[start : source.index("]", start)]
-        menu = {
-            line.split('command="', 1)[1].split('"', 1)[0]
-            for line in menu_block.splitlines()
-            if 'command="' in line
-        }
+        menu = set(menu_commands())
         help_block = source[source.index("BOT_HELP_TEXT = (") :]
         help_block = help_block[: help_block.index("\n)\n")]
         for name in menu:
@@ -4608,21 +4623,21 @@ class SettingsMenuTest(BotTestCase):
     def test_callback_toggles_visibility(self):
         bot.reasoning_hidden.discard(self.CHAT_ID)
         bot.tools_hidden.discard(self.CHAT_ID)
-        event = _CallbackEvent(b"settings:reasoning", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:reasoning", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertIn(self.CHAT_ID, bot.reasoning_hidden)
-        event = _CallbackEvent(b"settings:tools", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:tools", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertIn(self.CHAT_ID, bot.tools_hidden)
 
     def test_callback_toggles_coder(self):
         bot.coder_chats.discard(self.CHAT_ID)
-        event = _CallbackEvent(b"settings:coder", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:coder", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertTrue(bot.is_coder(self.CHAT_ID))
 
     def test_callback_rejects_non_owner(self):
-        event = _CallbackEvent(b"settings:reasoning", self.CHAT_ID, self.CHAT_ID + 1)
+        event = _CallbackEvent("settings:reasoning", self.CHAT_ID, self.CHAT_ID + 1)
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(event.edits, [])
         self.assertTrue(event.answers[-1][1])
@@ -4632,24 +4647,24 @@ class SettingsMenuTest(BotTestCase):
         bot.chat_history[self.CHAT_ID] = deque(
             [{"role": "user", "content": "x"}], maxlen=userbot.DM_HISTORY_LIMIT
         )
-        event = _CallbackEvent(b"settings:clear", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:clear", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(len(bot.chat_history[self.CHAT_ID]), 0)
 
     def test_callback_model_picker(self):
         userbot.MODELS = ["m-one", "m-two"]
-        event = _CallbackEvent(b"settings:model", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:model", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         picked = rows_data(event.edits[-1][1])
         self.assertIn("settings:pick:m-one", picked)
         self.assertIn("settings:pick:m-two", picked)
         self.assertIn("settings:main", picked)
-        pick = _CallbackEvent(b"settings:pick:m-two", self.CHAT_ID, self.CHAT_ID)
+        pick = _CallbackEvent("settings:pick:m-two", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(pick))
         self.assertEqual(bot.model_overrides[self.CHAT_ID], "m-two")
 
     def test_callback_unknown_action(self):
-        event = _CallbackEvent(b"settings:nope", self.CHAT_ID, self.CHAT_ID)
+        event = _CallbackEvent("settings:nope", self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(event.edits, [])
         self.assertEqual(event.answers[-1][1], True)
@@ -4659,10 +4674,8 @@ class SettingsMenuTest(BotTestCase):
         userbot.MODELS = [long_name]
         self.addCleanup(setattr, userbot, "MODELS", userbot.MODELS)
         data = bot._pick_data(long_name)
-        self.assertLessEqual(len(data), bot.CALLBACK_MAX_BYTES)
-        self.assertEqual(
-            bot._resolve_picked_model(data.decode().split(":")[2]), long_name
-        )
+        self.assertLessEqual(len(data.encode("utf-8")), bot.CALLBACK_MAX_BYTES)
+        self.assertEqual(bot._resolve_picked_model(data.split(":")[2]), long_name)
         event = _CallbackEvent(data, self.CHAT_ID, self.CHAT_ID)
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(bot.model_overrides[self.CHAT_ID], long_name)
@@ -4678,9 +4691,10 @@ class SettingsMenuTest(BotTestCase):
         self.assertIn("вкл", text)
 
     def _coder_button_text(self):
-        rows = bot._settings_rows(self.CHAT_ID)
         return next(
-            btn.text for row in rows for btn in row if btn_data(btn) == "settings:coder"
+            btn.text
+            for btn in rows_data_buttons(bot._settings_rows(self.CHAT_ID))
+            if btn_data(btn) == "settings:coder"
         )
 
     def test_coder_button_shows_on_off(self):
@@ -4691,11 +4705,9 @@ class SettingsMenuTest(BotTestCase):
 
     def test_visibility_buttons_stay_visibility_wording(self):
         bot.reasoning_hidden.discard(self.CHAT_ID)
-        rows = bot._settings_rows(self.CHAT_ID)
         text = next(
             btn.text
-            for row in rows
-            for btn in row
+            for btn in rows_data_buttons(bot._settings_rows(self.CHAT_ID))
             if btn_data(btn) == "settings:reasoning"
         )
         self.assertIn("видно", text)
@@ -4855,6 +4867,443 @@ class BotModuleTest(BotTestCase):
             bot.HISTORY_SAVER = saved_saver
             bot.bot_client = saved_client
         self.assertEqual(flushed, [1])
+
+
+class _AnswerCallback:
+    def __init__(self, data="settings:model", sender_id=6, message=None):
+        self.data = data
+        self.from_user = SimpleNamespace(id=sender_id)
+        self.message = message
+        self.answers = []
+
+    async def answer(self, text=None, show_alert=False):
+        self.answers.append((text, show_alert))
+        return True
+
+
+def _raise_later(exc):
+    async def _coro():
+        raise exc
+
+    return _coro()
+
+
+def _value_later(value):
+    async def _coro():
+        return value
+
+    return _coro()
+
+
+def _local_bot():
+    return Bot(token="1234567890:" + "a" * 40)
+
+
+def _aiogram_message(
+    text="привет", chat_id=5, chat_type="private", user_id=6, reply=None
+):
+    return Message(
+        message_id=11,
+        date=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        chat=Chat(id=chat_id, type=chat_type),
+        from_user=User(id=user_id, is_bot=False, first_name="A"),
+        text=text,
+        reply_to_message=reply,
+    )
+
+
+class BotAdapterTest(BotTestCase):
+    def _client(self, **kwargs):
+        inner = _FakeAiogramBot(**kwargs)
+        return bot.BotClient(inner), inner
+
+    def _patch(self, target, name, value) -> None:
+        patcher = mock.patch.object(target, name, value)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _record(self, name, result=None, error=None) -> list:
+        calls = []
+
+        async def _method(_self, *args, **kwargs):
+            calls.append((args, kwargs))
+            if error is not None:
+                raise error
+            return result
+
+        self._patch(Message, name, _method)
+        return calls
+
+    def _record_answer(self, result=None, error=None) -> list:
+        return self._record("answer", result=result, error=error)
+
+    def _record_edit(self, result=None, error=None) -> list:
+        return self._record("edit_text", result=result, error=error)
+
+    def test_resolve_returns_bot_profile(self):
+        client, _ = self._client()
+        me = asyncio.run(client.resolve())
+        self.assertEqual((me.id, me.username), (42, "danybot_bot"))
+
+    def test_get_me_maps_profile_fields(self):
+        client, _ = self._client()
+        me = asyncio.run(client.get_me())
+        self.assertEqual(me.id, 42)
+        self.assertEqual(me.first_name, "Me")
+        self.assertEqual(me.last_name, "M")
+        self.assertIsNone(me.title)
+
+    def test_get_entity_reports_chat_with_members(self):
+        client, _ = self._client()
+        entity = asyncio.run(client.get_entity(5150))
+        self.assertEqual(entity.id, 5150)
+        self.assertEqual(entity.title, "Chat T")
+        self.assertEqual(entity.username, "uchat")
+        self.assertEqual(entity.participants_count, 11)
+
+    def test_get_entity_accepts_strings_and_handles(self):
+        client, _ = self._client()
+        self.assertEqual(asyncio.run(client.get_entity("5150")).id, 5150)
+        self.assertEqual(asyncio.run(client.get_entity("danychat")).id, 7)
+
+    def test_get_entity_survives_member_count_error(self):
+        client, _ = self._client(count_error=TelegramBadRequest(_NO_METHOD, "no count"))
+        entity = asyncio.run(client.get_entity(-1))
+        self.assertEqual(entity.id, -1)
+        self.assertIsNone(entity.participants_count)
+
+    def test_get_entity_reports_api_error_as_rpc(self):
+        client, _ = self._client(chat_error=TelegramBadRequest(_NO_METHOD, "no chat"))
+        with self.assertRaises(RPCError):
+            asyncio.run(client.get_entity(1))
+
+    def test_edit_message_uses_bot_api(self):
+        client, inner = self._client()
+        asyncio.run(client.edit_message(7, 8, "текст"))
+        self.assertEqual(inner.edits, [(7, 8, "текст")])
+
+    def test_edit_message_error_becomes_rpc(self):
+        class _Boom:
+            async def edit_message_text(self, **_kwargs):
+                raise TelegramBadRequest(_NO_METHOD, "message not found")
+
+        with self.assertRaises(RPCError):
+            asyncio.run(bot.BotClient(_Boom()).edit_message(1, 2, "t"))
+
+    def test_set_commands_uses_menu(self):
+        client, inner = self._client()
+        asyncio.run(client.set_commands())
+        self.assertEqual([item.command for item in inner.commands], menu_commands())
+
+    def test_set_commands_survives_api_error(self):
+        client, _ = self._client(
+            commands_error=TelegramBadRequest(_NO_METHOD, "no commands")
+        )
+        self.assertIsNone(asyncio.run(client.set_commands()))
+
+    def test_poll_keeps_session_and_signals_with_us(self):
+        recorded = {}
+
+        class _FakeDispatcher:
+            async def start_polling(self, target, **kwargs):
+                recorded["target"] = target
+                recorded["kwargs"] = kwargs
+
+        client, inner = self._client()
+        saved = bot.build_dispatcher
+        self.addCleanup(setattr, bot, "build_dispatcher", saved)
+        bot.build_dispatcher = _FakeDispatcher
+        asyncio.run(client.poll())
+        self.assertIs(recorded["target"], inner)
+        self.assertFalse(recorded["kwargs"]["handle_signals"])
+        self.assertFalse(recorded["kwargs"]["close_bot_session"])
+
+    def test_close_closes_session(self):
+        client, inner = self._client()
+        asyncio.run(client.close())
+        self.assertEqual(inner.session.closed, 1)
+
+    def test_typing_action_sends_chat_action(self):
+        client, inner = self._client()
+
+        async def scenario():
+            async with client.action(7, "typing"):
+                await asyncio.sleep(0)
+            await asyncio.sleep(0)
+
+        asyncio.run(scenario())
+        self.assertEqual(inner.actions, [(7, "typing")])
+
+    def test_typing_action_survives_outer_cancellation(self):
+        client, inner = self._client()
+
+        async def scenario():
+            async def body():
+                async with client.action(7, "typing"):
+                    await asyncio.sleep(5)
+
+            with self.assertRaises(asyncio.CancelledError):
+                task = asyncio.create_task(body())
+                await asyncio.sleep(0.01)
+                task.cancel()
+                await task
+
+        asyncio.run(scenario())
+        self.assertEqual(inner.actions, [(7, "typing")])
+
+    def test_typing_action_stops_after_error(self):
+        class _Boom:
+            async def send_chat_action(self, _chat_id, _action):
+                raise TelegramBadRequest(_NO_METHOD, "chat not found")
+
+        action = bot.TypingAction(_Boom(), 7, "typing", interval=0.01)
+
+        async def scenario():
+            async with action:
+                await asyncio.sleep(0.02)
+
+        asyncio.run(scenario())
+
+    def test_typing_action_without_enter_is_noop(self):
+        action = bot.TypingAction(_FakeAiogramBot(), 7, "typing")
+        asyncio.run(action.__aexit__())
+
+    def test_retry_after_becomes_flood_wait(self):
+        exc = TelegramRetryAfter(_NO_METHOD, "Too Many Requests", retry_after=7)
+
+        async def scenario():
+            with self.assertRaises(FloodWaitError) as ctx:
+                await bot._tg_call(_raise_later(exc))
+            return ctx.exception.seconds
+
+        self.assertEqual(asyncio.run(scenario()), 7)
+
+    def test_api_error_becomes_rpc_error(self):
+        async def scenario():
+            with self.assertRaises(RPCError):
+                await bot._tg_call(
+                    _raise_later(TelegramBadRequest(_NO_METHOD, "bad request"))
+                )
+
+        asyncio.run(scenario())
+
+    def test_network_error_becomes_os_error(self):
+        async def scenario():
+            with self.assertRaises(OSError):
+                await bot._tg_call(
+                    _raise_later(TelegramNetworkError(_NO_METHOD, "down"))
+                )
+
+        asyncio.run(scenario())
+
+    def test_tg_call_returns_result(self):
+        self.assertEqual(asyncio.run(bot._tg_call(_value_later(5))), 5)
+
+    def test_event_reads_chat_and_sender(self):
+        event = bot.BotEvent(_aiogram_message())
+        self.assertEqual(event.chat_id, 5)
+        self.assertEqual(event.sender_id, 6)
+        self.assertTrue(event.is_private)
+        self.assertEqual(event.message.message, "привет")
+        self.assertEqual(event.message.id, 11)
+        self.assertFalse(event.message.out)
+        self.assertFalse(event.message.is_reply)
+        self.assertEqual(asyncio.run(event.get_sender()).id, 6)
+
+    def test_event_in_group_is_not_private(self):
+        event = bot.BotEvent(_aiogram_message(chat_id=-100, chat_type="supergroup"))
+        self.assertFalse(event.is_private)
+        self.assertEqual(event.chat_id, -100)
+
+    def test_event_without_sender_fails_closed(self):
+        message = _aiogram_message().model_copy(update={"from_user": None})
+        self.assertEqual(bot.BotEvent(message).sender_id, 0)
+
+    def test_event_exposes_replied_message(self):
+        replied = _aiogram_message(text="ответ бота", user_id=77)
+        event = bot.BotEvent(_aiogram_message(reply=replied))
+        self.assertTrue(event.message.is_reply)
+        wrapped = asyncio.run(event.message.get_reply_message())
+        self.assertIsNotNone(wrapped)
+        self.assertEqual(cast(Any, wrapped).message, "ответ бота")
+        self.assertEqual(cast(Any, wrapped).sender_id, 77)
+
+    def test_event_without_reply_returns_none(self):
+        event = bot.BotEvent(_aiogram_message())
+        self.assertIsNone(asyncio.run(event.message.get_reply_message()))
+
+    def test_event_reply_wraps_sent_message(self):
+        calls = self._record_answer(result=SimpleNamespace(message_id=99))
+        sent = asyncio.run(
+            bot.BotEvent(_aiogram_message()).reply("ответ", buttons="kb")
+        )
+        self.assertIsNotNone(sent)
+        self.assertEqual(cast(Any, sent).id, 99)
+        self.assertEqual(calls, [(("ответ",), {"reply_markup": "kb"})])
+
+    def test_event_reply_error_becomes_rpc(self):
+        self._record_answer(error=TelegramBadRequest(_NO_METHOD, "blocked"))
+        with self.assertRaises(RPCError):
+            asyncio.run(bot.BotEvent(_aiogram_message()).reply("x"))
+
+    def test_callback_event_routes_answer_edit_reply(self):
+        answers = self._record_answer(result=SimpleNamespace(message_id=99))
+        edits = self._record_edit(result=SimpleNamespace(message_id=11))
+        query = _AnswerCallback(message=_aiogram_message(text="меню"))
+        event = bot.BotCallbackEvent(cast(Any, query))
+        self.assertEqual(event.chat_id, 5)
+        self.assertEqual(event.sender_id, 6)
+        self.assertEqual(event.data, "settings:model")
+        asyncio.run(event.answer("готово", alert=True))
+        asyncio.run(event.edit("меню", buttons="kb"))
+        sent = asyncio.run(event.reply("ответ"))
+        self.assertEqual(query.answers, [("готово", True)])
+        self.assertEqual(edits, [((), {"text": "меню", "reply_markup": "kb"})])
+        self.assertEqual(answers, [(("ответ",), {"reply_markup": None})])
+        self.assertIsNotNone(sent)
+        self.assertEqual(cast(Any, sent).id, 99)
+
+    def test_callback_event_edit_error_becomes_rpc(self):
+        self._record_edit(error=TelegramBadRequest(_NO_METHOD, "not modified"))
+        event = bot.BotCallbackEvent(
+            cast(Any, _AnswerCallback(message=_aiogram_message()))
+        )
+        with self.assertRaises(RPCError):
+            asyncio.run(event.edit("x"))
+
+    def test_callback_event_without_message(self):
+        event = bot.BotCallbackEvent(cast(Any, _AnswerCallback(message=None)))
+        self.assertIsNone(event.chat_id)
+        asyncio.run(event.answer("x"))
+        asyncio.run(event.edit("y"))
+        self.assertIsNone(asyncio.run(event.reply("z")))
+
+    def test_callback_event_with_inaccessible_message(self):
+        inaccessible = InaccessibleMessage(
+            message_id=3, chat=Chat(id=5, type="private")
+        )
+        event = bot.BotCallbackEvent(cast(Any, _AnswerCallback(message=inaccessible)))
+        asyncio.run(event.edit("y"))
+        self.assertIsNone(asyncio.run(event.reply("z")))
+
+    def test_dispatcher_feeds_message_to_handler(self):
+        seen: list[Any] = []
+        saved = bot.handler
+        self.addCleanup(setattr, bot, "handler", saved)
+
+        async def handler(event):
+            seen.append(event)
+
+        bot.handler = handler
+        dispatcher = bot.build_dispatcher()
+        asyncio.run(
+            dispatcher.feed_update(
+                _local_bot(), Update(update_id=1, message=_aiogram_message())
+            )
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], bot.BotEvent)
+        self.assertEqual(seen[0].chat_id, 5)
+
+    def test_dispatcher_feeds_callback_to_handler(self):
+        seen: list[Any] = []
+        saved = bot.callback_handler
+        self.addCleanup(setattr, bot, "callback_handler", saved)
+
+        async def callback_handler(event):
+            seen.append(event)
+
+        bot.callback_handler = callback_handler
+        query = CallbackQuery(
+            id="q1",
+            chat_instance="ci",
+            from_user=User(id=8, is_bot=False, first_name="A"),
+            data="settings:model",
+            message=_aiogram_message(text="меню", user_id=6),
+        )
+        dispatcher = bot.build_dispatcher()
+        asyncio.run(
+            dispatcher.feed_update(
+                _local_bot(), Update(update_id=2, callback_query=query)
+            )
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], bot.BotCallbackEvent)
+        self.assertEqual((seen[0].chat_id, seen[0].sender_id), (5, 8))
+
+    def test_chat_ref_normalizes_input(self):
+        self.assertEqual(bot._chat_ref(5), 5)
+        self.assertEqual(bot._chat_ref(" -100123 "), -100123)
+        self.assertEqual(bot._chat_ref("@chat"), "@chat")
+        self.assertEqual(bot._chat_ref(None), "None")
+
+    def test_proxy_url_converts_schemes(self):
+        self.assertEqual(
+            bot._proxy_url({"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080}),
+            "socks5://1.2.3.4:1080",
+        )
+        self.assertEqual(
+            bot._proxy_url({"proxy_type": "http", "addr": "1.2.3.4", "port": 8080}),
+            "http://1.2.3.4:8080",
+        )
+        self.assertEqual(
+            bot._proxy_url({"proxy_type": "weird", "addr": "h", "port": 1}),
+            "socks5://h:1",
+        )
+        self.assertIsNone(bot._proxy_url({}))
+        self.assertIsNone(bot._proxy_url(None))
+
+    def test_connect_builds_client_for_proxy(self):
+        saved_token = userbot.BOT_TOKEN
+        self.addCleanup(setattr, userbot, "BOT_TOKEN", saved_token)
+        userbot.BOT_TOKEN = "1234567890:" + "b" * 40
+        built = []
+        saved = bot.Bot
+        self.addCleanup(setattr, bot, "Bot", saved)
+
+        def _bot(token, session=None):
+            built.append((token, getattr(session, "_proxy", None)))
+            return _FakeAiogramBot()
+
+        bot.Bot = _bot
+        client = bot._connect({"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080})
+        self.assertIsInstance(client, bot.BotClient)
+        self.assertEqual(built, [(userbot.BOT_TOKEN, "socks5://1.2.3.4:1080")])
+
+    def test_connect_without_proxy_has_no_proxy_url(self):
+        saved_token = userbot.BOT_TOKEN
+        self.addCleanup(setattr, userbot, "BOT_TOKEN", saved_token)
+        userbot.BOT_TOKEN = "1234567890:" + "b" * 40
+        built = []
+        saved = bot.Bot
+        self.addCleanup(setattr, bot, "Bot", saved)
+
+        def _bot(token, session=None):
+            built.append((token, getattr(session, "_proxy", None)))
+            return _FakeAiogramBot()
+
+        bot.Bot = _bot
+        bot._connect(None)
+        self.assertEqual(built, [(userbot.BOT_TOKEN, None)])
+
+    def test_get_bot_client_is_cached(self):
+        saved_token = userbot.BOT_TOKEN
+        self.addCleanup(setattr, userbot, "BOT_TOKEN", saved_token)
+        userbot.BOT_TOKEN = "1234567890:" + "c" * 40
+        saved_client = bot.bot_client
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        bot.bot_client = None
+        first = bot.get_bot_client()
+        self.assertIs(bot.get_bot_client(), first)
+        asyncio.run(first.close())
+
+    def test_disconnect_closes_active_client(self):
+        client, inner = self._client()
+        saved_client = bot.bot_client
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        bot.bot_client = client
+        asyncio.run(bot.disconnect_quietly())
+        self.assertEqual(inner.session.closed, 1)
 
 
 class SubagentsTest(BotTestCase):
@@ -5275,6 +5724,95 @@ class _FakeTelegramClient:
             raise self._command_error
         self.commands.append(request)
         return SimpleNamespace()
+
+
+class _NoMethod:
+    def __repr__(self):
+        return "no-method"
+
+
+_NO_METHOD: Any = _NoMethod()
+
+
+class _FakeAiogramClient:
+    def __init__(self, error=None, username="danybot_bot", uid=77):
+        self.error = error
+        self.username = username
+        self.uid = uid
+        self.commands = 0
+        self.polled = 0
+        self.closed = 0
+
+    async def resolve(self):
+        if self.error is not None:
+            raise self.error
+        return SimpleNamespace(username=self.username, id=self.uid)
+
+    async def set_commands(self):
+        self.commands += 1
+
+    async def poll(self):
+        self.polled += 1
+
+    async def close(self):
+        self.closed += 1
+
+
+class _FakeBotSession:
+    def __init__(self):
+        self.closed = 0
+
+    async def close(self):
+        self.closed += 1
+
+
+class _FakeAiogramBot:
+    def __init__(self, commands_error=None, chat_error=None, count_error=None):
+        self.commands_error = commands_error
+        self.chat_error = chat_error
+        self.count_error = count_error
+        self.commands = []
+        self.actions = []
+        self.edits = []
+        self.session = _FakeBotSession()
+
+    async def get_me(self):
+        return SimpleNamespace(
+            id=42,
+            username="danybot_bot",
+            first_name="Me",
+            last_name="M",
+            is_bot=True,
+        )
+
+    async def set_my_commands(self, commands):
+        if self.commands_error is not None:
+            raise self.commands_error
+        self.commands = list(commands)
+        return True
+
+    async def get_chat(self, key):
+        if self.chat_error is not None:
+            raise self.chat_error
+        return SimpleNamespace(
+            id=int(key) if str(key).lstrip("-").isdigit() else 7,
+            type="supergroup",
+            title="Chat T",
+            username="uchat",
+        )
+
+    async def get_chat_member_count(self, chat_id):
+        if self.count_error is not None:
+            raise self.count_error
+        return 11
+
+    async def edit_message_text(self, text=None, chat_id=None, message_id=None):
+        self.edits.append((chat_id, message_id, text))
+        return True
+
+    async def send_chat_action(self, chat_id, action):
+        self.actions.append((chat_id, action))
+        return True
 
 
 class UserbotHandlerTest(BotTestCase):
@@ -6511,7 +7049,7 @@ class HardeningTest(BotTestCase):
         saved_models = list(userbot.MODELS)
         self.addCleanup(setattr, userbot, "MODELS", type(userbot.MODELS)(saved_models))
         userbot.MODELS = [f"model-{i}" for i in range(bot.MODEL_MENU_LIMIT + 3)]
-        rows = bot._model_rows(1)
+        rows = bot._model_rows(1).inline_keyboard
         labels = [row[0].text for row in rows]
         self.assertTrue(any("Ещё 3" in label for label in labels))
         self.assertEqual(len(rows), bot.MODEL_MENU_LIMIT + 2)
@@ -6520,7 +7058,7 @@ class HardeningTest(BotTestCase):
         saved_models = list(userbot.MODELS)
         self.addCleanup(setattr, userbot, "MODELS", type(userbot.MODELS)(saved_models))
         userbot.MODELS = ["only-one"]
-        rows = bot._model_rows(1)
+        rows = bot._model_rows(1).inline_keyboard
         self.assertEqual(len(rows), 2)
 
     def test_callback_models_action_lists_every_model(self):
@@ -6578,6 +7116,9 @@ class StartupTest(BotTestCase):
         self.saved_api = (userbot.API_ID, userbot.API_HASH)
         self.addCleanup(setattr, userbot, "API_ID", self.saved_api[0])
         self.addCleanup(setattr, userbot, "API_HASH", self.saved_api[1])
+        for attr in ("bot_client", "bot_username", "bot_id"):
+            self.addCleanup(setattr, bot, attr, getattr(bot, attr))
+        self.connected: list = []
         userbot.API_ID = 123
         userbot.API_HASH = "hash"
         userbot.BOT_TOKEN = NO_AUTH
@@ -6601,11 +7142,6 @@ class StartupTest(BotTestCase):
         self.assertIsNone(asyncio.run(userbot.start_userbot()))
 
     def test_bot_requires_token(self):
-        self._install_proxies([])
-        self.assertIsNone(asyncio.run(bot.start_bot()))
-
-    def test_bot_requires_api_credentials(self):
-        userbot.API_ID = 0
         self._install_proxies([])
         self.assertIsNone(asyncio.run(bot.start_bot()))
 
@@ -6665,42 +7201,107 @@ class StartupTest(BotTestCase):
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.starts, 0)
 
+    def _install_connect(self, clients):
+        queue = list(clients)
+        seen = []
+
+        def connect(_proxy):
+            seen.append(_proxy)
+            return queue.pop(0)
+
+        saved = bot._connect
+        self.addCleanup(setattr, bot, "_connect", saved)
+        bot._connect = connect
+        self.connected = seen
+
     def test_bot_connects_and_sets_commands(self):
         userbot.BOT_TOKEN = BOT_AUTH_VALUE
         self._install_proxies([None])
-        client = _FakeTelegramClient(username="danybot_bot", uid=77)
-        self._install_client(bot, lambda: client, "get_bot_client")
-        saved_username = bot.bot_username
-        saved_id = bot.bot_id
-        self.addCleanup(setattr, bot, "bot_username", saved_username)
-        self.addCleanup(setattr, bot, "bot_id", saved_id)
-        asyncio.run(bot.start_bot())
+        client = _FakeAiogramClient(username="danybot_bot", uid=77)
+        self._install_connect([client])
+        self.assertIsNone(asyncio.run(bot.start_bot()))
         self.assertEqual(bot.bot_username, "danybot_bot")
         self.assertEqual(bot.bot_id, 77)
-        self.assertEqual(len(client.commands), 1)
-        self.assertFalse(client.running)
+        self.assertEqual(bot.bot_client, client)
+        self.assertEqual(client.commands, 1)
+        self.assertEqual(client.polled, 1)
+        self.assertEqual(self.connected, [None])
 
-    def test_bot_survives_command_registration_error(self):
+    def test_bot_tries_next_proxy_after_network_error(self):
         userbot.BOT_TOKEN = BOT_AUTH_VALUE
-        self._install_proxies([None])
-        client = _FakeTelegramClient(
-            username="danybot_bot",
-            uid=5,
-            command_error=RPCError(None, "no commands", 400),
+        proxy = {"proxy_type": "socks5", "addr": "7.7.7.7", "port": 1080}
+        self._install_proxies([proxy, None])
+        first = _FakeAiogramClient(error=TelegramNetworkError(_NO_METHOD, "timeout"))
+        second = _FakeAiogramClient(username="danybot_bot", uid=9)
+        self._install_connect([first, second])
+        marked = []
+        self.enterContext(
+            mock.patch.object(
+                proxies, "mark_bad_proxy", lambda item: marked.append(item)
+            )
         )
-        self._install_client(bot, lambda: client, "get_bot_client")
         asyncio.run(bot.start_bot())
-        self.assertEqual(bot.bot_username, "danybot_bot")
+        self.assertEqual(bot.bot_id, 9)
+        self.assertEqual(first.closed, 1)
+        self.assertEqual(second.polled, 1)
+        self.assertEqual(marked, [("socks5", "7.7.7.7", 1080)])
+
+    def test_bot_gives_up_after_all_proxies(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        self._install_proxies(
+            [
+                {"proxy_type": "socks5", "addr": "8.8.8.8", "port": 1},
+                {"proxy_type": "http", "addr": "9.9.9.9", "port": 2},
+            ]
+        )
+        clients = [
+            _FakeAiogramClient(error=OSError("connect failed")),
+            _FakeAiogramClient(error=TelegramNetworkError(_NO_METHOD, "timeout")),
+        ]
+        self._install_connect(clients)
+        self.enterContext(mock.patch.object(proxies, "mark_bad_proxy", lambda _i: None))
+        asyncio.run(bot.start_bot())
+        self.assertEqual([c.polled for c in clients], [0, 0])
+        self.assertEqual([c.closed for c in clients], [1, 1])
+        self.assertIsNone(bot.bot_client)
 
     def test_bot_stops_on_invalid_token(self):
         userbot.BOT_TOKEN = BOT_AUTH_VALUE
         self._install_proxies([None])
-        client = _FakeTelegramClient(
-            error=AuthKeyError(request=None, message="AUTH_KEY_UNREGISTERED")
+        client = _FakeAiogramClient(
+            error=TelegramUnauthorizedError(_NO_METHOD, "Unauthorized")
         )
-        self._install_client(bot, lambda: client, "get_bot_client")
+        self._install_connect([client])
         asyncio.run(bot.start_bot())
-        self.assertEqual(client.starts, 1)
+        self.assertEqual(client.closed, 1)
+        self.assertEqual(client.polled, 0)
+
+    def test_bot_stops_on_malformed_token(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        self._install_proxies([None])
+        self.enterContext(
+            mock.patch.object(
+                bot, "_connect", mock.Mock(side_effect=TokenValidationError("bad"))
+            )
+        )
+        asyncio.run(bot.start_bot())
+        self.assertIsNone(bot.bot_client)
+
+    def test_bot_skips_proxy_when_session_cannot_be_built(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        proxy = {"proxy_type": "socks5", "addr": "4.4.4.4", "port": 1}
+        self._install_proxies([proxy, None])
+        second = _FakeAiogramClient(username="danybot_bot", uid=3)
+        self.enterContext(
+            mock.patch.object(
+                bot,
+                "_connect",
+                mock.Mock(side_effect=[RuntimeError("no aiohttp-socks"), second]),
+            )
+        )
+        asyncio.run(bot.start_bot())
+        self.assertEqual(bot.bot_id, 3)
+        self.assertEqual(second.polled, 1)
 
 
 class MainRunTest(BotTestCase):
