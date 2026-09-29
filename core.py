@@ -114,21 +114,22 @@ def _build_trigger_re():
 
 TRIGGER_RE = _build_trigger_re()
 
-DC_FALLBACK = "149.154.167.220"
+DC_MAIN = "149.154.167.220"
+DC_MAIN_ENV = "DC_MAIN"
+DC_FALLBACK = DC_MAIN
+DC_FALLBACK_ENV = "DC_FALLBACK"
+DC_DISABLED_ENV = "DC_DISABLED"
+DC_ORDER_ENV = "DC_ORDER"
 
 DC_ADDRESSES = {
     1: "149.154.175.53",
-    2: DC_FALLBACK,
+    2: DC_MAIN,
     3: "149.154.175.100",
     4: "149.154.167.91",
     5: "91.108.56.130",
 }
 
 DC_ORDER = (2, 1, 3, 4, 5)
-
-DC_ORDER_ENV = "DC_ORDER"
-DC_FALLBACK_ENV = "DC_FALLBACK"
-DC_DISABLED_ENV = "DC_DISABLED"
 
 DC_PORT = 443
 
@@ -170,8 +171,12 @@ def dc_order() -> list[int]:
     return _dc_order_from_env() or list(DC_ORDER)
 
 
+def dc_main() -> str:
+    return _env_str(DC_MAIN_ENV, DC_MAIN) or DC_MAIN
+
+
 def dc_fallback() -> str:
-    return _env_str(DC_FALLBACK_ENV, DC_FALLBACK)
+    return _env_str(DC_FALLBACK_ENV, DC_MAIN) or DC_MAIN
 
 
 def dc_address(dc=None) -> str:
@@ -209,9 +214,16 @@ def dc_candidates(extra=()) -> list[dict]:
         for value in order
         if value not in disabled
     ]
-    fallback = dc_fallback()
-    out = [item for item in out if item["address"] != fallback]
-    out.append({"dc": 0, "address": fallback})
+    seen = {item["address"] for item in out}
+    for address in (dc_main(), dc_fallback()):
+        if address and address not in seen:
+            out.append({"dc": 0, "address": address})
+            seen.add(address)
+    preferred: list[str] = []
+    for address in (dc_main(), dc_fallback()):
+        if address and address not in preferred:
+            preferred.append(address)
+    out.sort(key=lambda item: item["address"] not in preferred)
     return out
 
 

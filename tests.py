@@ -4586,57 +4586,95 @@ class DatacenterTest(BotTestCase):
         with mock.patch.dict(os.environ, {"DC_ORDER": "junk,9"}):
             self.assertEqual(core.dc_order(), list(core.DC_ORDER))
 
-    def test_dc_candidates_always_ends_with_fallback(self):
+    def test_dc_candidates_start_with_main(self):
         with mock.patch.dict(os.environ):
-            os.environ.pop("DC_ORDER", None)
-            os.environ.pop("DC_DISABLED", None)
-            os.environ.pop("DC_FALLBACK", None)
+            for name in ("DC_ORDER", "DC_DISABLED", "DC_MAIN", "DC_FALLBACK"):
+                os.environ.pop(name, None)
             items = core.dc_candidates()
-        self.assertEqual(items[-1]["address"], core.DC_FALLBACK)
-        self.assertEqual([item["address"] for item in items].count(core.DC_FALLBACK), 1)
-        self.assertEqual(items[-1]["dc"], 0)
+        self.assertEqual(items[0]["address"], core.DC_MAIN)
+        self.assertEqual(items[0]["dc"], 2)
+        addresses = [item["address"] for item in items]
+        self.assertEqual(addresses.count(core.DC_MAIN), 1)
+        self.assertEqual(addresses[1], core.DC_ADDRESSES[1])
 
-    def test_dc_candidates_keep_configured_order(self):
+    def test_dc_candidates_keep_configured_order_after_main(self):
         with mock.patch.dict(
             os.environ,
             {
                 "DC_ORDER": "4,3",
                 "DC_DISABLED": "",
-                "DC_FALLBACK": core.DC_FALLBACK,
+                "DC_MAIN": core.DC_MAIN,
+                "DC_FALLBACK": core.DC_MAIN,
             },
         ):
             items = core.dc_candidates()
-        self.assertEqual([item["dc"] for item in items], [4, 3, 0])
-        self.assertEqual(items[-1]["address"], core.DC_FALLBACK)
+        self.assertEqual(
+            [item["address"] for item in items],
+            [core.DC_MAIN, core.DC_ADDRESSES[4], core.DC_ADDRESSES[3]],
+        )
 
     def test_dc_candidates_respects_disabled(self):
-        with mock.patch.dict(os.environ, {"DC_ORDER": "1,2", "DC_DISABLED": "1,9"}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DC_ORDER": "1,2",
+                "DC_DISABLED": "1,9",
+                "DC_MAIN": core.DC_MAIN,
+                "DC_FALLBACK": core.DC_MAIN,
+            },
+        ):
             items = core.dc_candidates()
         addresses = [item["address"] for item in items]
         self.assertNotIn(core.DC_ADDRESSES[1], addresses)
-        self.assertIn(core.DC_ADDRESSES[2], addresses)
+        self.assertEqual(addresses[0], core.DC_MAIN)
 
-    def test_dc_candidates_avoid_duplicate_fallback(self):
+    def test_dc_candidates_avoid_duplicates(self):
         with mock.patch.dict(
             os.environ,
-            {"DC_ORDER": "2", "DC_FALLBACK": core.DC_ADDRESSES[3]},
+            {
+                "DC_ORDER": "2",
+                "DC_MAIN": core.DC_MAIN,
+                "DC_FALLBACK": core.DC_ADDRESSES[3],
+            },
         ):
             items = core.dc_candidates()
         addresses = [item["address"] for item in items]
         self.assertEqual(addresses.count(core.DC_ADDRESSES[3]), 1)
-        self.assertEqual(addresses[-1], core.DC_ADDRESSES[3])
+        self.assertEqual(addresses.count(core.DC_MAIN), 1)
+        self.assertEqual(addresses, [core.DC_MAIN, core.DC_ADDRESSES[3]])
 
     def test_dc_candidates_accepts_extra_from_env(self):
-        with mock.patch.dict(os.environ, {"DC_ORDER": "1", "DC_DISABLED": ""}):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DC_ORDER": "1",
+                "DC_DISABLED": "",
+                "DC_MAIN": core.DC_MAIN,
+                "DC_FALLBACK": core.DC_MAIN,
+            },
+        ):
             items = core.dc_candidates(extra=("4", "junk", "1"))
-        numbers = [item["dc"] for item in items]
-        self.assertEqual(numbers[:2], [1, 4])
+        addresses = [item["address"] for item in items]
+        self.assertEqual(
+            addresses[:3], [core.DC_MAIN, core.DC_ADDRESSES[1], core.DC_ADDRESSES[4]]
+        )
 
-    def test_dc_fallback_is_configurable(self):
-        with mock.patch.dict(os.environ, {"DC_FALLBACK": "10.0.0.1"}):
-            self.assertEqual(core.dc_fallback(), "10.0.0.1")
+    def test_dc_main_is_configurable_and_comes_first(self):
+        with mock.patch.dict(
+            os.environ, {"DC_MAIN": "10.0.0.1", "DC_FALLBACK": "10.0.0.2"}
+        ):
+            self.assertEqual(core.dc_main(), "10.0.0.1")
+            self.assertEqual(core.dc_fallback(), "10.0.0.2")
             items = core.dc_candidates()
-        self.assertEqual(items[-1]["address"], "10.0.0.1")
+        self.assertEqual(
+            [item["address"] for item in items][:2], ["10.0.0.1", "10.0.0.2"]
+        )
+
+    def test_dc_main_falls_back_to_default_when_empty(self):
+        with mock.patch.dict(os.environ, {"DC_MAIN": "   ", "DC_FALLBACK": ""}):
+            self.assertEqual(core.dc_main(), core.DC_MAIN)
+            self.assertEqual(core.dc_fallback(), core.DC_MAIN)
+            self.assertEqual(core.dc_candidates()[0]["address"], core.DC_MAIN)
 
     def test_connect_uses_dc_api_url(self):
         userbot.BOT_TOKEN = BOT_TOKEN_VALUE
@@ -4715,12 +4753,15 @@ class DatacenterTest(BotTestCase):
             {
                 "DC_ORDER": "1,2",
                 "DC_DISABLED": "junk; 9,, 42 ,bad",
-                "DC_FALLBACK": core.DC_FALLBACK,
+                "DC_MAIN": core.DC_MAIN,
+                "DC_FALLBACK": core.DC_MAIN,
             },
         ):
             self.assertEqual(core._dc_int_set("DC_DISABLED"), set())
             items = core.dc_candidates()
-        self.assertEqual([item["dc"] for item in items], [1, 0])
+        self.assertEqual(
+            [item["address"] for item in items], [core.DC_MAIN, core.DC_ADDRESSES[1]]
+        )
 
 
 class TaskJournalTest(BotTestCase):
