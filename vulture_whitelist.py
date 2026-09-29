@@ -1,2 +1,3 @@
 row_factory
 auth_key
+_scan_worker_main

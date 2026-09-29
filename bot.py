@@ -169,6 +169,10 @@ class BotMessage:
         return False
 
     @property
+    def from_user(self):
+        return getattr(self._message, "from_user", None)
+
+    @property
     def sender_id(self) -> int:
         return _sender_id(self._message)
 
@@ -234,7 +238,7 @@ class BotClient:
         self.bot = bot
 
     async def resolve(self):
-        return await _tg_call(self.bot.get_me())
+        return await self.bot.get_me()
 
     async def set_commands(self) -> None:
         try:
@@ -658,14 +662,18 @@ async def handler(event: Any):
         tool_menu = tools_module.PUBLIC_TOOLS
     limit_ctx = userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
     progress: dict[str, str] = {"reason": ""}
+    task_token: list[Any] = [None]
 
     def on_progress(rounds, calls_made, reason=""):
         if reason:
             progress["reason"] = reason
-        TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
+        TASKS.progress(chat_id, rounds=rounds, tools=calls_made, token=task_token[0])
 
     async def generate():
-        TASKS.begin(chat_id, prompt, model=model, coder=coder_active, owner=is_owner)
+        record = TASKS.begin(
+            chat_id, prompt, model=model, coder=coder_active, owner=is_owner
+        )
+        task_token[0] = record.get("token")
         try:
             answer = await core.stream_answer(
                 STORE,
@@ -694,16 +702,25 @@ async def handler(event: Any):
             )
         except asyncio.CancelledError:
             TASKS.finish(
-                chat_id, core.TASK_INTERRUPTED, reason="прерван новым запросом"
+                chat_id,
+                core.TASK_INTERRUPTED,
+                reason="прерван новым запросом",
+                token=record.get("token"),
             )
             raise
-        except userbot.HANDLER_ERRORS as exc:
-            TASKS.finish(chat_id, core.TASK_FAILED, reason=type(exc).__name__)
+        except BaseException as exc:
+            TASKS.finish(
+                chat_id,
+                core.TASK_FAILED,
+                reason=type(exc).__name__,
+                token=record.get("token"),
+            )
             raise
         TASKS.finish(
             chat_id,
             core.TASK_STOPPED if progress["reason"] else core.TASK_DONE,
             reason=progress["reason"],
+            token=record.get("token"),
         )
         if answer.strip():
             async with ctx_lock:
@@ -977,6 +994,8 @@ async def _connect_all(dc, candidates):
         except (
             TelegramAPIError,
             TelegramNetworkError,
+            RPCError,
+            FloodWaitError,
             OSError,
             TimeoutError,
             RuntimeError,

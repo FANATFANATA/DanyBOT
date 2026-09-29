@@ -976,14 +976,16 @@ async def handler(event: Any):
     tool_menu = TOOLS if sender_id in OWNER_IDS else tools_module.PUBLIC_TOOLS
     owner = sender_id in OWNER_IDS
     progress: dict[str, str] = {"reason": ""}
+    task_token: list[Any] = [None]
 
     def on_progress(rounds, calls_made, reason=""):
         if reason:
             progress["reason"] = reason
-        TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
+        TASKS.progress(chat_id, rounds=rounds, tools=calls_made, token=task_token[0])
 
     async def generate():
-        TASKS.begin(chat_id, prompt, model=model, owner=owner)
+        record = TASKS.begin(chat_id, prompt, model=model, owner=owner)
+        task_token[0] = record.get("token")
         try:
             answer = await core.stream_answer(
                 STORE,
@@ -1012,16 +1014,25 @@ async def handler(event: Any):
             )
         except asyncio.CancelledError:
             TASKS.finish(
-                chat_id, core.TASK_INTERRUPTED, reason="прерван новым запросом"
+                chat_id,
+                core.TASK_INTERRUPTED,
+                reason="прерван новым запросом",
+                token=record.get("token"),
             )
             raise
-        except HANDLER_ERRORS as exc:
-            TASKS.finish(chat_id, core.TASK_FAILED, reason=type(exc).__name__)
+        except BaseException as exc:
+            TASKS.finish(
+                chat_id,
+                core.TASK_FAILED,
+                reason=type(exc).__name__,
+                token=record.get("token"),
+            )
             raise
         TASKS.finish(
             chat_id,
             core.TASK_STOPPED if progress["reason"] else core.TASK_DONE,
             reason=progress["reason"],
+            token=record.get("token"),
         )
         if answer.strip():
             async with ctx_lock:

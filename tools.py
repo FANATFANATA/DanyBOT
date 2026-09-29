@@ -27,6 +27,8 @@ import core
 
 logger = logging.getLogger("danybot.tools")
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
 SAFE_FUNCS = {
     "abs": abs,
     "round": round,
@@ -49,6 +51,7 @@ SAFE_CONSTS = {
 
 CODER_ROOT = Path(os.getenv("CODER_ROOT", "/root")).expanduser().resolve()
 MAX_READ_BYTES = 2_000_000
+MAX_READ_OUTPUT = 60_000
 MAX_WRITE_BYTES = 500_000
 MAX_LIST_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
@@ -85,6 +88,7 @@ TOOL_ERRORS: tuple[type[BaseException], ...] = (
     EOFError,
     sqlite3.Error,
     httpx.HTTPError,
+    httpx.InvalidURL,
 )
 
 
@@ -955,6 +959,12 @@ def _format_process_result(rc: int, out: str, err: str) -> str:
     return result
 
 
+def _clip_process_result(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n… (вывод обрезан, {len(text)} символов)"
+
+
 def _resolve_workdir(raw_cwd):
     if not raw_cwd:
         return CODER_ROOT, ""
@@ -986,7 +996,9 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
     except OSError as exc:
         return f"Ошибка запуска: {exc}"
     rc, out, err_out, note = await _collect_process(proc, timeout, MAX_PROCESS_BYTES)
-    result = _format_process_result(rc, out, err_out)[:MAX_SHELL_OUTPUT]
+    result = _clip_process_result(
+        _format_process_result(rc, out, err_out), MAX_SHELL_OUTPUT
+    )
     return f"{result}\n{note}" if note else result
 
 
@@ -1146,11 +1158,25 @@ def _is_public_addr(addr) -> bool:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
-    return ip.is_global
+    if isinstance(ip, ipaddress.IPv6Address):
+        embedded = ip.ipv4_mapped or ip.sixtofour
+        if embedded is not None:
+            ip = embedded
+        elif int(ip) >> 32 == 0 or int(ip) >> 96 == 0x0064FF9B:
+            return False
+    return bool(
+        ip.is_global
+        and not ip.is_multicast
+        and not ip.is_reserved
+        and not ip.is_loopback
+    )
 
 
 async def _check_public_url(url: str) -> str:
-    parsed = urllib.parse.urlparse(url)
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except ValueError as exc:
+        return f"Некорректный URL: {exc}"
     if parsed.scheme not in ("http", "https"):
         return f"Схема заблокирована: {parsed.scheme or 'пусто'}"
     host = parsed.hostname
@@ -1190,10 +1216,13 @@ async def _tool_fetch_url(arguments, chat_id, client, stats, unrestricted=False)
                     return guard
                 try:
                     status, location, raw, truncated = await _fetch_once(hc, current)
-                except (httpx.HTTPError, OSError, ValueError) as exc:
+                except (httpx.HTTPError, httpx.InvalidURL, OSError, ValueError) as exc:
                     return f"Ошибка загрузки: {exc}"
                 if 300 <= status < 400 and location:
-                    current = urllib.parse.urljoin(current, location)
+                    try:
+                        current = urllib.parse.urljoin(current, location)
+                    except ValueError as exc:
+                        return f"Некорректный редирект: {exc}"
                     continue
                 break
             else:
@@ -1322,6 +1351,8 @@ async def _tool_get_bot_stats(arguments, chat_id, client, stats, unrestricted=Fa
 
 SUBAGENT_RESULT_CHARS = 1500
 SUBAGENT_REPORT_CHARS = 8000
+SUBAGENT_NAME_CHARS = 60
+SUBAGENT_TASK_CHARS = 300
 
 
 def _tool_name_list(raw) -> list[str] | None:
@@ -1334,22 +1365,30 @@ def _tool_name_list(raw) -> list[str] | None:
     return [str(item).strip() for item in raw if str(item).strip()] or None
 
 
+def _report_item(item, result_chars) -> dict[str, Any]:
+    return {
+        "name": str(item.get("name", "universal"))[:SUBAGENT_NAME_CHARS],
+        "task": str(item.get("task", ""))[:SUBAGENT_TASK_CHARS],
+        "ok": bool(item.get("ok")),
+        "rounds": item.get("rounds", 0),
+        "tools_used": item.get("tools_used", []),
+        "result": str(item.get("result", ""))[:result_chars],
+    }
+
+
 def _subagent_report(results) -> str:
-    payload = [
-        {
-            "name": item.get("name", "universal"),
-            "task": item.get("task", ""),
-            "ok": bool(item.get("ok")),
-            "rounds": item.get("rounds", 0),
-            "tools_used": item.get("tools_used", []),
-            "result": str(item.get("result", ""))[:SUBAGENT_RESULT_CHARS],
-        }
-        for item in results
-    ]
-    text = json.dumps(payload, ensure_ascii=False)
-    if len(text) <= SUBAGENT_REPORT_CHARS:
-        return text
-    return text[: SUBAGENT_REPORT_CHARS - 1] + "…"
+    items = list(results)
+    for result_chars in (SUBAGENT_RESULT_CHARS, 400, 100, 0):
+        payload = [_report_item(item, result_chars) for item in items]
+        text = json.dumps(payload, ensure_ascii=False)
+        if len(text) <= SUBAGENT_REPORT_CHARS:
+            return text
+    while len(items) > 1:
+        items = items[:-1]
+        text = json.dumps([_report_item(item, 0) for item in items], ensure_ascii=False)
+        if len(text) <= SUBAGENT_REPORT_CHARS:
+            return text
+    return json.dumps([_report_item(items[0], 0)], ensure_ascii=False)
 
 
 async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=False):
@@ -1404,7 +1443,7 @@ async def _tool_read_file(arguments, chat_id, client, stats, unrestricted=False)
     if not chunk:
         return f"{head}\n(пусто)"
     body = "\n".join(f"{start + i}|{line}" for i, line in enumerate(chunk))
-    return f"{head}\n{body}"
+    return f"{head}\n{_clip(body, MAX_READ_OUTPUT)}"
 
 
 async def _tool_write_file(arguments, chat_id, client, stats, unrestricted=False):
@@ -1560,6 +1599,92 @@ def _scan_files(
     return matches, note
 
 
+SCAN_LIMIT_KEYS = (
+    "MAX_SEARCH_NODES",
+    "MAX_SEARCH_FILES",
+    "MAX_SEARCH_FILE_BYTES",
+)
+
+SCAN_ERRORS: tuple[type[BaseException], ...] = (*TOOL_ERRORS, re.error)
+
+
+def _reconfigure_stream(stream) -> None:
+    reconfigure = getattr(stream, "reconfigure", None)
+    if reconfigure is None:
+        return
+    with contextlib.suppress(ValueError, OSError):
+        reconfigure(encoding="utf-8")
+
+
+def _scan_worker_main() -> None:
+    for stream in (sys.stdin, sys.stdout):
+        _reconfigure_stream(stream)
+    request = json.loads(sys.stdin.read())
+    for name, value in (request.get("limits") or {}).items():
+        if name in SCAN_LIMIT_KEYS:
+            setattr(sys.modules[__name__], name, value)
+    stop = threading.Event()
+    try:
+        matches, note = _scan_files(
+            Path(request["root"]),
+            request["glob"],
+            re.compile(request["pattern"]),
+            int(request["limit"]),
+            stop,
+        )
+    except SCAN_ERRORS as exc:
+        payload = {"matches": [], "note": "", "error": repr(exc)}
+    else:
+        payload = {"matches": matches, "note": note, "error": ""}
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False))
+
+
+async def _run_search_subprocess(root, glob_pat, pattern, limit) -> tuple[list, str]:
+    request = json.dumps(
+        {
+            "root": str(root),
+            "glob": glob_pat,
+            "pattern": pattern,
+            "limit": limit,
+            "limits": {name: globals()[name] for name in SCAN_LIMIT_KEYS},
+        },
+        ensure_ascii=False,
+    )
+    env = _subprocess_env()
+    existing_path = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(PROJECT_DIR), existing_path) if part
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import tools; tools._scan_worker_main()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=str(PROJECT_DIR),
+        env=env,
+        **_spawn_kwargs(),
+    )
+    try:
+        out, err = await asyncio.wait_for(
+            proc.communicate(request.encode("utf-8")), timeout=SEARCH_TIMEOUT
+        )
+    except TimeoutError:
+        await _kill_process(proc)
+        return [], f"Таймаут поиска: {SEARCH_TIMEOUT}s"
+    if proc.returncode != 0:
+        detail = err.decode("utf-8", errors="replace").strip()[-200:]
+        return [], f"сканер поиска не отработал: {detail}"
+    try:
+        payload = json.loads(out.decode("utf-8", errors="replace") or "{}")
+    except ValueError as exc:
+        return [], f"сканер поиска вернул мусор: {exc}"
+    if payload.get("error"):
+        return [], f"сканер поиска упал: {payload['error']}"
+    return list(payload.get("matches") or []), str(payload.get("note") or "")
+
+
 async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=False):
     pattern = _str_arg(arguments, "pattern")
     if not pattern:
@@ -1576,18 +1701,13 @@ async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=Fal
         return "Недопустимый glob."
     limit = _int_arg(arguments, "limit", 60, 1, MAX_SEARCH_RESULTS)
     try:
-        rx = re.compile(pattern)
+        re.compile(pattern)
     except re.error as exc:
         return f"Некорректное выражение: {exc}"
-    stop = threading.Event()
     try:
-        matches, note = await asyncio.wait_for(
-            asyncio.to_thread(_scan_files, path, glob_pat, rx, limit, stop),
-            timeout=SEARCH_TIMEOUT,
-        )
-    except TimeoutError:
-        stop.set()
-        return f"Таймаут поиска: {SEARCH_TIMEOUT}s"
+        matches, note = await _run_search_subprocess(path, glob_pat, pattern, limit)
+    except OSError as exc:
+        return f"Ошибка запуска сканера: {exc}"
     text = "\n".join(matches) if matches else "Совпадений не найдено."
     if note:
         text = f"{text}\n\nПоиск неполный: {note}. Сузить path, glob или pattern."
@@ -1636,7 +1756,9 @@ async def _tool_execute_script(arguments, chat_id, client, stats, unrestricted=F
         if script_path is not None:
             with contextlib.suppress(OSError):
                 script_path.unlink()
-    result = _clip(_format_process_result(rc, out, err_out), MAX_SCRIPT_OUTPUT)
+    result = _clip_process_result(
+        _format_process_result(rc, out, err_out), MAX_SCRIPT_OUTPUT
+    )
     return f"{result}\n{note}" if note else result
 
 

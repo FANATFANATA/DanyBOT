@@ -3169,6 +3169,44 @@ class ToolsInternalsTest(BotTestCase):
         self.assertTrue(tools_module._is_public_addr("8.8.8.8"))
         self.assertFalse(tools_module._is_public_addr("192.168.0.1"))
 
+    def test_is_public_addr_blocks_internal_reachable_forms(self):
+        for addr in (
+            "64:ff9b::7f00:1",
+            "::a00:1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "ff02::1",
+            "224.0.0.1",
+            "127.0.0.1",
+            "169.254.169.254",
+            "::1",
+            "fc00::1",
+        ):
+            with self.subTest(addr=addr):
+                self.assertFalse(tools_module._is_public_addr(addr))
+        for addr in ("8.8.8.8", "2001:4860:4860::8888", "1.1.1.1"):
+            with self.subTest(addr=addr):
+                self.assertTrue(tools_module._is_public_addr(addr))
+
+    def test_clip_process_result_marks_truncation(self):
+        text = tools_module._format_process_result(0, "a" * 5000, "ошибка")
+        clipped = tools_module._clip_process_result(text, 1000)
+        self.assertLessEqual(len(clipped), 1100)
+        self.assertIn("вывод обрезан", clipped)
+        short = tools_module._format_process_result(0, "ok", "")
+        self.assertIs(tools_module._clip_process_result(short, 1000), short)
+
+    def test_read_file_output_is_bounded(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_readout_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        saved_root = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        tools_module.CODER_ROOT = tmp
+        (tmp / "huge.txt").write_text("строка данных\n" * 20000, encoding="utf-8")
+        out = _owner_tool("read_file", {"path": "huge.txt", "limit": 5000}, 1)
+        self.assertLessEqual(len(out), tools_module.MAX_READ_OUTPUT + 500)
+        self.assertIn("…", out)
+
     def test_check_public_url_reports_missing_host(self):
         out = asyncio.run(tools_module._check_public_url("http:///страница"))
         self.assertIn("URL без хоста", out)
@@ -3192,6 +3230,35 @@ class ToolsInternalsTest(BotTestCase):
     def test_check_public_url_rejects_blocked_scheme(self):
         out = asyncio.run(tools_module._check_public_url("file:///etc/passwd"))
         self.assertIn("Схема заблокирована", out)
+
+    def test_check_public_url_blocks_internal_targets(self):
+        for host, addr in (
+            ("metadata.test", "169.254.169.254"),
+            ("nat64.test", "64:ff9b::7f00:1"),
+            ("compat.test", "::a00:1"),
+            ("mapped.test", "::ffff:127.0.0.1"),
+        ):
+            with self.subTest(host=host):
+
+                async def fake_resolve(_host, _port, _addr=addr):
+                    return [_addr]
+
+                with mock.patch.object(tools_module, "_resolve_addrs", fake_resolve):
+                    out = asyncio.run(
+                        tools_module._check_public_url(f"https://{host}/")
+                    )
+                self.assertIn("Адрес заблокирован", out)
+
+    def test_fetch_url_reports_error_instead_of_raising(self):
+        for url in (
+            "http://example.test/\x00",
+            "http://exa mple.test/",
+            "http://[::1/",
+        ):
+            with self.subTest(url=url):
+                out = _owner_tool("fetch_url", {"url": url}, 1)
+                self.assertIsInstance(out, str)
+                self.assertNotIn("Traceback", out)
 
     def test_error_label_prefers_http_status(self):
         request = httpx.Request("GET", "https://search.test/")
@@ -4174,20 +4241,141 @@ class CoreHelpersTest(BotTestCase):
         self.assertEqual(saved, [1])
         self.assertEqual(len(store.chat_history[1]), 1)
 
-    def test_trim_tool_history_moves_cut_past_tool_block(self):
+    def test_append_message_context_releases_key_when_interrupted(self):
+        store = _StoreStub()
+        calls = []
+
+        async def slow_label():
+            calls.append(1)
+            await asyncio.sleep(5)
+            return "Tester"
+
+        async def run():
+            task = asyncio.ensure_future(
+                core.append_message_context(
+                    store,
+                    1,
+                    5,
+                    True,
+                    "привет",
+                    False,
+                    True,
+                    lambda text, triggered: text.strip(),
+                    lambda text: text,
+                    slow_label,
+                    10,
+                    10,
+                    lambda: None,
+                )
+            )
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(run())
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn((1, 5), store.seen_msg_keys)
+        self.assertEqual(len(store.chat_history.get(1, [])), 0)
+
+        async def retry():
+            async def label():
+                return "Tester"
+
+            await core.append_message_context(
+                store,
+                1,
+                5,
+                True,
+                "привет",
+                False,
+                True,
+                lambda text, triggered: text.strip(),
+                lambda text: text,
+                label,
+                10,
+                10,
+                lambda: None,
+            )
+
+        asyncio.run(retry())
+        self.assertEqual(len(store.chat_history[1]), 1)
+
+    @staticmethod
+    def _tool_messages_are_paired(trimmed) -> bool:
+        for index, item in enumerate(trimmed):
+            if item["role"] != "tool":
+                continue
+            back = index - 1
+            while back >= 0 and trimmed[back]["role"] == "tool":
+                back -= 1
+            if back < 0:
+                return False
+            owner = trimmed[back]
+            if owner["role"] != "assistant" or "tool_calls" not in owner:
+                return False
+        return True
+
+    def test_trim_tool_history_keeps_tool_block_with_its_assistant(self):
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": "s"},
-            {"role": "assistant", "content": "a0"},
+            {"role": "assistant", "content": "a0", "tool_calls": [{"id": "0"}]},
             {"role": "tool", "content": "r0"},
-            {"role": "assistant", "content": "a1"},
+            {"role": "assistant", "content": "a1", "tool_calls": [{"id": "1"}]},
             {"role": "tool", "content": "r1"},
             {"role": "tool", "content": "r2"},
         ]
         trimmed = core.trim_tool_history(messages, 5)
-        self.assertEqual(
-            [item["role"] for item in trimmed],
-            ["system", "tool", "assistant", "tool", "tool"],
-        )
+        self.assertNotIn("tool", [item["role"] for item in trimmed[:2]])
+        self.assertLessEqual(len(trimmed), 5)
+        self.assertTrue(self._tool_messages_are_paired(trimmed))
+
+    def test_trim_tool_history_never_orphans_tool_messages(self):
+        for rounds in (1, 2, 3, 5, 8, 13, 30):
+            for calls in (1, 2, 5):
+                for head_size in (1, 2):
+                    for max_messages in (3, 5, 10, 40, 60):
+                        with self.subTest(
+                            rounds=rounds,
+                            calls=calls,
+                            head=head_size,
+                            limit=max_messages,
+                        ):
+                            messages: list[dict[str, Any]] = [
+                                {"role": "system", "content": "s"},
+                                {"role": "user", "content": "u"},
+                            ]
+                            for index in range(rounds):
+                                messages.append(
+                                    {
+                                        "role": "assistant",
+                                        "content": "",
+                                        "tool_calls": [
+                                            {"id": f"{index}-{c}"} for c in range(calls)
+                                        ],
+                                    }
+                                )
+                                for call in range(calls):
+                                    messages.append(
+                                        {
+                                            "role": "tool",
+                                            "tool_call_id": f"{index}-{call}",
+                                            "content": "r",
+                                        }
+                                    )
+                            trimmed = core.trim_tool_history(
+                                messages, max_messages, head_size=head_size
+                            )
+                            self.assertTrue(
+                                self._tool_messages_are_paired(trimmed),
+                                msg=f"сиротские tool: {trimmed}",
+                            )
+                            if len(messages) > max_messages >= 2:
+                                self.assertTrue(
+                                    len(trimmed) <= max_messages
+                                    or len(trimmed) == len(messages),
+                                    msg="обрезка не уложилась в лимит",
+                                )
 
     def test_trim_tool_history_keeps_all_when_cut_is_empty(self):
         messages: list[dict[str, Any]] = [
@@ -4793,6 +4981,31 @@ class TaskJournalTest(BotTestCase):
         journal.progress(1, rounds=2)
         self.assertIsNone(journal.get(1))
         self.assertFalse(self.saves)
+
+    def test_stale_task_cannot_overwrite_new_one(self):
+        journal = self._journal()
+        old = journal.begin(4, "старая", model="m")
+        new = journal.begin(4, "новая", model="m")
+        self.assertNotEqual(old["token"], new["token"])
+        journal.finish(4, core.TASK_INTERRUPTED, reason="поздно", token=old["token"])
+        record = journal.get(4) or {}
+        self.assertEqual(record.get("status"), core.TASK_RUNNING)
+        self.assertEqual(record.get("prompt"), "новая")
+        journal.progress(4, rounds=9, token=old["token"])
+        self.assertEqual((journal.get(4) or {}).get("rounds"), 0)
+        journal.finish(4, core.TASK_DONE, token=new["token"])
+        self.assertEqual((journal.get(4) or {}).get("status"), core.TASK_DONE)
+
+    def test_restore_keeps_tokens_ahead_of_new_tasks(self):
+        journal = self._journal()
+        journal.begin(6, "из файла", model="m")
+        saved = journal.snapshot()
+        fresh = self._journal()
+        fresh.restore(saved)
+        restored_token = int((fresh.get(6) or {}).get("token") or 0)
+        self.assertGreaterEqual(restored_token, 1)
+        record = fresh.begin(6, "новая")
+        self.assertGreater(int(record["token"]), restored_token)
 
     def test_progress_with_persist_saves_once(self):
         journal = self._journal()
@@ -5735,6 +5948,34 @@ class BotHandlerTest(BotTestCase):
         self._run(private)
         self.assertEqual(len(self.stream_calls), 1)
 
+    def test_sender_is_bot_works_on_real_aiogram_message(self):
+        machine = _aiogram_message(chat_type="private", text="спам").model_copy(
+            update={
+                "from_user": User(id=8, is_bot=True, first_name="Bot"),
+            }
+        )
+        human = _aiogram_message(chat_type="private", text="привет")
+        self.assertTrue(asyncio.run(bot._sender_is_bot(bot.BotEvent(machine))))
+        self.assertFalse(asyncio.run(bot._sender_is_bot(bot.BotEvent(human))))
+        without_sender = machine.model_copy(update={"from_user": None})
+        self.assertFalse(asyncio.run(bot._sender_is_bot(bot.BotEvent(without_sender))))
+
+    def test_private_bot_message_is_skipped_on_real_aiogram_message(self):
+        machine = _aiogram_message(chat_type="private", text="я бот").model_copy(
+            update={"from_user": User(id=8, is_bot=True, first_name="Bot")}
+        )
+        event = bot.BotEvent(machine)
+        sent = []
+
+        async def spy(text, buttons=None):
+            sent.append(text)
+            return bot.SentMessage(machine)
+
+        event.reply = spy
+        asyncio.run(bot.handler(event))
+        self.assertEqual(self.stream_calls, [])
+        self.assertEqual(sent, [])
+
     def test_bot_stats_reports_chat_state(self):
         bot.chat_history[777] = deque([{"role": "user", "content": "a"}], maxlen=10)
         bot.model_overrides[777] = "custom-model"
@@ -6036,6 +6277,21 @@ class BotHandlerTest(BotTestCase):
         self._run(event)
         self.assertIn("Ошибка", event.sent[0])
 
+    def test_unexpected_error_still_closes_task_record(self):
+        async def broken_stream(*args, **kwargs):
+            raise ZeroDivisionError("не из HANDLER_ERRORS")
+
+        saved = core.stream_answer
+        self.addCleanup(setattr, core, "stream_answer", saved)
+        core.stream_answer = broken_stream
+        with self.assertRaises(ZeroDivisionError):
+            self._run(
+                self._group_event("@danybot привет", chat_id=571, sender_id=self.OWNER)
+            )
+        record = bot.TASKS.get(571) or {}
+        self.assertEqual(record.get("status"), core.TASK_FAILED)
+        self.assertEqual(record.get("reason"), "ZeroDivisionError")
+
     def test_history_saver_marked_dirty(self):
         self._run(self._group_event("@danybot привет"))
         self.assertGreaterEqual(self.saver.dirty, 1)
@@ -6189,9 +6445,22 @@ class BotHandlerTest(BotTestCase):
         self.assertEqual(self.stream_calls, [])
 
     def test_task_command_without_history(self):
-        event = self._group_event("/task", chat_id=56, sender_id=1)
+        event = self._group_event("/task", chat_id=56, sender_id=self.OWNER)
         self._run(event)
         self.assertIn("не было", event.sent[0])
+
+    def test_task_command_is_owner_only(self):
+        bot.TASKS.begin(58, "секретный промпт", model="m")
+        event = self._group_event("/task", chat_id=58, sender_id=1)
+        self._run(event)
+        self.assertNotIn("секретный промпт", event.sent[0])
+        self.assertIn("только владельцу", event.sent[0])
+
+    def test_models_command_is_owner_only(self):
+        event = self._group_event("/models", chat_id=59, sender_id=1)
+        self._run(event)
+        self.assertNotIn("Доступные модели", event.sent[0])
+        self.assertIn("только владельцу", event.sent[0])
 
     def test_settings_show_task_state(self):
         event = self._run(self._group_event("/settings", sender_id=self.OWNER))
@@ -8058,7 +8327,7 @@ class SubagentsTest(BotTestCase):
         self.assertEqual(seen["model"], "real-model")
         self.assertFalse(seen["unrestricted"])
         self.assertTrue(seen["verify"])
-        self.assertEqual(seen["max_rounds"], 10**6)
+        self.assertEqual(seen["max_rounds"], subagents.MAX_ROUNDS)
         self.assertEqual(seen["tool_names"], ["read_file"])
         self.assertEqual(len(seen["subagent_name"]), subagents.MAX_NAME_CHARS)
 
@@ -8754,7 +9023,7 @@ class UserbotHandlerTest(BotTestCase):
         self.assertEqual(len(userbot.chat_history[self.DM]), 1)
 
     def test_models_command_lists_models(self):
-        event = self._event(".db models", msg_id=30)
+        event = self._event(".db models", msg_id=30, sender_id=self.OWNER)
         self._run(event)
         self.assertIn("Доступные модели", event.sent[0])
 
@@ -9351,7 +9620,27 @@ class HardeningTest(BotTestCase):
             setattr(subagents, attr, value)
         out = _owner_tool("run_subagent", {"task": "t"}, 1)
         self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
-        self.assertTrue(out.endswith("…"))
+        self.assertEqual(len(json.loads(out)), 10)
+
+    def test_subagent_report_stays_valid_json_when_shrunk(self):
+        results = [
+            {
+                "name": "n" * 200,
+                "task": "t" * 2000,
+                "ok": True,
+                "rounds": 2,
+                "tools_used": ["x"],
+                "result": "y" * 5000,
+            }
+            for _ in range(16)
+        ]
+        out = tools_module._subagent_report(results)
+        self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
+        parsed = json.loads(out)
+        self.assertEqual(len(parsed), 16)
+        for item in parsed:
+            self.assertLessEqual(len(item["name"]), tools_module.SUBAGENT_NAME_CHARS)
+            self.assertLessEqual(len(item["task"]), tools_module.SUBAGENT_TASK_CHARS)
 
     def test_owner_only_tools_are_denied_for_strangers(self):
         for name in sorted(tools_module.OWNER_ONLY_TOOLS):

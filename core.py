@@ -65,7 +65,7 @@ def _bool_command(name, arg):
 
 VISIBILITY_COMMANDS = ("reasoning", "reasoning_status", "tools", "tools_status")
 
-OWNER_COMMANDS = ("clear", "model")
+OWNER_COMMANDS = ("clear", "model", "models", "task")
 
 VISIBILITY_LABELS = {
     "reasoning": "Рассуждения / Reasoning",
@@ -344,14 +344,38 @@ def models_text(current: str, models) -> str:
     return "\n".join(parts)
 
 
+def _int_map(raw) -> dict[int, str]:
+    out: dict[int, str] = {}
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        try:
+            out[int(key)] = str(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _int_set(raw) -> set[int]:
+    out: set[int] = set()
+    if not isinstance(raw, (list, tuple, set, frozenset)):
+        return out
+    for item in raw:
+        try:
+            out.add(int(item))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def parse_state_data(data):
+    if not isinstance(data, dict):
+        raise TypeError("state must be an object")
     return {
-        "model_overrides": {
-            int(k): str(v) for k, v in data.get("model_overrides", {}).items()
-        },
-        "coder_chats": {int(x) for x in data.get("coder_chats", [])},
-        "reasoning_hidden": {int(x) for x in data.get("reasoning_hidden", [])},
-        "tools_hidden": {int(x) for x in data.get("tools_hidden", [])},
+        "model_overrides": _int_map(data.get("model_overrides", {})),
+        "coder_chats": _int_set(data.get("coder_chats", [])),
+        "reasoning_hidden": _int_set(data.get("reasoning_hidden", [])),
+        "tools_hidden": _int_set(data.get("tools_hidden", [])),
         "tasks": data.get("tasks", {}),
     }
 
@@ -394,6 +418,16 @@ def _build_payload(builder) -> str:
             time.sleep(_REPLACE_DELAY)
 
 
+def _fsync_dir(directory) -> None:
+    if os.name == "nt":
+        return
+    fd = os.open(str(directory), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _write_text_atomic(path, text) -> bool:
     tmp_name = None
     try:
@@ -405,12 +439,15 @@ def _write_text_atomic(path, text) -> bool:
             os.close(handle)
             with open(tmp_name, "w", encoding="utf-8") as stream:
                 stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
             if path.is_file():
                 os.chmod(tmp_name, stat.S_IMODE(path.stat().st_mode))
             _replace_with_retry(tmp_name, path)
             tmp_name = None
+            _fsync_dir(path.parent)
         return True
-    except (OSError, TypeError, ValueError, RuntimeError):
+    except (OSError, TypeError, ValueError, RuntimeError, KeyError, AttributeError):
         return False
     finally:
         if tmp_name is not None:
@@ -637,6 +674,11 @@ def _evict_oldest(target, limit: int) -> None:
         target.discard(key)
 
 
+def _remember_key(target, key, limit: int) -> None:
+    _evict_oldest(target, limit)
+    target.add(key)
+
+
 async def safe_reply(event, text, attempts, recent_ids):
     if not text or not text.strip():
         text = "…"
@@ -649,8 +691,9 @@ async def safe_reply(event, text, attempts, recent_ids):
         except (RPCError, OSError, ValueError, TypeError):
             return None
         if sent:
-            recent_ids.add((getattr(event, "chat_id", None), sent.id))
-            _evict_oldest(recent_ids, MAX_RECENT_IDS)
+            _remember_key(
+                recent_ids, (getattr(event, "chat_id", None), sent.id), MAX_RECENT_IDS
+            )
         return sent
     return None
 
@@ -904,20 +947,23 @@ async def append_message_context(
     key = (chat_id, msg_id)
     if key in store.seen_msg_keys:
         return
-    store.seen_msg_keys.add(key)
-    _evict_oldest(store.seen_msg_keys, MAX_SEEN_MSG_KEYS)
-    stripped = strip_trigger_fn(text, triggered) or text.strip()
-    if is_self:
-        role = "user" if triggered else "assistant"
-        content = strip_role_fn(stripped)
-    else:
-        role = "user"
-        label = await sender_label_fn()
-        content = f"{label}: {stripped}" if label else stripped
-    limit = history_limit(chat_id, is_private, dm_limit, group_limit)
-    async with store.ctx_lock:
-        hist = history_for(store.chat_history, chat_id, limit)
-        hist.append({"role": role, "content": content})
+    _remember_key(store.seen_msg_keys, key, MAX_SEEN_MSG_KEYS)
+    try:
+        stripped = strip_trigger_fn(text, triggered) or text.strip()
+        if is_self:
+            role = "user" if triggered else "assistant"
+            content = strip_role_fn(stripped)
+        else:
+            role = "user"
+            label = await sender_label_fn()
+            content = f"{label}: {stripped}" if label else stripped
+        limit = history_limit(chat_id, is_private, dm_limit, group_limit)
+        async with store.ctx_lock:
+            hist = history_for(store.chat_history, chat_id, limit)
+            hist.append({"role": role, "content": content})
+    except BaseException:
+        store.seen_msg_keys.discard(key)
+        raise
     save_history_fn()
 
 
@@ -934,12 +980,9 @@ def trim_tool_history(messages, max_messages, head_size=1):
     if max_messages < 2 or len(messages) <= max_messages:
         return messages
     head = messages[:head_size]
-    start = max(0, len(messages) - (max_messages - head_size))
-    if start < len(messages) and messages[start].get("role") == "tool":
-        while start < len(messages) and messages[start].get("role") == "tool":
-            start += 1
-        while start > 0 and messages[start - 1].get("role") == "tool":
-            start -= 1
+    start = max(head_size, len(messages) - (max_messages - head_size))
+    while start < len(messages) and messages[start].get("role") == "tool":
+        start += 1
     if start >= len(messages):
         return messages
     return [*head, *messages[start:]]
@@ -951,8 +994,9 @@ def is_own_cancellation() -> bool:
 
 
 async def _run_after(coro, previous):
-    while not previous.done():
-        await asyncio.wait({previous})
+    pending = {task for task in previous if not task.done()}
+    while pending:
+        _done, pending = await asyncio.wait(pending)
     return await coro
 
 
@@ -994,9 +1038,10 @@ class SessionRegistry:
                 logger.info(
                     "Запрос в чате %s ждёт завершения работы владельца", chat_id
                 )
-            task = asyncio.ensure_future(_run_after(coro, live[0]))
+            task = asyncio.ensure_future(_run_after(coro, live))
         else:
             self.cancel(chat_id, reason="новый запрос", logger=logger)
+            slot = None
             task = asyncio.ensure_future(coro)
         if slot is None:
             slot = {"tasks": [], "scope": "other"}
@@ -1055,13 +1100,18 @@ class TaskJournal:
         self._limit = max(1, limit)
         self._lock = threading.Lock()
         self._tasks: dict[int, dict[str, Any]] = {}
+        self._seq = 0
 
     def _persist(self) -> None:
         if self._save is not None:
             self._save()
 
     def begin(self, chat_id, prompt, model="", coder=False, owner=False):
+        with self._lock:
+            self._seq += 1
+            token = self._seq
         record = {
+            "token": token,
             "prompt": str(prompt or "")[:TASK_PROMPT_CHARS],
             "model": str(model or "")[:80],
             "coder": bool(coder),
@@ -1079,10 +1129,12 @@ class TaskJournal:
         self._persist()
         return record
 
-    def progress(self, chat_id, persist: bool = False, **fields) -> None:
+    def progress(self, chat_id, persist: bool = False, token=None, **fields) -> None:
         with self._lock:
             record = self._tasks.get(chat_id)
             if record is None:
+                return
+            if token is not None and record.get("token") != token:
                 return
             for key, value in fields.items():
                 if key in record:
@@ -1091,10 +1143,12 @@ class TaskJournal:
         if persist:
             self._persist()
 
-    def finish(self, chat_id, status, reason="", **fields):
+    def finish(self, chat_id, status, reason="", token=None, **fields):
         with self._lock:
             record = self._tasks.get(chat_id)
             if record is None:
+                return None
+            if token is not None and record.get("token") != token:
                 return None
             record["status"] = status
             record["reason"] = str(reason or "")[:TASK_REASON_CHARS]
@@ -1155,6 +1209,10 @@ class TaskJournal:
                     continue
                 self._tasks[key] = clean
                 restored += 1
+            self._seq = max(
+                (int(item.get("token") or 0) for item in self._tasks.values()),
+                default=0,
+            )
             self._trim()
         return restored
 
@@ -1189,6 +1247,7 @@ def _clean_task_record(record) -> dict[str, Any] | None:
     if status not in TASK_STATUSES:
         return None
     clean = {
+        "token": _safe_int(record.get("token")),
         "prompt": str(record.get("prompt", ""))[:TASK_PROMPT_CHARS],
         "model": str(record.get("model", ""))[:80],
         "coder": bool(record.get("coder", False)),
@@ -1277,7 +1336,7 @@ async def stream_answer(
         if state["edit_id"] is not None:
             edited = await edit_fn(chat_id, state["edit_id"], text, logger=logger)
             delivered = bool(edited)
-            if not edited and placeholder_id is not None:
+            if not edited:
                 if logger is not None:
                     logger.warning(
                         "финальный edit не удался, отправляю ответ новым сообщением"

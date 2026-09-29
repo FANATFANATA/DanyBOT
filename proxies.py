@@ -368,15 +368,21 @@ async def get_proxy_candidates(limit=40, deadline=180.0):
     host = os.getenv("PROXY_HOST", "").strip()
     port = os.getenv("PROXY_PORT", "").strip()
     proto = os.getenv("PROXY_TYPE", "socks5").strip().lower()
+    prefer = proto if proto in PROTOCOLS else "socks5"
 
-    if host and port.isdigit():
-        candidates.append({"proxy_type": proto, "addr": host, "port": int(port)})
+    if host:
+        if proto not in PROTOCOLS:
+            logger.error("PROXY_TYPE=%s не поддерживается, беру socks5", proto)
+        if not port.isdigit() or not 1 <= int(port) <= 65535:
+            logger.error("PROXY_PORT=%s некорректен, статический прокси пропущен", port)
+        else:
+            candidates.append({"proxy_type": prefer, "addr": host, "port": int(port)})
 
     if _env_bool("PROXY_AUTO", True):
         try:
             async with asyncio.timeout(deadline):
                 items = await get_working_proxies(
-                    limit=limit, prefer_protocol=proto, deadline=deadline
+                    limit=limit, prefer_protocol=prefer, deadline=deadline
                 )
         except TimeoutError:
             logger.warning("Прокси не собраны за %.0fs, иду напрямую", deadline)

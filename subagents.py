@@ -3,6 +3,8 @@ import json
 import logging
 from typing import Any, cast
 
+from openai import OpenAIError
+
 import core
 
 logger = logging.getLogger("danybot.subagents")
@@ -19,6 +21,7 @@ MAX_TOOL_RESULT = 6000
 MAX_CONTEXT_MESSAGES = 40
 REQUEST_TIMEOUT = 120.0
 MAX_NAME_CHARS = 40
+MAX_ROUNDS = 500
 
 TRUNCATED_MARK = "\n… (вывод обрезан)"
 
@@ -116,7 +119,7 @@ def _model_rounds(raw, fallback):
         value = int(raw)
     except (TypeError, ValueError):
         return fallback
-    return max(1, value)
+    return min(max(1, value), MAX_ROUNDS)
 
 
 def _select_tools(tool_names, unrestricted=False):
@@ -159,7 +162,7 @@ async def _call_tool(
         output = await tools_module.execute_tool(
             name, arguments, chat_id, client, stats, unrestricted, allowed
         )
-    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+    except (OSError, ValueError, TypeError, RuntimeError, OpenAIError) as exc:
         output = f"Ошибка инструмента {name}: {exc}"
     text = str(output)
     if len(text) > MAX_TOOL_RESULT:
@@ -219,7 +222,7 @@ async def run_subagent(
     use_model = model or _RUNTIME["model"]
     rounds_limit = max_rounds if max_rounds is not None else _RUNTIME["max_rounds"]
     if rounds_limit is not None:
-        rounds_limit = max(1, int(rounds_limit))
+        rounds_limit = min(max(1, int(rounds_limit)), MAX_ROUNDS)
     verifier = cast(Any, _RUNTIME["verifier"])
     tool_stats = stats if stats is not None else _RUNTIME["stats"]
     allowed = tools_module.tool_names_of(selected_tools)
@@ -257,6 +260,8 @@ async def run_subagent(
             TypeError,
             AttributeError,
             IndexError,
+            KeyError,
+            OpenAIError,
             asyncio.TimeoutError,
         ) as exc:
             logger.warning("Субагент %s: ошибка: %s", subagent_name, exc)
