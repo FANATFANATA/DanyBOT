@@ -114,6 +114,107 @@ def _build_trigger_re():
 
 TRIGGER_RE = _build_trigger_re()
 
+DC_FALLBACK = "149.154.167.220"
+
+DC_ADDRESSES = {
+    1: "149.154.175.53",
+    2: DC_FALLBACK,
+    3: "149.154.175.100",
+    4: "149.154.167.91",
+    5: "91.108.56.130",
+}
+
+DC_ORDER = (2, 1, 3, 4, 5)
+
+DC_ORDER_ENV = "DC_ORDER"
+DC_FALLBACK_ENV = "DC_FALLBACK"
+DC_DISABLED_ENV = "DC_DISABLED"
+
+DC_PORT = 443
+
+DRAIN_TIMEOUT = 5.0
+
+
+def _dc_int_set(name: str) -> set[int]:
+    raw = _env_str(name, "")
+    out: set[int] = set()
+    for part in raw.replace(";", ",").split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        try:
+            value = int(chunk)
+        except ValueError:
+            continue
+        if value in DC_ADDRESSES:
+            out.add(value)
+    return out
+
+
+def _dc_order_from_env() -> list[int]:
+    parsed: list[int] = []
+    for part in _env_str(DC_ORDER_ENV, "").replace(";", ",").split(","):
+        chunk = part.strip()
+        if not chunk:
+            continue
+        try:
+            value = int(chunk)
+        except ValueError:
+            continue
+        if value in DC_ADDRESSES and value not in parsed:
+            parsed.append(value)
+    return parsed
+
+
+def dc_order() -> list[int]:
+    return _dc_order_from_env() or list(DC_ORDER)
+
+
+def dc_fallback() -> str:
+    return _env_str(DC_FALLBACK_ENV, DC_FALLBACK)
+
+
+def dc_address(dc=None) -> str:
+    if dc is None:
+        return ""
+    if isinstance(dc, bool):
+        return ""
+    try:
+        value = int(dc)
+    except (TypeError, ValueError):
+        return ""
+    if isinstance(dc, float) and value != dc:
+        return ""
+    if isinstance(dc, str) and str(value) != dc.strip():
+        return ""
+    return DC_ADDRESSES.get(value, "")
+
+
+def dc_api_url(dc=None) -> str | None:
+    address = dc_address(dc)
+    if not address:
+        return None
+    return f"https://{address}"
+
+
+def dc_candidates(extra=()) -> list[dict]:
+    disabled = _dc_int_set(DC_DISABLED_ENV)
+    order = dc_order()
+    for item in extra:
+        value = int(item) if str(item).strip().isdigit() else -1
+        if value in DC_ADDRESSES and value not in order:
+            order.append(value)
+    out = [
+        {"dc": value, "address": DC_ADDRESSES[value]}
+        for value in order
+        if value not in disabled
+    ]
+    fallback = dc_fallback()
+    out = [item for item in out if item["address"] != fallback]
+    out.append({"dc": 0, "address": fallback})
+    return out
+
+
 SUB_ALIASES = {
     "clear": ("clear",),
     "model": ("model",),
@@ -252,21 +353,10 @@ def load_state_file(path):
         return None
 
 
-_WRITE_LOCKS: dict[str, threading.Lock] = {}
-_WRITE_LOCKS_GUARD = threading.Lock()
+_WRITE_LOCK = threading.Lock()
 
 _REPLACE_ATTEMPTS = 5
 _REPLACE_DELAY = 0.05
-
-
-def _write_lock(path) -> threading.Lock:
-    key = str(path)
-    with _WRITE_LOCKS_GUARD:
-        lock = _WRITE_LOCKS.get(key)
-        if lock is None:
-            lock = threading.Lock()
-            _WRITE_LOCKS[key] = lock
-        return lock
 
 
 def _replace_with_retry(tmp_name, path) -> None:
@@ -295,7 +385,7 @@ def _build_payload(builder) -> str:
 def _write_text_atomic(path, text) -> bool:
     tmp_name = None
     try:
-        with _write_lock(path):
+        with _WRITE_LOCK:
             payload = _build_payload(text) if callable(text) else text
             handle, tmp_name = tempfile.mkstemp(
                 dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp"
@@ -396,7 +486,7 @@ class AsyncSaver:
     _task: Any | None
     _dirty: bool
 
-    def __init__(self, writer: Callable[[], None], delay=0.5, logger=None):
+    def __init__(self, writer: Callable[[], Any], delay=0.5, logger=None):
         self._writer = writer
         self._delay = delay
         self._logger = logger
@@ -411,12 +501,12 @@ class AsyncSaver:
 
     async def _write(self) -> bool:
         try:
-            await asyncio.to_thread(self._writer)
+            result = await asyncio.to_thread(self._writer)
         except SAVER_ERRORS as exc:
             if self._logger:
                 self._logger.warning("AsyncSaver write failed: %r", exc)
             return False
-        return True
+        return result is not False
 
     async def _run(self):
         while True:
@@ -489,7 +579,7 @@ def load_state_into(store, state_file, logger=None, journal=None):
         journal.restore(state.get("tasks"))
 
 
-def save_state_from(store, state_file, logger, journal=None):
+def save_state_from(store, state_file, logger, journal=None) -> bool:
     payload = {
         "model_overrides": store.model_overrides,
         "coder_chats": store.coder_chats,
@@ -498,8 +588,10 @@ def save_state_from(store, state_file, logger, journal=None):
     }
     if journal is not None:
         payload["tasks"] = journal.snapshot()
-    if not save_state_file(state_file, payload):
-        logger.warning("Не удалось сохранить %s", state_file.name)
+    if save_state_file(state_file, payload):
+        return True
+    logger.warning("Не удалось сохранить %s", state_file.name)
+    return False
 
 
 def load_history_into(store, history_file, dm_limit, group_limit, logger=None):
@@ -513,9 +605,11 @@ def load_history_into(store, history_file, dm_limit, group_limit, logger=None):
     store.chat_history = history
 
 
-def save_history_from(store, history_file, logger):
-    if not save_history_file(history_file, store.chat_history):
-        logger.warning("Не удалось сохранить %s", history_file.name)
+def save_history_from(store, history_file, logger) -> bool:
+    if save_history_file(history_file, store.chat_history):
+        return True
+    logger.warning("Не удалось сохранить %s", history_file.name)
+    return False
 
 
 MAX_RECENT_IDS = 5000
@@ -677,6 +771,20 @@ def check_cooldown(
     return False
 
 
+def history_limit(chat_id, is_private, dm_limit, group_limit) -> int:
+    private = chat_id > 0 if is_private is None else bool(is_private)
+    return dm_limit if private else group_limit
+
+
+def history_for(chat_history, chat_id, limit) -> deque:
+    hist = chat_history.get(chat_id)
+    if hist is not None and hist.maxlen == limit:
+        return hist
+    fresh = deque(hist if hist is not None else (), maxlen=limit)
+    chat_history[chat_id] = fresh
+    return fresh
+
+
 def handle_command_state(
     command,
     chat_id,
@@ -692,8 +800,8 @@ def handle_command_state(
 ) -> tuple[str, bool, bool] | None:
     cmd = command[0]
     if cmd == "clear":
-        limit = dm_limit if is_private else group_limit
-        hist = chat_history.setdefault(chat_id, deque(maxlen=limit))
+        limit = history_limit(chat_id, is_private, dm_limit, group_limit)
+        hist = history_for(chat_history, chat_id, limit)
         hist.clear()
         return ("Контекст очищен. / Context cleared.", False, True)
     if cmd == "model":
@@ -717,7 +825,7 @@ def handle_command_state(
 
 async def append_group_history(chat_id, content, chat_history, group_limit, ctx_lock):
     async with ctx_lock:
-        hist = chat_history.setdefault(chat_id, deque(maxlen=group_limit))
+        hist = history_for(chat_history, chat_id, group_limit)
         hist.append({"role": "user", "content": content})
 
 
@@ -794,17 +902,19 @@ async def append_message_context(
         role = "user"
         label = await sender_label_fn()
         content = f"{label}: {stripped}" if label else stripped
-    limit = dm_limit if chat_id > 0 else group_limit
+    limit = history_limit(chat_id, is_private, dm_limit, group_limit)
     async with store.ctx_lock:
-        hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
+        hist = history_for(store.chat_history, chat_id, limit)
         hist.append({"role": role, "content": content})
     save_history_fn()
 
 
-async def prepare_messages(store, chat_id, dm_limit, group_limit, system_fn):
-    limit = dm_limit if chat_id > 0 else group_limit
+async def prepare_messages(
+    store, chat_id, dm_limit, group_limit, system_fn, is_private=None
+):
+    limit = history_limit(chat_id, is_private, dm_limit, group_limit)
     async with store.ctx_lock:
-        hist = store.chat_history.setdefault(chat_id, deque(maxlen=limit))
+        hist = history_for(store.chat_history, chat_id, limit)
         return [{"role": "system", "content": system_fn(chat_id)}, *list(hist)]
 
 
@@ -812,12 +922,15 @@ def trim_tool_history(messages, max_messages, head_size=1):
     if max_messages < 2 or len(messages) <= max_messages:
         return messages
     head = messages[:head_size]
-    tail = messages[len(messages) - (max_messages - head_size) :]
-    while tail and tail[0].get("role") == "tool":
-        tail = tail[1:]
-    if not tail or tail[0].get("role") != "assistant":
+    start = max(0, len(messages) - (max_messages - head_size))
+    if start < len(messages) and messages[start].get("role") == "tool":
+        while start < len(messages) and messages[start].get("role") == "tool":
+            start += 1
+        while start > 0 and messages[start - 1].get("role") == "tool":
+            start -= 1
+    if start >= len(messages):
         return messages
-    return [*head, *tail]
+    return [*head, *messages[start:]]
 
 
 def is_own_cancellation() -> bool:
@@ -827,68 +940,100 @@ def is_own_cancellation() -> bool:
 
 async def _run_after(coro, previous):
     while not previous.done():
-        try:
-            await asyncio.wait({previous})
-        except asyncio.CancelledError:
-            if is_own_cancellation():
-                coro.close()
-                raise
+        await asyncio.wait({previous})
     return await coro
 
 
 class SessionRegistry:
     def __init__(self):
-        self._tasks: dict[Any, dict[str, Any]] = {}
+        self._slots: dict[Any, dict[str, Any]] = {}
+        self._draining: set[Any] = set()
 
-    def _drop(self, chat_id, task) -> None:
-        entry = self._tasks.get(chat_id)
-        if entry is not None and entry["task"] is task:
-            self._tasks.pop(chat_id, None)
+    def _live(self, chat_id) -> list[Any]:
+        slot = self._slots.get(chat_id)
+        if slot is None:
+            return []
+        return [task for task in slot["tasks"] if not task.done()]
+
+    def _drop(self, chat_id, task, coro) -> None:
+        self._draining.discard(task)
+        slot = self._slots.get(chat_id)
+        if slot is not None:
+            if task in slot["tasks"]:
+                slot["tasks"].remove(task)
+            if not slot["tasks"] and self._slots.get(chat_id) is slot:
+                del self._slots[chat_id]
+        with contextlib.suppress(Exception):
+            coro.close()
+
+    def _watcher(self, chat_id, coro):
+        def _on_done(task) -> None:
+            self._drop(chat_id, task, coro)
+
+        return _on_done
 
     def start(self, chat_id, coro, logger=None, scope="other"):
-        entry = self._tasks.get(chat_id) or {}
-        current = entry.get("task")
-        if current is None or current.done():
+        live = self._live(chat_id)
+        slot = self._slots.get(chat_id)
+        if not live:
             task = asyncio.ensure_future(coro)
-        elif scope != "owner" and entry.get("scope") == "owner":
+        elif scope != "owner" and slot is not None and slot["scope"] == "owner":
             if logger is not None:
                 logger.info(
                     "Запрос в чате %s ждёт завершения работы владельца", chat_id
                 )
-            task = asyncio.ensure_future(_run_after(coro, current))
+            task = asyncio.ensure_future(_run_after(coro, live[0]))
         else:
             self.cancel(chat_id, reason="новый запрос", logger=logger)
             task = asyncio.ensure_future(coro)
-        self._tasks[chat_id] = {"task": task, "scope": scope}
-        task.add_done_callback(lambda done: self._drop(chat_id, done))
+        if slot is None:
+            slot = {"tasks": [], "scope": "other"}
+            self._slots[chat_id] = slot
+        slot["tasks"].append(task)
+        if scope == "owner":
+            slot["scope"] = "owner"
+        task.add_done_callback(self._watcher(chat_id, coro))
         return task
 
     def cancel(self, chat_id, reason="", logger=None) -> bool:
-        entry = self._tasks.pop(chat_id, None)
-        if entry is None:
+        slot = self._slots.pop(chat_id, None)
+        if slot is None:
             return False
-        task = entry["task"]
-        if task.done():
-            return False
-        task.cancel()
-        if logger is not None:
+        stopped = False
+        for task in list(slot["tasks"]):
+            if task.done():
+                continue
+            self._draining.add(task)
+            task.cancel()
+            stopped = True
+        if stopped and logger is not None:
             logger.info("Прерван запрос в чате %s: %s", chat_id, reason or "причина")
-        return True
+        return stopped
 
     def cancel_all(self, reason="остановка", logger=None) -> int:
         stopped = 0
-        for chat_id in list(self._tasks):
+        for chat_id in list(self._slots):
             if self.cancel(chat_id, reason=reason, logger=logger):
                 stopped += 1
         return stopped
 
+    async def drain(self, timeout=DRAIN_TIMEOUT) -> None:
+        tasks = [task for task in self._draining if not task.done()]
+        if not tasks:
+            return
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True), timeout
+            )
+
     def is_running(self, chat_id) -> bool:
-        entry = self._tasks.get(chat_id)
-        return entry is not None and not entry["task"].done()
+        return bool(self._live(chat_id))
 
     def running_chats(self) -> int:
         return sum(
-            1 for entry in list(self._tasks.values()) if not entry["task"].done()
+            1
+            for slot in list(self._slots.values())
+            if any(not task.done() for task in slot["tasks"])
         )
 
 
@@ -1149,7 +1294,7 @@ async def stream_answer(
                     client_override=tool_client,
                     tools=tools,
                     verify_tools=not unrestricted,
-                    sanitize_tools=not unrestricted,
+                    sanitize_tools=userbot_module.SANITIZE_ENABLED,
                     unrestricted=unrestricted,
                     stats=stats,
                     on_progress=progress_fn,

@@ -18,6 +18,7 @@ MAX_TASKS = 16
 MAX_TOOL_RESULT = 6000
 MAX_CONTEXT_MESSAGES = 40
 REQUEST_TIMEOUT = 120.0
+MAX_NAME_CHARS = 40
 
 TRUNCATED_MARK = "\n… (вывод обрезан)"
 
@@ -97,11 +98,32 @@ def _full_tools():
     ]
 
 
+def _tool_names(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return None
+    names = [str(item).strip() for item in raw if str(item).strip()]
+    return names or None
+
+
+def _model_rounds(raw, fallback):
+    if raw is None:
+        return fallback
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return fallback
+    return max(1, value)
+
+
 def _select_tools(tool_names, unrestricted=False):
     available = _full_tools() if unrestricted else list(_available_tools())
-    if not tool_names:
+    wanted = set(_tool_names(tool_names) or ())
+    if not wanted:
         return available
-    wanted = {str(name).strip() for name in tool_names if str(name).strip()}
     return [item for item in available if item["function"]["name"] in wanted]
 
 
@@ -196,6 +218,8 @@ async def run_subagent(
     selected_tools = _select_tools(tool_names, unrestricted=unrestricted)
     use_model = model or _RUNTIME["model"]
     rounds_limit = max_rounds if max_rounds is not None else _RUNTIME["max_rounds"]
+    if rounds_limit is not None:
+        rounds_limit = max(1, int(rounds_limit))
     verifier = cast(Any, _RUNTIME["verifier"])
     tool_stats = stats if stats is not None else _RUNTIME["stats"]
     allowed = tools_module.tool_names_of(selected_tools)
@@ -361,18 +385,19 @@ async def run_subagents(
     )
 
     async def worker(spec):
+        name = str(spec.get("name") or "universal")[:MAX_NAME_CHARS]
         return await run_subagent(
             spec.get("task", ""),
-            system=spec.get("system", system),
-            model=spec.get("model", model),
-            tool_names=spec.get("tools", tool_names),
-            chat_id=spec.get("chat_id", chat_id),
+            system=spec.get("system") or system,
+            model=model,
+            tool_names=_tool_names(spec.get("tools")) or tool_names,
+            chat_id=chat_id,
             client=client,
-            max_rounds=spec.get("max_rounds", max_rounds),
-            subagent_name=spec.get("name", "universal"),
+            max_rounds=_model_rounds(spec.get("max_rounds"), max_rounds),
+            subagent_name=name,
             verify=verify,
             stats=stats,
-            unrestricted=spec.get("unrestricted", unrestricted),
+            unrestricted=unrestricted,
         )
 
     if limit is None:

@@ -397,8 +397,16 @@ async def main():
         print("Рабочих прокси не найдено")
 
 
-if __name__ == "__main__":
+def run_cli() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
     )
     asyncio.run(main())
+
+
+def cli() -> None:
+    run_cli()
+
+
+if __name__ == "__main__":
+    cli()

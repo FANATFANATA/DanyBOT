@@ -11,6 +11,7 @@ from typing import Any
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.exceptions import (
     TelegramAPIError,
     TelegramNetworkError,
@@ -79,6 +80,13 @@ def _sender_id(message) -> int:
     if user is None:
         return 0
     return int(user.id)
+
+
+async def _sender_is_bot(event) -> bool:
+    user = getattr(getattr(event, "message", event), "from_user", None)
+    if user is None:
+        return False
+    return bool(getattr(user, "is_bot", False))
 
 
 def _chat_ref(key) -> int | str:
@@ -197,6 +205,11 @@ class BotCallbackEvent:
         self.data = query.data
         message = query.message
         self.chat_id = message.chat.id if message is not None else None
+        self.is_private = (
+            getattr(getattr(message, "chat", None), "type", "") == "private"
+            if message is not None
+            else False
+        )
         self.sender_id = _sender_id(query)
 
     async def answer(self, text=None, alert=False) -> None:
@@ -305,10 +318,17 @@ def _proxy_url(proxy) -> str | None:
     return f"{PROXY_SCHEMES.get(protocol.lower(), 'socks5')}://{host}:{port}"
 
 
-def _connect(proxy) -> BotClient:
+def _session_for(proxy, dc=None):
     url = _proxy_url(proxy)
-    session = AiohttpSession(proxy=url) if url else AiohttpSession()
-    return BotClient(Bot(token=userbot.BOT_TOKEN, session=session))
+    kwargs: dict[str, Any] = {"proxy": url} if url else {}
+    base = core.dc_api_url(dc)
+    if base:
+        kwargs["api"] = TelegramAPIServer.from_base(base)
+    return AiohttpSession(**kwargs)
+
+
+def _connect(proxy, dc=None) -> BotClient:
+    return BotClient(Bot(token=userbot.BOT_TOKEN, session=_session_for(proxy, dc)))
 
 
 _MENTION_RX = None
@@ -337,8 +357,11 @@ def _strip_mention(text):
     return text
 
 
-def _db_triggered(text):
-    return False
+NO_TEXT_TRIGGER = False
+
+
+def _strip_trigger(text, triggered):
+    return text.strip()
 
 
 BOT_HELP_TEXT = (
@@ -421,7 +444,9 @@ async def handler(event: Any):
         return
 
     is_private = event.is_private
-    triggered = _db_triggered(text)
+    if is_private and await _sender_is_bot(event):
+        return
+    triggered = NO_TEXT_TRIGGER
     mentioned = _is_mentioned(text)
     now = time.monotonic()
 
@@ -488,7 +513,9 @@ async def handler(event: Any):
             await safe_reply(event, "Настройки доступны только владельцу.")
             return
         try:
-            await event.reply(_settings_text(chat_id), buttons=_settings_rows(chat_id))
+            await event.reply(
+                _settings_text(chat_id, is_private), buttons=_settings_rows(chat_id)
+            )
         except (RPCError, OSError, ValueError, TypeError):
             logger.exception("Бот: не удалось отправить меню настроек")
         return
@@ -539,7 +566,7 @@ async def handler(event: Any):
         text,
         is_self,
         triggered,
-        lambda t, tr: t.strip(),
+        _strip_trigger,
         userbot.strip_role_tag,
         lambda: userbot.get_sender_label(event),
         userbot.DM_HISTORY_LIMIT,
@@ -593,6 +620,7 @@ async def handler(event: Any):
             userbot.DM_HISTORY_LIMIT,
             userbot.GROUP_HISTORY_LIMIT,
             system_fn,
+            is_private=True,
         )
     else:
         label = await userbot.get_sender_label(event)
@@ -611,6 +639,7 @@ async def handler(event: Any):
             userbot.DM_HISTORY_LIMIT,
             userbot.GROUP_HISTORY_LIMIT,
             system_fn,
+            is_private=False,
         )
 
     if is_self:
@@ -628,7 +657,6 @@ async def handler(event: Any):
     else:
         tool_menu = tools_module.PUBLIC_TOOLS
     limit_ctx = userbot.DM_HISTORY_LIMIT if is_private else userbot.GROUP_HISTORY_LIMIT
-    TASKS.begin(chat_id, prompt, model=model, coder=coder_active, owner=is_owner)
     progress: dict[str, str] = {"reason": ""}
 
     def on_progress(rounds, calls_made, reason=""):
@@ -637,6 +665,7 @@ async def handler(event: Any):
         TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
 
     async def generate():
+        TASKS.begin(chat_id, prompt, model=model, coder=coder_active, owner=is_owner)
         try:
             answer = await core.stream_answer(
                 STORE,
@@ -805,8 +834,10 @@ def _on_off_label(chat_id, active) -> str:
     return "вкл" if chat_id in active else "выкл"
 
 
-def _settings_text(chat_id):
-    limit = userbot.DM_HISTORY_LIMIT if chat_id > 0 else userbot.GROUP_HISTORY_LIMIT
+def _settings_text(chat_id, is_private=None):
+    limit = core.history_limit(
+        chat_id, is_private, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
+    )
     ctx_len = len(chat_history.get(chat_id, deque()))
     return (
         "Настройки / Settings\n"
@@ -827,7 +858,7 @@ async def _answer(event, text=None, alert=False) -> None:
 async def _edit_settings(event, chat_id, text=None, buttons=None) -> None:
     try:
         await event.edit(
-            text if text is not None else _settings_text(chat_id),
+            text if text is not None else _settings_text(chat_id, event.is_private),
             buttons if buttons is not None else _settings_rows(chat_id),
         )
     except (RPCError, OSError, ValueError, TypeError, OverflowError) as exc:
@@ -859,11 +890,14 @@ async def callback_handler(event: Any):
         if chat_id not in coder_chats:
             SESSIONS.cancel(chat_id, reason="кодер выключен", logger=logger)
     elif action == "clear":
-        limit = userbot.GROUP_HISTORY_LIMIT
-        if chat_id > 0:
-            limit = userbot.DM_HISTORY_LIMIT
+        limit = core.history_limit(
+            chat_id,
+            event.is_private,
+            userbot.DM_HISTORY_LIMIT,
+            userbot.GROUP_HISTORY_LIMIT,
+        )
         async with ctx_lock:
-            chat_history.setdefault(chat_id, deque(maxlen=limit)).clear()
+            core.history_for(chat_history, chat_id, limit).clear()
         save_history()
     elif action == "pick" and arg:
         picked = _resolve_picked_model(arg)
@@ -922,8 +956,52 @@ async def _close_client(client) -> None:
         await client.close()
 
 
+async def _connect_all(dc, candidates):
+    for idx, proxy in enumerate(candidates):
+        if proxy:
+            logger.info(
+                "Бот: ДЦ %s, прокси %d/%d: %s",
+                dc["address"],
+                idx + 1,
+                len(candidates),
+                proxy,
+            )
+        attempt = None
+        try:
+            attempt = _connect(proxy, dc["dc"] or None)
+            me = await asyncio.wait_for(attempt.resolve(), timeout=CONNECT_TIMEOUT)
+        except (TelegramUnauthorizedError, TokenValidationError) as exc:
+            logger.error("Токен бота невалиден: %s", exc)
+            await _close_client(attempt)
+            return None, True
+        except (
+            TelegramAPIError,
+            TelegramNetworkError,
+            OSError,
+            TimeoutError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            logger.warning(
+                "Бот: не удалось подключиться через %s (%s): %s",
+                proxy,
+                dc["address"],
+                type(exc).__name__,
+            )
+            await _close_client(attempt)
+            if proxy:
+                proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
+            continue
+        global bot_username, bot_id
+        bot_username = getattr(me, "username", "") or ""
+        bot_id = int(getattr(me, "id", 0) or 0)
+        return attempt, False
+    return None, False
+
+
 async def start_bot():
-    global bot_client, bot_username, bot_id
+    global bot_client
     if not userbot.BOT_TOKEN:
         logger.error("ENABLE_BOT=1, но BOT_TOKEN не задан")
         return
@@ -937,40 +1015,16 @@ async def start_bot():
         candidates = [None]
 
     client = None
-    for idx, proxy in enumerate(candidates):
-        if proxy:
-            logger.info("Бот: пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-        attempt = None
-        try:
-            attempt = _connect(proxy)
-            me = await asyncio.wait_for(attempt.resolve(), timeout=CONNECT_TIMEOUT)
-        except (TelegramUnauthorizedError, TokenValidationError) as exc:
-            logger.error("Токен бота невалиден: %s", exc)
-            await _close_client(attempt)
+    for dc in core.dc_candidates():
+        client, fatal = await _connect_all(dc, candidates)
+        if fatal:
             return
-        except (
-            TelegramAPIError,
-            TelegramNetworkError,
-            OSError,
-            TimeoutError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            logger.warning(
-                "Бот: не удалось подключиться через %s: %s", proxy, type(exc).__name__
-            )
-            await _close_client(attempt)
-            if proxy:
-                proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
-            continue
-        bot_username = getattr(me, "username", "") or ""
-        bot_id = int(getattr(me, "id", 0) or 0)
-        client = attempt
-        break
+        if client is not None:
+            break
+        logger.warning("Бот: ДЦ %s недоступен, пробую следующий", dc["address"])
 
     if client is None:
-        logger.error("Бот: не удалось подключиться ни через один прокси")
+        logger.error("Бот: не удалось подключиться ни через один ДЦ и прокси")
         return
 
     bot_client = client
@@ -981,6 +1035,7 @@ async def start_bot():
 
 async def disconnect_quietly(timeout=10):
     SESSIONS.cancel_all(reason="остановка", logger=logger)
+    await SESSIONS.drain(timeout)
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if bot_client is None:

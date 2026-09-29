@@ -16,14 +16,15 @@ logger = logging.getLogger("danybot.main")
 
 
 async def _flush_savers():
-    with contextlib.suppress(Exception):
-        await userbot.HISTORY_SAVER.flush()
-    with contextlib.suppress(Exception):
-        await bot.HISTORY_SAVER.flush()
-    with contextlib.suppress(Exception):
-        await tools.close_httpx_client()
-    with contextlib.suppress(Exception):
-        await userbot.close_ai()
+    steps = (
+        userbot.HISTORY_SAVER.flush,
+        bot.HISTORY_SAVER.flush,
+        tools.close_httpx_client,
+        userbot.close_ai,
+    )
+    for step in steps:
+        with contextlib.suppress(Exception, asyncio.CancelledError):
+            await step()
 
 
 async def run():
@@ -100,12 +101,11 @@ async def run():
         for task in all_tasks:
             if not task.done():
                 task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await asyncio.gather(*all_tasks, return_exceptions=True)
-        with contextlib.suppress(Exception):
-            await userbot.disconnect_quietly()
-        with contextlib.suppress(Exception):
-            await bot.disconnect_quietly()
+        for cleanup in (userbot.disconnect_quietly, bot.disconnect_quietly):
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await cleanup()
         await _flush_savers()
         logger.info("Завершено / Stopped.")
 

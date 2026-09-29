@@ -96,10 +96,6 @@ DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
 LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
-MAX_TOOL_ROUNDS = _env_int("MAX_TOOL_ROUNDS", 40)
-MAX_TOOL_SECONDS = max(30, _env_int("MAX_TOOL_SECONDS", 900))
-MAX_TOOL_STUCK = max(1, _env_int("MAX_TOOL_STUCK", 6))
-MAX_TOOL_REPEATS = max(1, _env_int("MAX_TOOL_REPEATS", 3))
 TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 60))
 REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
@@ -224,19 +220,32 @@ def make_session(name: str):
 client = None
 
 
-def get_client():
+def get_client(dc=None):
     global client
     if client is None:
-        client = TelegramClient(
-            make_session(SESSION_NAME),
-            API_ID,
-            API_HASH,
-            connection_retries=2,
-            request_retries=1,
-            retry_delay=0,
-            timeout=10,
-        )
+        session = make_session(SESSION_NAME)
+        options: dict[str, Any] = {
+            "connection_retries": 2,
+            "request_retries": 1,
+            "retry_delay": 0,
+            "timeout": 10,
+        }
+        client = TelegramClient(session, API_ID, API_HASH, **options)
+        pin_datacenter(client, dc)
     return client
+
+
+def pin_datacenter(cli, dc) -> None:
+    address = core.dc_address(dc)
+    if not address:
+        return
+    session = cli.session
+    if getattr(session, "auth_key", None) is not None and session.dc_id:
+        logger.info(
+            "Сессия уже авторизована на ДЦ %s, оставляю адрес сессии", session.dc_id
+        )
+        return
+    session.set_dc(int(dc), address, core.DC_PORT)
 
 
 ai = AsyncOpenAI(
@@ -579,20 +588,9 @@ async def stream_with_tools(
     rounds = 0
     all_parts: list[str] = []
     allowed = tools_module.tool_names_of(tools if tools is not None else TOOLS)
-    started = time.monotonic()
-    seen_calls: dict[tuple[str, str], int] = {}
-    stuck = 0
-    last_cause = ""
     calls_made = 0
     while True:
         rounds += 1
-        stop = _loop_stop_reason(rounds, started, stuck, last_cause)
-        if stop:
-            _report_progress(on_progress, rounds, calls_made, stop)
-            return _finish_loop(
-                all_parts,
-                f"{stop} Раундов: {rounds}, вызовов инструментов: {calls_made}.",
-            )
         working = core.trim_tool_history(working, TOOL_CONTEXT_MESSAGES)
         tool_calls: dict[int, dict[str, str]] = {}
         content_parts = []
@@ -670,36 +668,15 @@ async def stream_with_tools(
         _report_progress(on_progress, rounds, calls_made)
 
         async def run_slot(slot):
-            key = (slot["name"], slot["arguments"])
-            seen_calls[key] = seen_calls.get(key, 0) + 1
-            repeats = seen_calls[key]
             try:
                 args = json.loads(slot["arguments"] or "{}")
             except (json.JSONDecodeError, ValueError) as exc:
                 snippet = str(slot["arguments"])[:200]
-                return (
-                    f"Некорректный JSON аргументов: {exc}. Args: {snippet}",
-                    "некорректные аргументы",
-                    False,
-                )
+                return f"Некорректный JSON аргументов: {exc}. Args: {snippet}"
             if not isinstance(args, dict):
                 return (
-                    (
-                        "Аргументы должны быть объектом JSON, получено: "
-                        f"{type(args).__name__}"
-                    ),
-                    "некорректные аргументы",
-                    False,
-                )
-            if repeats > MAX_TOOL_REPEATS:
-                return (
-                    (
-                        f"Вызов {slot['name']} с этими аргументами уже повторялся "
-                        f"{repeats - 1} раз и результат не изменился. Измени подход, "
-                        "разбей задачу или собери недостающие данные."
-                    ),
-                    "повтор того же вызова",
-                    False,
+                    "Аргументы должны быть объектом JSON, получено: "
+                    f"{type(args).__name__}"
                 )
             verify_model = TOOL_VERIFY_MODEL or model
             if (
@@ -707,11 +684,7 @@ async def stream_with_tools(
                 and not unrestricted
                 and not await verify_tool_call(slot["name"], args, verify_model)
             ):
-                return (
-                    "Вызов отклонён проверкой безопасности. Не повторяй его.",
-                    "отказ проверки безопасности",
-                    False,
-                )
+                return "Вызов отклонён проверкой безопасности. Не повторяй его."
             if on_tool is not None:
                 await on_tool(slot["name"])
             result = await execute_tool(
@@ -723,28 +696,21 @@ async def stream_with_tools(
                 unrestricted,
                 allowed,
             )
-            if slot["name"] in SANITIZED_TOOLS and sanitize_tools and not unrestricted:
-                cleaned = await sanitize_tool_output(result, model)
-                return (cleaned, None, True)
-            return (result, None, True)
+            if slot["name"] in SANITIZED_TOOLS and sanitize_tools:
+                return await sanitize_tool_output(result, model)
+            return result
 
-        results = await asyncio.gather(
-            *(run_slot(s) for s in slots), return_exceptions=True
+        results: list[Any] = list(
+            await asyncio.gather(*(run_slot(s) for s in slots), return_exceptions=True)
         )
-        progressed = False
-        causes: list[str] = []
         for slot, outcome in zip(slots, results, strict=True):
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
             if isinstance(outcome, BaseException):
                 logger.warning("Инструмент %s упал: %r", slot["name"], outcome)
                 content = f"Ошибка инструмента {slot['name']}: {outcome}"
-                causes.append(f"ошибка {slot['name']}")
             else:
-                content, cause, ok = outcome
-                if cause:
-                    causes.append(cause)
-                progressed = progressed or ok
+                content = outcome
             working.append(
                 {
                     "role": "tool",
@@ -752,12 +718,6 @@ async def stream_with_tools(
                     "content": content,
                 }
             )
-        if progressed:
-            stuck = 0
-            last_cause = ""
-        else:
-            stuck += 1
-            last_cause = ", ".join(dict.fromkeys(causes)) or "без прогресса"
 
 
 def _report_progress(on_progress, rounds, calls_made, reason="") -> None:
@@ -765,26 +725,6 @@ def _report_progress(on_progress, rounds, calls_made, reason="") -> None:
         return
     with contextlib.suppress(Exception):
         on_progress(rounds, calls_made, reason)
-
-
-def _loop_stop_reason(rounds, started, stuck, cause) -> str:
-    if MAX_TOOL_SECONDS > 0 and time.monotonic() - started > MAX_TOOL_SECONDS:
-        return f"Достигнут лимит времени цикла инструментов: {MAX_TOOL_SECONDS}s."
-    if 0 < MAX_TOOL_ROUNDS < rounds:
-        return f"Достигнут лимит циклов инструментов: {MAX_TOOL_ROUNDS}."
-    if stuck >= MAX_TOOL_STUCK:
-        return (
-            f"Цикл инструментов не продвинулся {stuck} раундов подряд "
-            f"({cause}). Остановился, чтобы не тратить токены впустую."
-        )
-    return ""
-
-
-def _finish_loop(parts, reason) -> str:
-    answer = "".join(parts)
-    if answer.strip():
-        return f"{answer}\n\n{reason}"
-    return reason
 
 
 async def _get_sender(event):
@@ -1035,7 +975,6 @@ async def handler(event: Any):
     delivery: dict[str, bool] = {}
     tool_menu = TOOLS if sender_id in OWNER_IDS else tools_module.PUBLIC_TOOLS
     owner = sender_id in OWNER_IDS
-    TASKS.begin(chat_id, prompt, model=model, owner=owner)
     progress: dict[str, str] = {"reason": ""}
 
     def on_progress(rounds, calls_made, reason=""):
@@ -1044,6 +983,7 @@ async def handler(event: Any):
         TASKS.progress(chat_id, rounds=rounds, tools=calls_made)
 
     async def generate():
+        TASKS.begin(chat_id, prompt, model=model, owner=owner)
         try:
             answer = await core.stream_answer(
                 STORE,
@@ -1108,6 +1048,7 @@ async def handler(event: Any):
 
 async def disconnect_quietly(timeout=10):
     SESSIONS.cancel_all(reason="остановка", logger=logger)
+    await SESSIONS.drain(timeout)
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if client is None:
@@ -1129,55 +1070,77 @@ async def _proxy_candidates():
         return []
 
 
+CONNECT_TIMEOUT = 25
+
+
+async def _try_connect(cli, proxy):
+    if proxy:
+        cli.set_proxy(proxy)
+    start_coro = cast(Any, cli.start())
+    await asyncio.wait_for(start_coro, timeout=CONNECT_TIMEOUT)
+    return await cli.get_me()
+
+
 async def start_userbot():
+    global client
     if not API_ID or not API_HASH:
         logger.error("ENABLE_USERBOT=1, но API_ID/API_HASH не заданы в .env")
         return
-    cli = get_client()
-    cli.add_event_handler(handler, events.NewMessage(incoming=None))
     candidates = await _proxy_candidates()
     if not candidates:
         logger.warning("Нет прокси, пробую напрямую")
         candidates = [None]
 
-    for idx, proxy in enumerate(candidates):
-        if proxy:
-            logger.info("Пробую прокси %d/%d: %s", idx + 1, len(candidates), proxy)
-        try:
+    for dc in core.dc_candidates():
+        client = None
+        cli = get_client(dc["dc"] or None)
+        cli.add_event_handler(handler, events.NewMessage(incoming=None))
+        for idx, proxy in enumerate(candidates):
             if proxy:
-                cli.set_proxy(proxy)
-            start_coro = cast(Any, cli.start())
-            await asyncio.wait_for(start_coro, timeout=25)
-            me = await cli.get_me()
-            logger.info(
-                "Бот запущен как %s (@%s)",
-                getattr(me, "first_name", "?"),
-                getattr(me, "username", "?"),
-            )
-            break
-        except AuthKeyError as exc:
-            logger.error("Сессия невалидна, подключение прервано: %s", exc)
-            return
-        except (
-            RPCError,
-            ConnectionError,
-            OSError,
-            TimeoutError,
-            EOFError,
-            BufferError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as exc:
-            logger.warning(
-                "Не удалось подключиться через %s: %s", proxy, type(exc).__name__
-            )
-            with contextlib.suppress(Exception):
-                await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
-            if proxy:
-                proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
-    else:
-        logger.error("Не удалось подключиться ни через один прокси")
-        return
+                logger.info(
+                    "ДЦ %s, прокси %d/%d: %s",
+                    dc["address"],
+                    idx + 1,
+                    len(candidates),
+                    proxy,
+                )
+            try:
+                me = await _try_connect(cli, proxy)
+                logger.info(
+                    "Бот запущен как %s (@%s) через ДЦ %s",
+                    getattr(me, "first_name", "?"),
+                    getattr(me, "username", "?"),
+                    dc["address"],
+                )
+                await cast(Any, cli.run_until_disconnected())
+                return
+            except AuthKeyError as exc:
+                logger.error("Сессия невалидна, подключение прервано: %s", exc)
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
+                return
+            except (
+                RPCError,
+                ConnectionError,
+                OSError,
+                TimeoutError,
+                EOFError,
+                BufferError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ) as exc:
+                logger.warning(
+                    "Не удалось подключиться через %s (%s): %s",
+                    proxy,
+                    dc["address"],
+                    type(exc).__name__,
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(cast(Any, cli.disconnect()), timeout=10)
+                if proxy:
+                    proxies.mark_bad_proxy(proxies.telethon_to_item(proxy))
+        logger.warning("ДЦ %s недоступен, пробую следующий", dc["address"])
+        client = None
 
-    await cast(Any, cli.run_until_disconnected())
+    logger.error("Не удалось подключиться ни через один ДЦ и прокси")

@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import urllib.parse
 from pathlib import Path
 from typing import Any
@@ -56,6 +57,7 @@ MAX_SEARCH_NODES = 40000
 MAX_SEARCH_FILE_BYTES = 2_000_000
 MAX_SEARCH_PATTERN = 250
 SEARCH_TIMEOUT = 30
+SEARCH_CHECK_EVERY = 200
 MAX_SHELL_TIMEOUT = 300
 MAX_SCRIPT_BYTES = 200_000
 MAX_SCRIPT_OUTPUT = 4000
@@ -244,6 +246,9 @@ def safe_eval(expression: str) -> str:
         return f"Ошибка вычисления: {exc}"
 
 
+MAX_OPT_INT = 1_000_000
+
+
 def _int_arg(arguments, key, default, lo, hi):
     try:
         value = int(arguments.get(key, default))
@@ -269,6 +274,8 @@ def _too_big(path):
 def _opt_int_arg(arguments, key, lo, hi):
     if arguments.get(key) is None:
         return None
+    if hi is None:
+        return _int_arg(arguments, key, lo, lo, MAX_OPT_INT)
     return _int_arg(arguments, key, lo, lo, hi)
 
 
@@ -610,7 +617,10 @@ TOOLS: list[dict[str, Any]] = [
                     "max_rounds": {
                         "type": "integer",
                         "minimum": 1,
-                        "maximum": 20,
+                        "description": (
+                            "Сколько раундов инструментов разрешить. "
+                            "Без значения раундов не ограничено."
+                        ),
                     },
                 },
             },
@@ -982,6 +992,7 @@ async def _tool_run_shell(arguments, chat_id, client, stats, unrestricted=False)
 
 _httpx_singleton = None
 _httpx_loop = None
+_httpx_closing: set[Any] = set()
 
 
 def _build_httpx_client() -> httpx.AsyncClient:
@@ -1012,7 +1023,9 @@ def _get_httpx_client():
         _httpx_singleton = None
         if stale_loop is not None and stale_loop.is_running():
             with contextlib.suppress(RuntimeError):
-                stale_loop.create_task(stale.aclose())
+                closing = stale_loop.create_task(stale.aclose())
+                _httpx_closing.add(closing)
+                closing.add_done_callback(_httpx_closing.discard)
     _httpx_loop = loop
     _httpx_singleton = _build_httpx_client()
     return _httpx_singleton
@@ -1358,7 +1371,7 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
         tool_names=_tool_name_list(arguments.get("tools")),
         chat_id=chat_id,
         client=client,
-        max_rounds=_opt_int_arg(arguments, "max_rounds", 1, 20),
+        max_rounds=_opt_int_arg(arguments, "max_rounds", 1, None),
         verify=not unrestricted,
         stats=stats,
         unrestricted=unrestricted,
@@ -1497,7 +1510,9 @@ def _is_safe_glob(pattern: str) -> bool:
     return ".." not in re.split(r"[\\/]+", pattern)
 
 
-def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> tuple[list[str], str]:
+def _scan_files(
+    root: Path, glob_pat: str, rx, limit: int, stop
+) -> tuple[list[str], str]:
     matches: list[str] = []
     scanned = 0
     visited = 0
@@ -1505,6 +1520,8 @@ def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> tuple[list[str], s
     note = ""
     candidates = [root] if root.is_file() else root.rglob(glob_pat)
     for item in candidates:
+        if stop.is_set():
+            return matches, note or "остановлено по таймауту"
         if len(matches) >= limit:
             note = f"достигнут лимит результатов {limit}"
             break
@@ -1532,6 +1549,8 @@ def _scan_files(root: Path, glob_pat: str, rx, limit: int) -> tuple[list[str], s
         except (OSError, ValueError):
             continue
         for idx, line in enumerate(text.splitlines(), start=1):
+            if idx % SEARCH_CHECK_EVERY == 0 and stop.is_set():
+                return matches, note or "остановлено по таймауту"
             if rx.search(line):
                 matches.append(f"{item}:{idx}: {line.strip()[:200]}")
                 if len(matches) >= limit:
@@ -1560,12 +1579,14 @@ async def _tool_search_files(arguments, chat_id, client, stats, unrestricted=Fal
         rx = re.compile(pattern)
     except re.error as exc:
         return f"Некорректное выражение: {exc}"
+    stop = threading.Event()
     try:
         matches, note = await asyncio.wait_for(
-            asyncio.to_thread(_scan_files, path, glob_pat, rx, limit),
+            asyncio.to_thread(_scan_files, path, glob_pat, rx, limit, stop),
             timeout=SEARCH_TIMEOUT,
         )
     except TimeoutError:
+        stop.set()
         return f"Таймаут поиска: {SEARCH_TIMEOUT}s"
     text = "\n".join(matches) if matches else "Совпадений не найдено."
     if note:

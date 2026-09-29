@@ -1,16 +1,21 @@
 import argparse
 import asyncio
 import json
+import logging
 import math
 import os
+import re
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
+import warnings
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -38,7 +43,7 @@ from aiogram.types import (
 from aiogram.utils.token import TokenValidationError
 from telethon.crypto import AuthKey
 from telethon.errors import AuthKeyError, FloodWaitError, RPCError
-from telethon.sessions import StringSession
+from telethon.sessions import MemorySession, StringSession
 
 import bot
 import core
@@ -66,7 +71,9 @@ WHITELIST_FILE = "vulture_whitelist.py"
 BANDIT_SKIP = "B404,B603,B607,B608"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
+AUTH_PART = "123456"
 BOT_AUTH_VALUE = "bot-token"
+BOT_TOKEN_VALUE = f"{AUTH_PART}:{BOT_AUTH_VALUE}"
 NO_AUTH = ""
 _log_lines: list[str] = []
 
@@ -367,6 +374,64 @@ class EnvHelpersTest(BotTestCase):
         with mock.patch.dict(os.environ):
             os.environ.pop("DANYBOT_TEST_STR", None)
             self.assertEqual(userbot._env_str("DANYBOT_TEST_STR", "d"), "d")
+
+    def test_env_bool_rules(self):
+        for raw, expected in (
+            ("on", True),
+            ("1", True),
+            ("yes", True),
+            ("off", False),
+            ("0", False),
+            ("no", False),
+            ("TRUE", True),
+            ("", False),
+            ("junk", True),
+        ):
+            with (
+                self.subTest(raw=raw),
+                mock.patch.dict(os.environ, {"DANYBOT_TEST_BOOL": raw}),
+            ):
+                self.assertEqual(
+                    userbot._env_bool("DANYBOT_TEST_BOOL", False), expected
+                )
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DANYBOT_TEST_BOOL", None)
+            self.assertTrue(userbot._env_bool("DANYBOT_TEST_BOOL", True))
+            self.assertFalse(userbot._env_bool("DANYBOT_TEST_BOOL", False))
+
+    def test_env_pos_int_ignores_non_positive(self):
+        for raw, expected in (
+            ("5", 5),
+            ("0", None),
+            ("-2", None),
+            ("", None),
+            ("junk", None),
+        ):
+            with (
+                self.subTest(raw=raw),
+                mock.patch.dict(os.environ, {"DANYBOT_TEST_POS": raw}),
+            ):
+                self.assertEqual(userbot._env_pos_int("DANYBOT_TEST_POS"), expected)
+
+    def test_env_id_set_parses_and_skips_junk(self):
+        with mock.patch.dict(os.environ, {"DANYBOT_TEST_IDS": " 7 ; 8, 9 ,, bad , 7"}):
+            self.assertEqual(userbot._env_id_set("DANYBOT_TEST_IDS"), {7, 8, 9})
+        with mock.patch.dict(os.environ, {"DANYBOT_TEST_IDS": ""}):
+            self.assertEqual(userbot._env_id_set("DANYBOT_TEST_IDS"), set())
+
+    def test_read_extra_system_reports_missing_file(self):
+        self.assertEqual(userbot._read_extra_system(""), "")
+        self.assertEqual(
+            userbot._read_extra_system(str(Path(tempfile.gettempdir()) / "нет.такого")),
+            "",
+        )
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_prompt_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "extra.md"
+        target.write_text("  дополнительный текст  ", encoding="utf-8")
+        self.assertEqual(
+            userbot._read_extra_system(str(target)), "дополнительный текст"
+        )
 
 
 class MakeSessionTest(unittest.TestCase):
@@ -738,6 +803,29 @@ class ValidateManyTest(BotTestCase):
             working = asyncio.run(proxies.validate_many(items, limit=5))
         self.assertEqual(working, [])
 
+    def test_reaching_limit_cancels_pending(self):
+        cancelled = []
+
+        async def validate(proto, host, port, timeout=12):
+            if port == 1:
+                return True
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                cancelled.append(host)
+                raise
+            return False
+
+        items = [("socks5", "fast", 1)] + [("socks5", f"slow{i}", 9) for i in range(4)]
+
+        async def run():
+            return await proxies.validate_many(items, limit=1, concurrency=4)
+
+        with mock.patch.object(proxies, "validate_one", validate):
+            working = asyncio.run(run())
+        self.assertEqual(working, [("socks5", "fast", 1)])
+        self.assertTrue(cancelled)
+
     @staticmethod
     async def exploding_validate_one(proto, host, port, timeout=12):
         if port == 3:
@@ -753,6 +841,45 @@ class ValidateManyTest(BotTestCase):
         with mock.patch.object(proxies, "validate_one", self.exploding_validate_one):
             working = asyncio.run(proxies.validate_many(items, limit=5))
         self.assertEqual(sorted(w[2] for w in working), [1, 2])
+
+    def test_validate_one_builds_proxy_dict(self):
+        seen = {}
+
+        async def fake_validate(proxy_dict, timeout=12):
+            seen["proxy_dict"] = proxy_dict
+            seen["timeout"] = timeout
+            return True
+
+        with mock.patch.object(proxies, "validate_one_mtproto", fake_validate):
+            result = asyncio.run(proxies.validate_one("socks5", "1.2.3.4", 1080, 7))
+        self.assertTrue(result)
+        self.assertEqual(
+            seen["proxy_dict"],
+            {"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080},
+        )
+        self.assertEqual(seen["timeout"], 7)
+
+    def test_cancel_path_runs_when_pool_exhausted(self):
+        started = []
+
+        async def slow_validate(proto, host, port, timeout=12):
+            started.append(host)
+            await asyncio.sleep(30)
+            return False
+
+        async def run():
+            items = [("socks5", f"h{i}", i) for i in range(4)]
+            task = asyncio.ensure_future(
+                proxies.validate_many(items, limit=99, concurrency=2)
+            )
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with mock.patch.object(proxies, "validate_one", slow_validate):
+            asyncio.run(run())
+        self.assertEqual(len(started), 2)
 
 
 class ValidateOneMtprotoTest(BotTestCase):
@@ -844,6 +971,138 @@ class ValidateOneMtprotoTest(BotTestCase):
         with mock.patch.object(proxies, "TelegramClient", cls):
             ok = asyncio.run(proxies.validate_one_mtproto(dict(self.PROXY_DICT)))
         self.assertTrue(ok)
+
+
+class ProxyIoTest(BotTestCase):
+    def test_cache_write_reports_failure(self):
+        target = Path(tempfile.gettempdir()) / "danybot_нет_каталога" / "cache.json"
+        self.assertFalse(proxies._cache_write(target, "данные"))
+
+    def test_save_raw_cache_and_load(self):
+        target = Path(tempfile.mkdtemp(prefix="danybot_raw_"))
+        self.addCleanup(shutil.rmtree, target, True)
+        raw = target / "proxy_cache.txt"
+        saved = proxies.RAW_CACHE_FILE
+        self.addCleanup(setattr, proxies, "RAW_CACHE_FILE", saved)
+        proxies.RAW_CACHE_FILE = raw
+        rows = [("socks5", "1.2.3.4", 1080), ("http", "5.6.7.8", 8080)]
+        proxies.save_raw_cache(rows)
+        self.assertEqual(proxies.load_raw_cache(), rows)
+
+    def test_load_raw_cache_skips_bad_lines(self):
+        target = Path(tempfile.mkdtemp(prefix="danybot_raw_"))
+        self.addCleanup(shutil.rmtree, target, True)
+        raw = target / "proxy_cache.txt"
+        saved = proxies.RAW_CACHE_FILE
+        self.addCleanup(setattr, proxies, "RAW_CACHE_FILE", saved)
+        proxies.RAW_CACHE_FILE = raw
+        raw.write_text(
+            "socks5 1.2.3.4 1080\n"
+            "\n"
+            "   \n"
+            "bad 5.6.7.8 8080\n"
+            "http 9.9.9.9 непорт\n"
+            "socks4 2.2.2.2 1081\n"
+            "http 3.3.3.3 3128 extra\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            proxies.load_raw_cache(),
+            [
+                ("socks5", "1.2.3.4", 1080),
+                ("socks4", "2.2.2.2", 1081),
+                ("http", "3.3.3.3", 3128),
+            ],
+        )
+
+    def test_load_raw_cache_handles_missing_file(self):
+        saved = proxies.RAW_CACHE_FILE
+        self.addCleanup(setattr, proxies, "RAW_CACHE_FILE", saved)
+        proxies.RAW_CACHE_FILE = Path(tempfile.gettempdir()) / "нет_такого_кэша.txt"
+        self.assertEqual(proxies.load_raw_cache(), [])
+
+    def test_fetch_sources_collects_and_skips_failures(self):
+        requested = []
+
+        class _Resp:
+            def __init__(self, text):
+                self.text = text
+
+            def raise_for_status(self):
+                return None
+
+        class _Client:
+            def __init__(self, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, url):
+                requested.append(url)
+                if "bad" in url:
+                    raise httpx.HTTPError("boom")
+                return _Resp("1.2.3.4:1080\n")
+
+        saved = proxies.SOURCES
+        self.addCleanup(setattr, proxies, "SOURCES", saved)
+        proxies.SOURCES = (
+            ("socks5", "https://good/list"),
+            ("socks4", "https://bad/list"),
+        )
+        with mock.patch.object(proxies.httpx, "AsyncClient", _Client):
+            got = asyncio.run(proxies.fetch_sources())
+        self.assertEqual(got, [("socks5", "1.2.3.4", 1080)])
+        self.assertEqual(len(requested), 2)
+
+    def test_get_working_proxy_returns_first(self):
+        async def fake(limit=10, prefer_protocol="socks5", deadline=180.0):
+            return [("socks5", "1.2.3.4", 1080)]
+
+        with mock.patch.object(proxies, "get_working_proxies", fake):
+            self.assertEqual(
+                asyncio.run(proxies.get_working_proxy()), ("socks5", "1.2.3.4", 1080)
+            )
+
+    def test_get_working_proxy_returns_none_when_empty(self):
+        async def fake(limit=10, prefer_protocol="socks5", deadline=180.0):
+            return []
+
+        with mock.patch.object(proxies, "get_working_proxies", fake):
+            self.assertIsNone(asyncio.run(proxies.get_working_proxy()))
+
+    def test_main_reports_missing_proxy(self):
+        async def fake(prefer_protocol="socks5"):
+            return None
+
+        with mock.patch.object(proxies, "get_working_proxy", fake):
+            asyncio.run(proxies.main())
+
+    def test_main_reports_found_proxy(self):
+        async def fake(prefer_protocol="socks5"):
+            return ("socks5", "1.2.3.4", 1080)
+
+        with mock.patch.object(proxies, "get_working_proxy", fake):
+            asyncio.run(proxies.main())
+
+    def test_cli_delegates_to_run_cli(self):
+        with mock.patch.object(proxies, "run_cli") as run:
+            proxies.cli()
+        run.assert_called_once_with()
+
+    def test_run_cli_configures_logging(self):
+        with (
+            mock.patch.object(proxies.logging, "basicConfig") as basic,
+            mock.patch.object(proxies, "main", mock.Mock(return_value=None)),
+            mock.patch.object(proxies.asyncio, "run") as run,
+        ):
+            proxies.run_cli()
+        basic.assert_called_once()
+        self.assertEqual(basic.call_args.kwargs["level"], logging.INFO)
+        run.assert_called_once()
 
 
 class GetWorkingProxiesTest(BotTestCase):
@@ -1601,28 +1860,31 @@ class StreamToolsTest(BotTestCase):
             )
         self.assertEqual(seen, ["evaluate"])
 
-    def test_tool_round_limit_reached(self):
+    def test_loop_has_no_round_limit(self):
         endless = [
             make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
         ]
-        self.install_ai([endless, endless])
-        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 2):
-            answer = asyncio.run(
-                userbot.stream_with_tools(
-                    [],
-                    "m",
-                    self.CHAT_ID,
-                    lambda p: self.collect([], p),
-                    lambda p: self.collect([], p),
-                )
-            )
-        self.assertEqual(
-            answer,
-            "Достигнут лимит циклов инструментов: 2. "
-            "Раундов: 3, вызовов инструментов: 2.",
+        rounds = 25
+        self.install_ai(
+            [endless] * rounds + [[make_chunk(make_delta(content="готово"))]]
         )
+        seen = []
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+                on_progress=lambda r, t, reason="": seen.append((r, t, reason)),
+            )
+        )
+        self.assertEqual(answer, "готово")
+        self.assertEqual(len(self.tool_calls_made), rounds)
+        self.assertEqual(seen[-1][:2], (rounds + 1, rounds))
+        self.assertTrue(all(not reason for _r, _t, reason in seen))
 
-    def test_repeated_call_asks_for_another_approach(self):
+    def test_repeated_call_is_executed_every_time(self):
         endless = [
             make_chunk(
                 make_delta(
@@ -1636,32 +1898,20 @@ class StreamToolsTest(BotTestCase):
                 )
             )
         ]
-        fake_ai = self.install_ai([endless] * 5)
-        with (
-            mock.patch.object(userbot, "MAX_TOOL_REPEATS", 2),
-            mock.patch.object(userbot, "MAX_TOOL_STUCK", 99),
-            mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 4),
-        ):
-            answer = asyncio.run(
-                userbot.stream_with_tools(
-                    [],
-                    "m",
-                    self.CHAT_ID,
-                    lambda p: self.collect([], p),
-                    lambda p: self.collect([], p),
-                )
+        self.install_ai([endless] * 4 + [[make_chunk(make_delta(content="стоп"))]])
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
             )
-        self.assertIn("лимит циклов", answer)
-        self.assertEqual(len(self.tool_calls_made), 2)
-        hints = [
-            m["content"]
-            for call in fake_ai.chat.completions.calls
-            for m in call["messages"]
-            if m.get("role") == "tool" and "Измени подход" in m["content"]
-        ]
-        self.assertTrue(hints)
+        )
+        self.assertEqual(answer, "стоп")
+        self.assertEqual(len(self.tool_calls_made), 4)
 
-    def test_denied_calls_stop_the_loop(self):
+    def test_denied_call_is_reported_and_loop_continues(self):
         endless = [
             make_chunk(
                 make_delta(
@@ -1675,15 +1925,14 @@ class StreamToolsTest(BotTestCase):
                 )
             )
         ]
-        self.install_ai([endless] * 10)
+        fake_ai = self.install_ai(
+            [endless] * 3 + [[make_chunk(make_delta(content="ок"))]]
+        )
 
         async def deny(name, args, model, unrestricted=False):
             return False
 
-        with (
-            mock.patch.object(userbot, "verify_tool_call", deny),
-            mock.patch.object(userbot, "MAX_TOOL_STUCK", 2),
-        ):
+        with mock.patch.object(userbot, "verify_tool_call", deny):
             answer = asyncio.run(
                 userbot.stream_with_tools(
                     [],
@@ -1694,9 +1943,15 @@ class StreamToolsTest(BotTestCase):
                     verify_tools=True,
                 )
             )
-        self.assertIn("не продвинулся", answer)
-        self.assertIn("отказ проверки безопасности", answer)
+        self.assertEqual(answer, "ок")
         self.assertEqual(self.tool_calls_made, [])
+        final = fake_ai.chat.completions.calls[-1]["messages"]
+        denials = [
+            m["content"]
+            for m in final
+            if m.get("role") == "tool" and "отклонён" in m["content"]
+        ]
+        self.assertEqual(len(denials), 3)
 
     def test_failing_tool_is_reported_without_stopping_immediately(self):
         endless = [
@@ -1721,30 +1976,27 @@ class StreamToolsTest(BotTestCase):
         )
         self.assertEqual(answer, "всё")
 
-    def test_progress_callback_reports_counters_and_reason(self):
+    def test_progress_callback_reports_counters(self):
         endless = [
             make_chunk(make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")]))
         ]
-        self.install_ai([endless] * 5)
+        self.install_ai([endless] * 3 + [[make_chunk(make_delta(content="ок"))]])
         seen = []
-        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 2):
-            answer = asyncio.run(
-                userbot.stream_with_tools(
-                    [],
-                    "m",
-                    self.CHAT_ID,
-                    lambda p: self.collect([], p),
-                    lambda p: self.collect([], p),
-                    on_progress=lambda rounds, tools, reason="": seen.append(
-                        (rounds, tools, reason)
-                    ),
-                )
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+                on_progress=lambda rounds, tools, reason="": seen.append(
+                    (rounds, tools, reason)
+                ),
             )
-        self.assertIn("лимит циклов", answer)
+        )
+        self.assertEqual(answer, "ок")
         self.assertEqual(seen[0], (1, 1, ""))
-        self.assertEqual(seen[-1][0], 3)
-        self.assertEqual(seen[-1][1], 2)
-        self.assertIn("лимит циклов", seen[-1][2])
+        self.assertEqual(seen[-1][:2], (4, 3))
 
     def test_progress_callback_failure_is_ignored(self):
         def boom(_rounds, _tools, _reason=""):
@@ -1764,19 +2016,19 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(answer, "ок")
         self.assertTrue(fake_ai.chat.completions.calls)
 
-    def test_loop_stop_reason_rules(self):
-        now = time.monotonic()
-        with mock.patch.object(userbot, "MAX_TOOL_SECONDS", 10):
-            self.assertIn("времени", userbot._loop_stop_reason(1, now - 11, 0, ""))
-        with mock.patch.object(userbot, "MAX_TOOL_ROUNDS", 3):
-            self.assertIn("циклов", userbot._loop_stop_reason(4, now, 0, ""))
-        with mock.patch.object(userbot, "MAX_TOOL_STUCK", 2):
-            stop = userbot._loop_stop_reason(1, now, 2, "отказ проверки безопасности")
-        self.assertIn("не продвинулся", stop)
-        self.assertIn("отказ проверки безопасности", stop)
-        self.assertEqual(userbot._loop_stop_reason(1, now, 0, ""), "")
-        self.assertEqual(userbot._finish_loop([], "стоп"), "стоп")
-        self.assertEqual(userbot._finish_loop(["часть"], "стоп"), "часть\n\nстоп")
+    def test_loop_budget_knobs_are_gone(self):
+        for name in (
+            "MAX_TOOL_ROUNDS",
+            "MAX_TOOL_SECONDS",
+            "MAX_TOOL_STUCK",
+            "MAX_TOOL_REPEATS",
+            "MAX_TOOL_CALLS_PER_ROUND",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(userbot, name))
+        for name in ("_loop_stop_reason", "_finish_loop"):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(userbot, name))
 
     def test_unrestricted_request_skips_verification(self):
         self.install_ai(
@@ -1878,6 +2130,103 @@ class StreamToolsTest(BotTestCase):
             )
         streams = fake_ai.chat.completions.streams
         self.assertTrue(all(s.closed >= 1 for s in streams))
+
+    def test_chunk_without_choices_is_skipped(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    SimpleNamespace(choices=[]),
+                    make_chunk(make_delta(content="ок")),
+                ]
+            ]
+        )
+        deltas = []
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect(deltas, p),
+                lambda p: self.collect([], p),
+            )
+        )
+        self.assertEqual(answer, "ок")
+        self.assertEqual(deltas, ["ок"])
+        self.assertTrue(all(s.closed >= 1 for s in fake_ai.chat.completions.streams))
+
+    def test_shell_output_is_passed_through_sanitizer(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(
+                                    tc_id="c1",
+                                    name="run_shell",
+                                    arguments='{"command": "echo hi"}',
+                                )
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="готово"))],
+            ]
+        )
+        seen = []
+
+        async def sanitize(output, model, unrestricted=False):
+            seen.append((output, model))
+            return "чистый вывод"
+
+        with mock.patch.object(userbot, "sanitize_tool_output", sanitize):
+            answer = asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                )
+            )
+        self.assertEqual(answer, "готово")
+        self.assertEqual(seen, [("TOOLOK", "m")])
+        second = fake_ai.chat.completions.calls[1]["messages"]
+        tool_msgs = [m for m in second if m.get("role") == "tool"]
+        self.assertEqual(tool_msgs[0]["content"], "чистый вывод")
+
+    def test_cancelled_tool_call_is_reraised(self):
+        self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(tc_id="c1", name="evaluate", arguments="{}")
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="не дойдёт"))],
+            ]
+        )
+
+        async def boom(name, args, chat_id, *rest, **kwargs):
+            raise asyncio.CancelledError
+
+        saved = userbot.execute_tool
+        userbot.execute_tool = boom
+        self.addCleanup(setattr, userbot, "execute_tool", saved)
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(
+                userbot.stream_with_tools(
+                    [],
+                    "m",
+                    self.CHAT_ID,
+                    lambda p: self.collect([], p),
+                    lambda p: self.collect([], p),
+                )
+            )
 
 
 class LastDecisionTest(BotTestCase):
@@ -2453,6 +2802,650 @@ class ExtraToolsTest(BotTestCase):
         )
         self.assertIn("C" * 100, out)
         self.assertIn("Таймаут 1s", out)
+
+    def test_web_search_reports_http_status_label(self):
+        class _RateLimited:
+            def stream(self, _method, _url, **_kwargs):
+                request = httpx.Request("GET", "https://search.test/")
+                response = httpx.Response(429, request=request)
+                raise httpx.HTTPStatusError("rate", request=request, response=response)
+
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _RateLimited()
+        ):
+            out = self._run("web_search", {"query": "x"})
+        self.assertIn("Ошибка поиска", out)
+        self.assertIn("HTTP 429", out)
+
+    def test_web_search_applies_result_limit(self):
+        html = (
+            '<a class="result__a" href="https://one.test/">One</a>'
+            '<a class="result__a" href="https://two.test/">Two</a>'
+        )
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)
+        ):
+            out = self._run("web_search", {"query": "x", "limit": 1})
+        self.assertIn("One", out)
+        self.assertNotIn("Two", out)
+
+    def test_web_search_clamps_limit_range(self):
+        html = '<a class="result__a" href="https://one.test/">One</a>'
+        with mock.patch.object(
+            tools_module, "_get_httpx_client", lambda: _FakeHttpx(html)
+        ):
+            self.assertIn("One", self._run("web_search", {"query": "x", "limit": 99}))
+            self.assertIn(
+                "One", self._run("web_search", {"query": "x", "limit": "junk"})
+            )
+
+    def test_fetch_url_reports_download_error(self):
+        class _Broken:
+            def stream(self, _method, _url, **_kwargs):
+                raise httpx.ConnectError("down")
+
+        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _Broken()):
+            out = self._run("fetch_url", {"url": "https://93.184.216.34/"})
+        self.assertIn("Ошибка загрузки", out)
+        self.assertIn("down", out)
+
+    def test_fetch_url_stops_after_redirect_budget(self):
+        class _Looping:
+            def stream(self, _method, _url, **_kwargs):
+                return _FakeStream(
+                    _FakeResp("", 302, location="https://93.184.216.34/next")
+                )
+
+        async def allowed(_url):
+            return ""
+
+        with (
+            mock.patch.object(tools_module, "_get_httpx_client", lambda: _Looping()),
+            mock.patch.object(tools_module, "_check_public_url", allowed),
+        ):
+            out = self._run("fetch_url", {"url": "https://93.184.216.34/"})
+        self.assertIn("Слишком много перенаправлений", out)
+
+    def test_fetch_url_reports_total_timeout(self):
+        class _Scope:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                raise TimeoutError
+
+        class _AsyncioProxy:
+            def __init__(self, timeout):
+                self.timeout = timeout
+
+            def __getattr__(self, name):
+                return getattr(asyncio, name)
+
+        delays = []
+
+        def fake_timeout(delay):
+            delays.append(delay)
+            return _Scope()
+
+        proxy = _AsyncioProxy(fake_timeout)
+        with mock.patch.object(tools_module, "asyncio", proxy):
+            out = self._run("fetch_url", {"url": "https://93.184.216.34/"})
+        self.assertEqual(delays, [tools_module.FETCH_TIMEOUT + 5])
+        self.assertIn("Таймаут", out)
+
+    def test_get_entity_tools_report_telethon_errors(self):
+        class _Failing:
+            async def get_entity(self, _key):
+                raise RPCError(request=None, message="chat not found")
+
+            async def get_me(self):
+                raise RPCError(request=None, message="account not found")
+
+        client = _Failing()
+        self.assertIn(
+            "Ошибка получения чата",
+            asyncio.run(tools_module.execute_tool("get_chat_info", {}, 1, client)),
+        )
+        self.assertIn(
+            "Ошибка получения пользователя",
+            asyncio.run(
+                tools_module.execute_tool("get_user_info", {"handle": "u"}, 1, client)
+            ),
+        )
+        self.assertIn(
+            "Ошибка получения профиля",
+            asyncio.run(tools_module.execute_tool("get_profile", {}, 1, client)),
+        )
+
+    def test_run_shell_reports_launch_failure(self):
+        async def broken(*_args, **_kwargs):
+            raise OSError("нет оболочки")
+
+        saved = asyncio.create_subprocess_shell
+        self.addCleanup(setattr, asyncio, "create_subprocess_shell", saved)
+        asyncio.create_subprocess_shell = broken
+        out = _owner_tool("run_shell", {"command": "echo x"}, 1)
+        self.assertIn("Ошибка запуска", out)
+        self.assertIn("нет оболочки", out)
+
+    def test_run_shell_rejects_missing_workdir(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_wd_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "a.txt").write_text("x", encoding="utf-8")
+        saved_root = tools_module.CODER_ROOT
+        self.addCleanup(setattr, tools_module, "CODER_ROOT", saved_root)
+        tools_module.CODER_ROOT = tmp
+        out = _owner_tool("run_shell", {"command": "cd", "cwd": "a.txt"}, 1)
+        self.assertIn("Каталог не найден", out)
+
+    def test_execute_script_rejects_oversized_code(self):
+        saved = tools_module.MAX_SCRIPT_BYTES
+        self.addCleanup(setattr, tools_module, "MAX_SCRIPT_BYTES", saved)
+        tools_module.MAX_SCRIPT_BYTES = 4
+        out = _owner_tool("execute_script", {"code": "print(1)"}, 1)
+        self.assertIn("Слишком большой объём", out)
+
+    def test_run_subagent_requires_task(self):
+        for attr, value in (
+            ("run_subagents", None),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        out = _owner_tool("run_subagent", {}, 1)
+        self.assertEqual(out, "Нужна задача: task или tasks.")
+
+    def test_run_subagent_passes_numeric_options(self):
+        seen = {}
+
+        async def fake_run(tasks, **kwargs):
+            seen.update(kwargs)
+            seen["tasks"] = tasks
+            return []
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        _owner_tool(
+            "run_subagent", {"tasks": ["a", "b"], "concurrency": 3, "tools": 5}, 1
+        )
+        self.assertEqual(seen["tasks"], ["a", "b"])
+        self.assertEqual(seen["concurrency"], 3)
+        self.assertIsNone(seen["tool_names"])
+        self.assertIsNone(seen["max_rounds"])
+        self.assertFalse(seen["verify"])
+        with mock.patch.object(tools_module, "OWNER_ONLY_TOOLS", frozenset()):
+            asyncio.run(tools_module.execute_tool("run_subagent", {"task": "a"}, 1))
+        self.assertTrue(seen["verify"])
+
+
+class ToolsInternalsTest(BotTestCase):
+    RESULT_CASES = (("5-2", "3"), ("5/2", "2.5"))
+    ERROR_CASES = (
+        ("1 << 2", "Недопустимый оператор"),
+        ("~5", "Недопустимый унарный оператор"),
+        ("1 < 2", "Недопустимая конструкция"),
+        ("(1).real", "Недопустимая конструкция"),
+        ("pow(10**41, 1000)", "Слишком большое число"),
+        ("max(" + "1," * 6000 + "1)", "Слишком сложное выражение"),
+    )
+
+    def test_safe_eval_arithmetic_paths(self):
+        for expression, expected in self.RESULT_CASES:
+            with self.subTest(expression=expression):
+                self.assertEqual(tools_module.safe_eval(expression), expected)
+
+    def test_safe_eval_rejects_unsupported_constructs(self):
+        for expression, expected in self.ERROR_CASES:
+            with self.subTest(expression=expression[:24]):
+                self.assertIn(expected, tools_module.safe_eval(expression))
+
+    def test_int_arg_clamps_and_falls_back(self):
+        for arguments, expected in (
+            ({"t": "junk"}, 30),
+            ({"t": None}, 30),
+            ({}, 30),
+            ({"t": "7"}, 7),
+            ({"t": 5000}, 300),
+            ({"t": -5}, 1),
+        ):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(
+                    tools_module._int_arg(arguments, "t", 30, 1, 300), expected
+                )
+
+    def test_opt_int_arg_keeps_absent_value(self):
+        self.assertIsNone(tools_module._opt_int_arg({}, "concurrency", 1, 16))
+        self.assertIsNone(
+            tools_module._opt_int_arg({"concurrency": None}, "concurrency", 1, 16)
+        )
+        self.assertEqual(
+            tools_module._opt_int_arg({"concurrency": "3"}, "concurrency", 1, 16), 3
+        )
+        self.assertEqual(
+            tools_module._opt_int_arg({"concurrency": 99}, "concurrency", 1, 16), 16
+        )
+
+    def test_too_big_ignores_unreadable_path(self):
+        missing = Path(tempfile.gettempdir()) / "нет.такого.py"
+        self.assertEqual(tools_module._too_big(missing), "")
+
+    def test_resolve_path_reports_unresolvable_target(self):
+        real = Path.resolve
+        seen = []
+
+        def flaky(self, *args, **kwargs):
+            seen.append(self.name)
+            if len(seen) > 1:
+                raise OSError("битая ссылка")
+            return real(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", flaky):
+            path, err = tools_module._resolve_path("куда-то")
+        self.assertIsNone(path)
+        self.assertIn("Не удалось разрешить путь", err)
+
+    def test_render_response_hard_truncates_huge_tool_list(self):
+        names = [f"tool_{index}" for index in range(1000)]
+        text = tools_module.render_response("п" * 800, ["р" * 3000], names, "")
+        self.assertEqual(len(text), tools_module.MAX_RENDER_CHARS)
+        self.assertTrue(text.endswith("…"))
+
+    def test_output_sink_ignores_chunks_after_truncation(self):
+        sink = tools_module._OutputSink(4)
+        sink.feed(b"abcde")
+        sink.feed(b"fgh")
+        self.assertEqual(sink.size, 4)
+        self.assertEqual(sink.text(), "abcd")
+
+    def test_spawn_kwargs_depends_on_platform(self):
+        self.assertEqual(tools_module._spawn_kwargs(), {})
+        fake_os = SimpleNamespace(name="posix")
+        with mock.patch.object(tools_module, "os", fake_os):
+            self.assertEqual(tools_module._spawn_kwargs(), {"start_new_session": True})
+
+    def test_kill_process_now_skips_finished_process(self):
+        killed = []
+        proc = SimpleNamespace(returncode=0, pid=11, kill=lambda: killed.append(1))
+        tools_module._kill_process_now(proc)
+        self.assertEqual(killed, [])
+
+    def test_kill_process_now_uses_group_kill_on_posix(self):
+        signals = []
+        killed = []
+        proc = SimpleNamespace(
+            returncode=None,
+            pid=4242,
+            kill=lambda: killed.append("proc"),
+        )
+        fake_os = SimpleNamespace(
+            name="posix", kill=lambda pid, sig: signals.append((pid, sig))
+        )
+        with mock.patch.object(tools_module, "os", fake_os):
+            tools_module._kill_process_now(proc)
+        self.assertEqual(signals, [(-4242, getattr(signal, "SIGKILL", 9))])
+        self.assertEqual(killed, ["proc"])
+
+    def test_close_pipes_handles_missing_transport(self):
+        tools_module._close_pipes(SimpleNamespace())
+        closed = []
+        proc = SimpleNamespace(
+            _transport=SimpleNamespace(close=lambda: closed.append(1))
+        )
+        tools_module._close_pipes(proc)
+        self.assertEqual(closed, [1])
+
+    def test_close_pipes_swallows_transport_failure(self):
+        def boom():
+            raise RuntimeError("уже закрыт")
+
+        tools_module._close_pipes(
+            SimpleNamespace(_transport=SimpleNamespace(close=boom))
+        )
+
+    def test_collect_process_reports_hanging_process(self):
+        class _Reader:
+            def __init__(self, chunks):
+                self.chunks = list(chunks)
+
+            async def read(self, _size):
+                return self.chunks.pop(0) if self.chunks else b""
+
+        class _Proc:
+            def __init__(self):
+                self.pid = 424242
+                self.returncode = None
+                self.stdout = _Reader(["часть".encode()])
+                self.stderr = _Reader([])
+                self.killed = False
+
+            async def wait(self):
+                return None
+
+            def kill(self):
+                self.killed = True
+
+        proc = _Proc()
+        fake_os = SimpleNamespace(name="posix", kill=lambda *_args: None)
+        with mock.patch.object(tools_module, "os", fake_os):
+            rc, out, err, note = asyncio.run(
+                tools_module._collect_process(proc, 5, tools_module.MAX_PROCESS_BYTES)
+            )
+        self.assertEqual(rc, -1)
+        self.assertEqual(out, "часть")
+        self.assertEqual(err, "")
+        self.assertIn("Процесс не завершился", note)
+        self.assertTrue(proc.killed)
+
+    def test_exit_code_falls_back_to_minus_one(self):
+        self.assertEqual(tools_module._exit_code(SimpleNamespace(returncode=None)), -1)
+        self.assertEqual(tools_module._exit_code(SimpleNamespace(returncode=3)), 3)
+
+    def test_format_process_result_appends_stderr(self):
+        self.assertEqual(
+            tools_module._format_process_result(0, "вывод", ""), "rc=0\nstdout:\nвывод"
+        )
+        self.assertIn(
+            "stderr:\nошибка", tools_module._format_process_result(1, "", "ошибка")
+        )
+
+    def test_read_capped_marks_truncation_on_exact_cap(self):
+        class _Resp:
+            async def aiter_bytes(self):
+                for chunk in (b"ab", b"cd", b"ef"):
+                    yield chunk
+
+        body, cut = asyncio.run(tools_module._read_capped(_Resp(), 4))
+        self.assertEqual(body, b"abcd")
+        self.assertTrue(cut)
+
+    def test_is_public_addr_rejects_garbage(self):
+        self.assertFalse(tools_module._is_public_addr("не адрес"))
+        self.assertTrue(tools_module._is_public_addr("8.8.8.8"))
+        self.assertFalse(tools_module._is_public_addr("192.168.0.1"))
+
+    def test_check_public_url_reports_missing_host(self):
+        out = asyncio.run(tools_module._check_public_url("http:///страница"))
+        self.assertIn("URL без хоста", out)
+
+    def test_check_public_url_reports_dns_failure(self):
+        async def failing(_host, _port):
+            raise OSError("dns недоступен")
+
+        with mock.patch.object(tools_module, "_resolve_addrs", failing):
+            out = asyncio.run(tools_module._check_public_url("https://host.test/"))
+        self.assertIn("Не удалось разрешить хост host.test", out)
+
+    def test_check_public_url_reports_empty_dns_answer(self):
+        async def empty(_host, _port):
+            return []
+
+        with mock.patch.object(tools_module, "_resolve_addrs", empty):
+            out = asyncio.run(tools_module._check_public_url("https://host.test/"))
+        self.assertIn("Не удалось разрешить хост host.test.", out)
+
+    def test_check_public_url_rejects_blocked_scheme(self):
+        out = asyncio.run(tools_module._check_public_url("file:///etc/passwd"))
+        self.assertIn("Схема заблокирована", out)
+
+    def test_error_label_prefers_http_status(self):
+        request = httpx.Request("GET", "https://search.test/")
+        response = httpx.Response(429, request=request)
+        exc = httpx.HTTPStatusError("rate", request=request, response=response)
+        self.assertEqual(tools_module._error_label(exc), "HTTP 429")
+        self.assertEqual(tools_module._error_label(OSError("down")), "OSError")
+
+    def test_strip_tags_unescapes_entities(self):
+        self.assertEqual(
+            tools_module._strip_tags("<b>жирный &amp; текст</b>"), "жирный & текст"
+        )
+
+    def test_parse_brave_skips_blocks_without_link(self):
+        raw = '<div class="snippet svelte-a" data-type="web"><span>нет ссылки</span></div>'
+        self.assertEqual(tools_module._parse_brave(raw, 5), [])
+
+    def test_parse_brave_honours_limit(self):
+        raw = (
+            '<div class="snippet a" data-type="web"><a href="https://one.test/">'
+            '<div class="title t">Раз</div></a></div>'
+            '<div class="snippet b" data-type="web"><a href="https://two.test/">'
+            '<div class="title t">Два</div></a></div>'
+        )
+        self.assertEqual(tools_module._parse_brave(raw, 1), ["Раз\nhttps://one.test/"])
+        self.assertEqual(len(tools_module._parse_brave(raw, 5)), 2)
+
+    def test_parse_brave_skips_blocks_without_title(self):
+        raw = (
+            '<div class="snippet a" data-type="web">'
+            '<a href="https://one.test/">без заголовка</a></div>'
+        )
+        self.assertEqual(tools_module._parse_brave(raw, 5), ["https://one.test/"])
+
+    def test_parse_ddg_unescapes_redirect_and_limits(self):
+        raw = (
+            '<a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fex.test%2Fa">'
+            "Первый &amp; итог</a>"
+            '<a class="result__a" href="https://two.test/b">Второй</a>'
+        )
+        first = "Первый & итог\nhttps://ex.test/a"
+        self.assertEqual(
+            tools_module._parse_ddg(raw, 5), [first, "Второй\nhttps://two.test/b"]
+        )
+        self.assertEqual(tools_module._parse_ddg(raw, 1), [first])
+
+    def test_parse_ddg_keeps_plain_href(self):
+        raw = '<a class="result__a" href="https://plain.test/x">Ровный</a>'
+        self.assertEqual(
+            tools_module._parse_ddg(raw, 5), ["Ровный\nhttps://plain.test/x"]
+        )
+
+    def test_tool_name_list_filters_bad_types(self):
+        self.assertIsNone(tools_module._tool_name_list(None))
+        self.assertIsNone(tools_module._tool_name_list(5))
+        self.assertIsNone(tools_module._tool_name_list(["  ", ""]))
+        self.assertEqual(tools_module._tool_name_list(("a", " b ")), ["a", "b"])
+        self.assertEqual(tools_module._tool_name_list("get_time"), ["get_time"])
+
+    def test_subagent_report_fills_defaults(self):
+        report = json.loads(tools_module._subagent_report([{}]))
+        self.assertEqual(report[0]["name"], "universal")
+        self.assertEqual(report[0]["task"], "")
+        self.assertFalse(report[0]["ok"])
+        self.assertEqual(report[0]["rounds"], 0)
+        self.assertEqual(report[0]["tools_used"], [])
+        self.assertEqual(report[0]["result"], "")
+
+    def test_is_safe_glob_rejects_escapes(self):
+        for pattern in ("/etc/*", "\\windows\\*", "~/x", "C:/x", "../x", "a/../../b"):
+            with self.subTest(glob=pattern):
+                self.assertFalse(tools_module._is_safe_glob(pattern))
+        self.assertTrue(tools_module._is_safe_glob("*.py"))
+        self.assertTrue(tools_module._is_safe_glob("sub/*.py"))
+
+    def test_httpx_singleton_lifecycle_across_loops(self):
+        saved = tools_module._httpx_singleton
+        saved_loop = tools_module._httpx_loop
+        self.addCleanup(setattr, tools_module, "_httpx_singleton", saved)
+        self.addCleanup(setattr, tools_module, "_httpx_loop", saved_loop)
+        tools_module._httpx_singleton = None
+        tools_module._httpx_loop = None
+
+        outside = tools_module._get_httpx_client()
+        self.assertIsNone(tools_module._httpx_loop)
+        self.addCleanup(asyncio.run, outside.aclose())
+
+        async def scenario():
+            first = tools_module._get_httpx_client()
+            second = tools_module._get_httpx_client()
+            self.assertIs(first, second)
+            await tools_module.close_httpx_client()
+            return first
+
+        inside = asyncio.run(scenario())
+        self.assertIsNot(inside, outside)
+        self.assertIsNone(tools_module._httpx_singleton)
+        asyncio.run(inside.aclose())
+        asyncio.run(tools_module.close_httpx_client())
+
+    def test_httpx_stale_client_is_closed_on_old_loop(self):
+        class _Task:
+            def __init__(self):
+                self.callbacks = []
+
+            def add_done_callback(self, callback):
+                self.callbacks.append(callback)
+
+        class _OldLoop:
+            def __init__(self):
+                self.tasks = []
+
+            def is_running(self):
+                return True
+
+            def create_task(self, coro):
+                coro.close()
+                task = _Task()
+                self.tasks.append(task)
+                return task
+
+        class _FakeClient:
+            is_closed = False
+
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        saved = tools_module._httpx_singleton
+        saved_loop = tools_module._httpx_loop
+        self.addCleanup(setattr, tools_module, "_httpx_singleton", saved)
+        self.addCleanup(setattr, tools_module, "_httpx_loop", saved_loop)
+        stale = _FakeClient()
+        old_loop = _OldLoop()
+        tools_module._httpx_singleton = stale
+        tools_module._httpx_loop = old_loop
+
+        fresh = _FakeClient()
+
+        async def scenario():
+            return tools_module._get_httpx_client()
+
+        with mock.patch.object(tools_module, "_build_httpx_client", lambda: fresh):
+            result = asyncio.run(scenario())
+        self.assertIs(result, fresh)
+        self.assertFalse(stale.closed)
+        self.assertEqual(len(old_loop.tasks), 1)
+        pending = old_loop.tasks[0]
+        self.addCleanup(tools_module._httpx_closing.discard, pending)
+        self.assertIn(pending, tools_module._httpx_closing)
+        pending.callbacks[0](pending)
+        self.assertNotIn(pending, tools_module._httpx_closing)
+
+    def test_scan_files_stops_when_event_is_set(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanstop_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "a.txt").write_text("игла", encoding="utf-8")
+        stop = threading.Event()
+        stop.set()
+        matches, note = tools_module._scan_files(tmp, "*", re.compile("игла"), 10, stop)
+        self.assertEqual(matches, [])
+        self.assertEqual(note, "остановлено по таймауту")
+
+    def test_scan_files_stops_on_file_budget(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanbudget_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in ("a.txt", "b.txt"):
+            (tmp / name).write_text("игла", encoding="utf-8")
+        saved = tools_module.MAX_SEARCH_FILES
+        self.addCleanup(setattr, tools_module, "MAX_SEARCH_FILES", saved)
+        tools_module.MAX_SEARCH_FILES = 1
+        matches, note = tools_module._scan_files(
+            tmp, "*", re.compile("игла"), 10, threading.Event()
+        )
+        self.assertEqual(len(matches), 1)
+        self.assertIn("просмотрено не больше 1 файлов", note)
+
+    def test_scan_files_skips_unresolvable_entries(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanres_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        for name in ("a.txt", "b.txt"):
+            (tmp / name).write_text("игла", encoding="utf-8")
+        real = Path.resolve
+
+        def flaky(self, *args, **kwargs):
+            if self.name == "b.txt":
+                raise OSError("битая ссылка")
+            return real(self, *args, **kwargs)
+
+        with mock.patch.object(Path, "resolve", flaky):
+            matches, note = tools_module._scan_files(
+                tmp, "*", re.compile("игла"), 10, threading.Event()
+            )
+        self.assertEqual(len(matches), 1)
+        self.assertIn("a.txt", matches[0])
+        self.assertEqual(note, "")
+
+    def test_scan_files_skips_unreadable_entries(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanread_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "a.txt").write_text("игла", encoding="utf-8")
+        with mock.patch.object(Path, "read_text", side_effect=ValueError("мусор")):
+            matches, note = tools_module._scan_files(
+                tmp, "*", re.compile("игла"), 10, threading.Event()
+            )
+        self.assertEqual(matches, [])
+        self.assertEqual(note, "")
+
+    def test_scan_files_stops_inside_long_file(self):
+        class _CountingStop:
+            def __init__(self):
+                self.calls = 0
+
+            def is_set(self):
+                self.calls += 1
+                return self.calls > 1
+
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanline_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "long.txt").write_text("строка\n" * 400, encoding="utf-8")
+        stop = _CountingStop()
+        matches, note = tools_module._scan_files(
+            tmp, "*", re.compile("иной текст"), 10000, stop
+        )
+        self.assertEqual(matches, [])
+        self.assertEqual(note, "остановлено по таймауту")
+        self.assertEqual(stop.calls, 2)
+
+    def test_scan_files_searches_single_file_root(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_scanone_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "a.txt"
+        target.write_text("игла\nигла", encoding="utf-8")
+        matches, note = tools_module._scan_files(
+            target, "*", re.compile("игла"), 10, threading.Event()
+        )
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(note, "")
+
+    def test_list_entries_sorts_files_after_directories(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_entries_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        (tmp / "z.txt").write_text("x", encoding="utf-8")
+        (tmp / "a_dir").mkdir()
+        (tmp / "b.txt").write_text("x", encoding="utf-8")
+        entries, total = tools_module._list_entries(tmp)
+        self.assertEqual(total, 3)
+        self.assertEqual([entry.name for entry in entries], ["a_dir", "b.txt", "z.txt"])
+
+    def test_list_entries_handles_missing_directory(self):
+        with self.assertRaises(OSError):
+            tools_module._list_entries(Path(tempfile.gettempdir()) / "нет.каталога")
 
 
 class CoreHelpersTest(BotTestCase):
@@ -3031,6 +4024,315 @@ class CoreHelpersTest(BotTestCase):
         self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o600)
         self.assertEqual([p.name for p in tmp.iterdir()], ["state.json"])
 
+    def test_async_saver_logs_write_failure(self):
+        def writer():
+            raise OSError("no space")
+
+        saver = core.AsyncSaver(writer, delay=0.01, logger=userbot.logger)
+
+        async def run():
+            saver.mark_dirty()
+            await asyncio.sleep(0.05)
+            await saver.flush()
+
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            asyncio.run(run())
+        self.assertTrue(captured.output)
+        self.assertTrue(saver._dirty)
+
+    def test_async_saver_cancelled_while_waiting_for_delay(self):
+        calls = []
+        saver = core.AsyncSaver(lambda: calls.append(1), delay=5)
+
+        async def run():
+            saver.mark_dirty()
+            await asyncio.sleep(0)
+            task = cast(Any, saver._task)
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        asyncio.run(run())
+        self.assertEqual(calls, [])
+
+    def test_async_saver_flush_cancels_stuck_write_task(self):
+        calls = []
+
+        async def write():
+            calls.append(1)
+            if len(calls) == 1:
+                await asyncio.sleep(5)
+            return True
+
+        saver = core.AsyncSaver(lambda: True, delay=-9.7)
+        saver._write = write
+
+        async def run():
+            saver.mark_dirty()
+            await asyncio.sleep(0.02)
+            await saver.flush()
+
+        asyncio.run(run())
+        self.assertEqual(calls, [1, 1])
+        self.assertFalse(saver._dirty)
+
+    def test_mode_store_rejects_unknown_attribute(self):
+        store = core.ModeStore({})
+        with self.assertRaises(AttributeError):
+            _ = store.not_a_mode_key
+        self.assertFalse(hasattr(store, "not_a_mode_key"))
+
+    def test_save_state_from_reports_write_failure(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_statefail_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "state.json"
+        target.mkdir()
+        store = _StoreStub()
+        with self.assertLogs("danybot", level="WARNING"):
+            saved = core.save_state_from(store, target, userbot.logger)
+        self.assertFalse(saved)
+
+    def test_save_history_from_reports_write_failure(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_histfail_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "history.json"
+        target.mkdir()
+        store = _StoreStub()
+        with self.assertLogs("danybot", level="WARNING"):
+            saved = core.save_history_from(store, target, userbot.logger)
+        self.assertFalse(saved)
+
+    def test_edit_text_skips_empty_text(self):
+        client = RichFakeClient()
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            ok = asyncio.run(core.edit_text(client, 1, 2, "   ", 2, userbot.logger))
+        self.assertFalse(ok)
+        self.assertEqual(client.edited, [])
+        self.assertIn("пустой текст", captured.output[0])
+
+    def test_edit_text_logs_flood_retries(self):
+        client = FlakyEditClient()
+        client.always_flood = True
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            ok = asyncio.run(core.edit_text(client, 1, 2, "текст", 2, userbot.logger))
+        self.assertFalse(ok)
+        self.assertEqual(client.attempts, 2)
+        self.assertTrue(any("флуд-лимит" in line for line in captured.output))
+        self.assertTrue(any("попыток" in line for line in captured.output))
+
+    def test_edit_text_logs_error(self):
+        class _Boom:
+            async def edit_message(self, chat, msg_id, text, **kwargs):
+                raise OSError("telegram down")
+
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            ok = asyncio.run(core.edit_text(_Boom(), 1, 2, "текст", 2, userbot.logger))
+        self.assertFalse(ok)
+        self.assertIn("OSError", captured.output[0])
+
+    def test_check_cooldown_cleans_stale_activity(self):
+        activity = {1: 0.0, 2: 99.5}
+        blocked = core.check_cooldown(
+            3, 100.0, 5.0, activity, cleanup_threshold=1, cleanup_age=2
+        )
+        self.assertFalse(blocked)
+        self.assertNotIn(1, activity)
+        self.assertIn(2, activity)
+        self.assertIn(3, activity)
+
+    def test_append_message_context_skips_duplicate_key(self):
+        store = _StoreStub()
+        labels = []
+        saved = []
+
+        async def label():
+            labels.append(1)
+            return "Tester"
+
+        def save():
+            saved.append(1)
+
+        async def run():
+            for _attempt in range(2):
+                await core.append_message_context(
+                    store,
+                    1,
+                    5,
+                    True,
+                    "привет",
+                    False,
+                    True,
+                    lambda text, triggered: text.strip(),
+                    lambda text: text,
+                    label,
+                    10,
+                    10,
+                    save,
+                )
+
+        asyncio.run(run())
+        self.assertEqual(labels, [1])
+        self.assertEqual(saved, [1])
+        self.assertEqual(len(store.chat_history[1]), 1)
+
+    def test_trim_tool_history_moves_cut_past_tool_block(self):
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "s"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "tool", "content": "r0"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "tool", "content": "r1"},
+            {"role": "tool", "content": "r2"},
+        ]
+        trimmed = core.trim_tool_history(messages, 5)
+        self.assertEqual(
+            [item["role"] for item in trimmed],
+            ["system", "tool", "assistant", "tool", "tool"],
+        )
+
+    def test_trim_tool_history_keeps_all_when_cut_is_empty(self):
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": "s"},
+            {"role": "user", "content": "u"},
+            {"role": "user", "content": "v"},
+        ]
+        self.assertIs(core.trim_tool_history(messages, 2, head_size=2), messages)
+
+    def test_stream_answer_sends_new_message_when_edit_fails(self):
+        store = _StoreStub()
+        sent = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            return False
+
+        async def reply_fn(event, text):
+            sent.append(text)
+            return SimpleNamespace(id=4321)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def stream_fn(*_args, **_kwargs):
+            return "итог"
+
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            answer = asyncio.run(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                    logger=userbot.logger,
+                )
+            )
+        self.assertEqual(answer, "итог")
+        self.assertEqual(sent, ["…", "итог"])
+        self.assertIn("новым сообщением", captured.output[0])
+        self.assertNotIn((1, 4321), store.recent_reply_ids)
+
+    def test_stream_answer_records_delivery_flag(self):
+        store = _StoreStub()
+        delivery = {}
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=1)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def stream_fn(*_args, **_kwargs):
+            raise KeyError("broken tool")
+
+        with self.assertRaises(KeyError):
+            asyncio.run(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                    delivery=delivery,
+                )
+            )
+        self.assertTrue(delivery.get("delivered"))
+        self.assertIn("Ошибка", edited[-1])
+
+    def test_stream_answer_logs_interruption(self):
+        store = _StoreStub()
+        edited = []
+
+        async def edit_fn(chat_id, msg_id, text, logger=None):
+            edited.append(text)
+            return True
+
+        async def reply_fn(event, text):
+            return SimpleNamespace(id=910)
+
+        def render(prefix, reasoning, tools, answer):
+            return answer
+
+        async def scenario():
+            async def stream_fn(*_args, **_kwargs):
+                await asyncio.sleep(5)
+
+            task = asyncio.ensure_future(
+                core.stream_answer(
+                    store,
+                    event=None,
+                    chat_id=1,
+                    is_self=False,
+                    messages=[],
+                    model="m",
+                    prefix="",
+                    self_edit_id=None,
+                    render_fn=render,
+                    edit_fn=edit_fn,
+                    reply_fn=reply_fn,
+                    action=_NullAsyncContext(),
+                    stream_fn=stream_fn,
+                    logger=userbot.logger,
+                )
+            )
+            await asyncio.sleep(0.01)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with self.assertLogs("danybot", level="INFO") as captured:
+            asyncio.run(scenario())
+        self.assertEqual(edited[-1], core.INTERRUPTED_NOTICE)
+        self.assertTrue(any("прерван" in line for line in captured.output))
+
+    def test_final_text_keeps_placeholder_with_reasoning_only(self):
+        state = {"reasoning_parts": ["рассуждение"], "tool_parts": []}
+        self.assertEqual(core._final_text(state, lambda: "…", "", None), "…")
+        state = {"reasoning_parts": [], "tool_parts": []}
+        self.assertEqual(
+            core._final_text(state, lambda: "", "", RuntimeError("boom")),
+            core.ERROR_NOTICE,
+        )
+
 
 class ContractPromptTest(BotTestCase):
     CHAT_ID = 7591254790
@@ -3158,6 +4460,268 @@ class ContractDirTest(BotTestCase):
             with mock.patch.object(userbot, "CONTRACT_DIR_CANDIDATES", candidates):
                 self.assertEqual(userbot._resolve_contract_dir(), candidates[0])
 
+    def test_signature_survives_unreadable_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_sig_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "contract.md"
+        target.write_text("правило", encoding="utf-8")
+        with (
+            mock.patch.object(userbot, "CONTRACT_DIR", tmp),
+            mock.patch.object(userbot, "CONTRACT_FILES", ("contract.md",)),
+        ):
+            userbot._contract_cache.update({"key": None, "text": ""})
+            before = userbot._contract_signature()
+            with mock.patch.object(Path, "stat", side_effect=OSError):
+                after = userbot._contract_signature()
+        self.assertNotEqual(before, after)
+        self.assertEqual(after[0][1], "contract.md")
+
+    def test_load_contract_tolerates_unreadable_file(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_read_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "contract.md"
+        target.write_text("правило", encoding="utf-8")
+        with (
+            mock.patch.object(userbot, "CONTRACT_DIR", tmp),
+            mock.patch.object(userbot, "CONTRACT_FILES", ("contract.md",)),
+        ):
+            userbot._contract_cache.update({"key": None, "text": ""})
+            self.assertIn("правило", userbot.load_contract())
+            userbot._contract_cache.update({"key": None, "text": ""})
+            with mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=UnicodeDecodeError("utf-8", b"", 0, 1, "bad"),
+            ):
+                self.assertEqual(userbot.load_contract(), "")
+
+    def test_system_for_appends_extra_system(self):
+        saved = userbot.EXTRA_SYSTEM
+        self.addCleanup(setattr, userbot, "EXTRA_SYSTEM", saved)
+        userbot.EXTRA_SYSTEM = "ДОПОЛНИТЕЛЬНО"
+        self.assertIn("ДОПОЛНИТЕЛЬНО", userbot.system_for(1, mode="bot"))
+        self.assertIn(
+            "ДОПОЛНИТЕЛЬНО", userbot.system_for(1, mode="bot", with_contract=True)
+        )
+        userbot.EXTRA_SYSTEM = ""
+        self.assertNotIn("ДОПОЛНИТЕЛЬНО", userbot.system_for(1, mode="userbot"))
+
+    def test_system_prompt_report_truncates(self):
+        report = userbot.system_prompt_report(1, mode="userbot", limit=20)
+        self.assertIn("обрезано / truncated", report)
+
+
+class DatacenterTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        for attr, value in (
+            ("API_ID", 123),
+            ("API_HASH", "hash"),
+            ("SESSION_NAME", "danybot_dc_selftest"),
+            ("BOT_TOKEN", BOT_TOKEN_VALUE),
+        ):
+            saved = getattr(userbot, attr)
+            self.addCleanup(setattr, userbot, attr, saved)
+            setattr(userbot, attr, value)
+
+    def test_dc_address_known_and_unknown(self):
+        self.assertEqual(core.dc_address(2), core.DC_FALLBACK)
+        self.assertEqual(core.dc_fallback(), core.DC_FALLBACK)
+        self.assertEqual(core.dc_address(9), "")
+        self.assertEqual(core.dc_address(None), "")
+        self.assertEqual(core.dc_address("junk"), "")
+        self.assertEqual(core.dc_address("2"), core.DC_FALLBACK)
+        self.assertEqual(core.dc_address(" 2 "), core.DC_FALLBACK)
+        self.assertEqual(core.dc_address(2.0), core.DC_FALLBACK)
+        self.assertEqual(core.dc_address(2.5), "")
+        self.assertEqual(core.dc_address("2.5"), "")
+        self.assertEqual(core.dc_address(True), "")
+        self.assertEqual(core.dc_address(False), "")
+        self.assertEqual(core.dc_address([2]), "")
+        self.assertEqual(core.dc_address("+2"), "")
+        self.assertEqual(core.dc_address("02"), "")
+
+    def test_disconnect_quietly_passes_timeout_to_drain(self):
+        seen: dict = {}
+
+        class _Registry:
+            def cancel_all(self, reason="", logger=None):
+                return 0
+
+            async def drain(self, timeout=core.DRAIN_TIMEOUT):
+                seen["timeout"] = timeout
+
+        for module in (bot, userbot):
+            seen.clear()
+            target = cast(Any, module)
+            saved = target.SESSIONS
+            self.addCleanup(setattr, target, "SESSIONS", saved)
+            target.SESSIONS = _Registry()
+            asyncio.run(module.disconnect_quietly(timeout=7))
+            self.assertEqual(seen["timeout"], 7, module.__name__)
+
+    def test_opt_int_arg_allows_unbounded_top(self):
+        self.assertEqual(tools_module._opt_int_arg({}, "n", 1, None), None)
+        self.assertIsNone(tools_module._opt_int_arg({"n": None}, "n", 1, None))
+        self.assertEqual(tools_module._opt_int_arg({"n": 3}, "n", 1, None), 3)
+        self.assertEqual(tools_module._opt_int_arg({"n": 0}, "n", 1, None), 1)
+        self.assertEqual(
+            tools_module._opt_int_arg({"n": 10**9}, "n", 1, None),
+            tools_module.MAX_OPT_INT,
+        )
+        self.assertEqual(tools_module._opt_int_arg({"n": "junk"}, "n", 1, 20), 1)
+        self.assertEqual(tools_module._opt_int_arg({"n": 99}, "n", 1, 20), 20)
+
+    def test_dc_api_url(self):
+        self.assertEqual(core.dc_api_url(2), f"https://{core.DC_FALLBACK}")
+        self.assertIsNone(core.dc_api_url(9))
+        self.assertIsNone(core.dc_api_url(None))
+
+    def test_dc_order_default_and_env(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DC_ORDER", None)
+            self.assertEqual(core.dc_order(), list(core.DC_ORDER))
+        with mock.patch.dict(os.environ, {"DC_ORDER": "3,1,3,junk,,9"}):
+            self.assertEqual(core.dc_order(), [3, 1])
+        with mock.patch.dict(os.environ, {"DC_ORDER": "junk,9"}):
+            self.assertEqual(core.dc_order(), list(core.DC_ORDER))
+
+    def test_dc_candidates_always_ends_with_fallback(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("DC_ORDER", None)
+            os.environ.pop("DC_DISABLED", None)
+            os.environ.pop("DC_FALLBACK", None)
+            items = core.dc_candidates()
+        self.assertEqual(items[-1]["address"], core.DC_FALLBACK)
+        self.assertEqual([item["address"] for item in items].count(core.DC_FALLBACK), 1)
+        self.assertEqual(items[-1]["dc"], 0)
+
+    def test_dc_candidates_keep_configured_order(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DC_ORDER": "4,3",
+                "DC_DISABLED": "",
+                "DC_FALLBACK": core.DC_FALLBACK,
+            },
+        ):
+            items = core.dc_candidates()
+        self.assertEqual([item["dc"] for item in items], [4, 3, 0])
+        self.assertEqual(items[-1]["address"], core.DC_FALLBACK)
+
+    def test_dc_candidates_respects_disabled(self):
+        with mock.patch.dict(os.environ, {"DC_ORDER": "1,2", "DC_DISABLED": "1,9"}):
+            items = core.dc_candidates()
+        addresses = [item["address"] for item in items]
+        self.assertNotIn(core.DC_ADDRESSES[1], addresses)
+        self.assertIn(core.DC_ADDRESSES[2], addresses)
+
+    def test_dc_candidates_avoid_duplicate_fallback(self):
+        with mock.patch.dict(
+            os.environ,
+            {"DC_ORDER": "2", "DC_FALLBACK": core.DC_ADDRESSES[3]},
+        ):
+            items = core.dc_candidates()
+        addresses = [item["address"] for item in items]
+        self.assertEqual(addresses.count(core.DC_ADDRESSES[3]), 1)
+        self.assertEqual(addresses[-1], core.DC_ADDRESSES[3])
+
+    def test_dc_candidates_accepts_extra_from_env(self):
+        with mock.patch.dict(os.environ, {"DC_ORDER": "1", "DC_DISABLED": ""}):
+            items = core.dc_candidates(extra=("4", "junk", "1"))
+        numbers = [item["dc"] for item in items]
+        self.assertEqual(numbers[:2], [1, 4])
+
+    def test_dc_fallback_is_configurable(self):
+        with mock.patch.dict(os.environ, {"DC_FALLBACK": "10.0.0.1"}):
+            self.assertEqual(core.dc_fallback(), "10.0.0.1")
+            items = core.dc_candidates()
+        self.assertEqual(items[-1]["address"], "10.0.0.1")
+
+    def test_connect_uses_dc_api_url(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = bot._connect(None, 2)
+        self.assertTrue(
+            client.bot.session.api.base.startswith(f"https://{core.DC_FALLBACK}")
+        )
+        asyncio.run(client.close())
+
+    def test_connect_without_dc_uses_default_api_url(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = bot._connect(None)
+        self.assertNotIn(core.DC_FALLBACK, client.bot.session.api.base)
+        asyncio.run(client.close())
+
+    def _client_with_memory_session(self, dc):
+        saved_client = userbot.client
+        saved_make = userbot.make_session
+        self.addCleanup(setattr, userbot, "client", saved_client)
+        self.addCleanup(setattr, userbot, "make_session", saved_make)
+        userbot.make_session = lambda _name: MemorySession()
+        userbot.client = None
+        cli = userbot.get_client(dc)
+        self.assertIsNotNone(cli)
+        return cast(Any, cli)
+
+    def test_get_client_pins_datacenter(self):
+        cli = self._client_with_memory_session(2)
+        self.assertEqual(cli.session.server_address, core.DC_FALLBACK)
+        self.assertEqual(cli.session.dc_id, 2)
+        self.assertEqual(cli.session.port, core.DC_PORT)
+
+    def test_get_client_without_dc_keeps_session_address(self):
+        cli = self._client_with_memory_session(None)
+        self.assertNotEqual(cli.session.server_address, core.DC_FALLBACK)
+
+    def test_pin_datacenter_keeps_authorized_session(self):
+        session = mock.Mock(dc_id=4, auth_key=object())
+        userbot.pin_datacenter(SimpleNamespace(session=session), 2)
+        session.set_dc.assert_not_called()
+
+    def test_pin_datacenter_pins_fresh_session(self):
+        session = mock.Mock(dc_id=0, auth_key=None)
+        userbot.pin_datacenter(SimpleNamespace(session=session), 3)
+        session.set_dc.assert_called_once_with(3, core.DC_ADDRESSES[3], core.DC_PORT)
+
+    def test_pin_datacenter_ignores_unknown_dc(self):
+        session = mock.Mock()
+        userbot.pin_datacenter(SimpleNamespace(session=session), 9)
+        session.set_dc.assert_not_called()
+        userbot.pin_datacenter(SimpleNamespace(session=session), None)
+        session.set_dc.assert_not_called()
+
+    def test_bot_connect_all_returns_fatal_on_bad_token(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = _FakeAiogramClient(
+            error=TelegramUnauthorizedError(_NO_METHOD, "Unauthorized")
+        )
+        self.enterContext(
+            mock.patch.object(bot, "_connect", mock.Mock(return_value=client))
+        )
+
+        async def proxies_none():
+            return [None]
+
+        self.enterContext(mock.patch.object(bot, "_proxy_candidates", proxies_none))
+        result = asyncio.run(
+            bot._connect_all({"dc": 2, "address": core.DC_FALLBACK}, [None])
+        )
+        self.assertEqual(result, (None, True))
+        self.assertEqual(client.closed, 1)
+
+    def test_dc_candidates_skip_junk_in_disabled(self):
+        with mock.patch.dict(
+            os.environ,
+            {
+                "DC_ORDER": "1,2",
+                "DC_DISABLED": "junk; 9,, 42 ,bad",
+                "DC_FALLBACK": core.DC_FALLBACK,
+            },
+        ):
+            self.assertEqual(core._dc_int_set("DC_DISABLED"), set())
+            items = core.dc_candidates()
+        self.assertEqual([item["dc"] for item in items], [1, 0])
+
 
 class TaskJournalTest(BotTestCase):
     def setUp(self):
@@ -3188,6 +4752,46 @@ class TaskJournalTest(BotTestCase):
         journal.progress(1, rounds=2)
         self.assertIsNone(journal.get(1))
         self.assertFalse(self.saves)
+
+    def test_progress_with_persist_saves_once(self):
+        journal = self._journal()
+        journal.begin(3, "задача", model="m")
+        self.saves.clear()
+        journal.progress(3, persist=True, rounds=2, tools=1)
+        self.assertEqual(self.saves, [1])
+        self.assertEqual((journal.get(3) or {}).get("rounds"), 2)
+        journal.progress(3, rounds=4, tools=2)
+        self.assertEqual(self.saves, [1])
+        self.assertEqual((journal.get(3) or {}).get("tools"), 2)
+
+    def test_finish_without_task_returns_none(self):
+        journal = self._journal()
+        self.assertIsNone(journal.finish(9, core.TASK_DONE))
+        self.assertFalse(self.saves)
+
+    def test_restore_skips_chat_ids_that_are_not_numbers(self):
+        journal = self._journal()
+        data = {"abc": {"status": "done"}, "7": {"status": "done"}}
+        self.assertEqual(journal.restore(data), 1)
+        self.assertIsNone(journal.get(None))
+        self.assertIsNotNone(journal.get(7))
+
+    def test_restore_drops_non_finite_timestamps(self):
+        journal = self._journal()
+        self.assertEqual(
+            journal.restore(
+                {"1": {"status": "done", "started": "inf", "updated": "nan"}}
+            ),
+            1,
+        )
+        record = journal.get(1) or {}
+        self.assertEqual(record.get("started"), 0.0)
+        self.assertEqual(record.get("updated"), 0.0)
+
+    def test_report_marks_unreadable_time(self):
+        self.assertEqual(core._fmt_time(0), "?")
+        self.assertEqual(core._fmt_time(None), "?")
+        self.assertEqual(core._fmt_time(1e30), "?")
 
     def test_report_for_unknown_chat(self):
         journal = self._journal()
@@ -3406,6 +5010,144 @@ class SessionRegistryTest(BotTestCase):
 
         asyncio.run(outer())
 
+    def test_cancel_ignores_already_finished_task(self):
+        registry = core.SessionRegistry()
+
+        async def scenario():
+            async def quick():
+                return 1
+
+            registry.start(1, quick())
+            await asyncio.sleep(0)
+            self.assertFalse(registry.cancel(1))
+            self.assertEqual(registry.running_chats(), 0)
+            await asyncio.sleep(0)
+            self.assertFalse(registry.is_running(1))
+
+        asyncio.run(scenario())
+        self.assertEqual(registry.running_chats(), 0)
+
+    def test_cancel_reaches_owner_run_while_other_is_queued(self):
+        registry = core.SessionRegistry()
+        state = []
+
+        async def scenario():
+            async def owner_run():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    state.append("owner-cancelled")
+                    raise
+
+            async def queued_run():
+                state.append("queued-ran")
+
+            owner_task = registry.start(4, owner_run(), scope="owner")
+            await asyncio.sleep(0)
+            queued_task = registry.start(4, queued_run(), scope="other")
+            await asyncio.sleep(0)
+            self.assertTrue(registry.is_running(4))
+            self.assertTrue(registry.cancel(4, reason="стоп"))
+            with self.assertRaises(asyncio.CancelledError):
+                await owner_task
+            with self.assertRaises(asyncio.CancelledError):
+                await queued_task
+            await asyncio.sleep(0)
+            self.assertFalse(registry.is_running(4))
+            self.assertEqual(registry.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(state, ["owner-cancelled"])
+
+    def test_cancel_all_reaches_owner_run_behind_queue(self):
+        registry = core.SessionRegistry()
+        state = []
+
+        async def scenario():
+            async def owner_run():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    state.append("owner-cancelled")
+                    raise
+
+            async def queued_run():
+                state.append("queued-ran")
+
+            owner_task = registry.start(4, owner_run(), scope="owner")
+            await asyncio.sleep(0)
+            registry.start(4, queued_run(), scope="other")
+            await asyncio.sleep(0)
+            self.assertEqual(registry.cancel_all(), 1)
+            with self.assertRaises(asyncio.CancelledError):
+                await owner_task
+            await asyncio.sleep(0)
+            self.assertEqual(registry.running_chats(), 0)
+
+        asyncio.run(scenario())
+        self.assertEqual(state, ["owner-cancelled"])
+
+    def test_drain_waits_for_cancelled_sessions(self):
+        registry = core.SessionRegistry()
+        done = []
+
+        async def scenario():
+            async def slow():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.01)
+                    done.append(1)
+                    raise
+
+            registry.start(4, slow(), scope="owner")
+            await asyncio.sleep(0)
+            registry.cancel_all()
+            await registry.drain()
+
+        asyncio.run(scenario())
+        self.assertEqual(done, [1])
+
+    def test_queued_coroutine_is_closed_when_dropped(self):
+        registry = core.SessionRegistry()
+
+        async def scenario():
+            async def owner_run():
+                await asyncio.sleep(5)
+
+            async def never_runs():
+                return 1
+
+            coro = never_runs()
+            registry.start(4, owner_run(), scope="owner")
+            await asyncio.sleep(0)
+            task = registry.start(4, coro, scope="other")
+            await asyncio.sleep(0)
+            registry.cancel(4)
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            registry.cancel(4)
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            asyncio.run(scenario())
+
+    def test_history_for_keeps_deque_maxlen_authoritative(self):
+        history: dict[int, deque] = {1: deque(maxlen=5)}
+        core.history_for(history, 1, 5)
+        self.assertIs(history[1].maxlen, 5)
+        refreshed = core.history_for(history, 1, 9)
+        self.assertIs(history[1], refreshed)
+        self.assertEqual(refreshed.maxlen, 9)
+        core.history_for(history, 1, 9)
+        self.assertIs(history[1], refreshed)
+
+    def test_history_limit_picks_dm_or_group(self):
+        self.assertEqual(core.history_limit(1, True, 100, 40), 100)
+        self.assertEqual(core.history_limit(-1, False, 100, 40), 40)
+        self.assertEqual(core.history_limit(1, None, 100, 40), 100)
+        self.assertEqual(core.history_limit(-1, None, 100, 40), 40)
+
     def test_stream_answer_marks_interruption_with_partial_text(self):
         store = _StoreStub()
         edited = []
@@ -3600,6 +5342,40 @@ class MemoryStoreTest(unittest.TestCase):
         self.assertEqual(memory.recall(1, "k2")["items"][0]["value"], "v2")
         self.assertEqual(memory.list_memories(1)["count"], 1)
 
+    def test_has_table_reports_sqlite_error(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE probe (id INTEGER)")
+        conn.commit()
+        self.assertTrue(memory._has_table(conn, "probe"))
+        self.assertFalse(memory._has_table(conn, "нет_такой_таблицы"))
+
+    def test_has_table_returns_false_on_broken_connection(self):
+        conn = sqlite3.connect(":memory:")
+        conn.close()
+        self.assertFalse(memory._has_table(conn, "memories"))
+
+    def test_connect_creates_missing_data_dir(self):
+        target = memory.DATA_DIR / "вложенный" / "каталог"
+        saved = (memory.DATA_DIR, memory.DB_PATH)
+        self.addCleanup(setattr, memory, "DATA_DIR", saved[0])
+        self.addCleanup(setattr, memory, "DB_PATH", saved[1])
+        memory.DATA_DIR = target
+        memory.DB_PATH = target / "memory.db"
+        memory._initialized.clear()
+        conn = memory._connect()
+        self.addCleanup(conn.close)
+        self.assertTrue(target.is_dir())
+        self.assertTrue(memory._has_table(conn, "memories"))
+
+    def test_connect_propagates_schema_failure(self):
+        with mock.patch.object(memory.sqlite3, "connect") as connect:
+            instance = connect.return_value
+            instance.execute.side_effect = sqlite3.OperationalError("read only")
+            with self.assertRaises(sqlite3.OperationalError):
+                memory._connect()
+            instance.close.assert_called()
+
 
 class SkillsStoreTest(unittest.TestCase):
     def setUp(self):
@@ -3693,9 +5469,55 @@ class SkillsStoreTest(unittest.TestCase):
         self.assertTrue(skills.load_skill("n2", touch=False)["ok"])
         self.assertEqual(skills.stats()["count"], 1)
 
+    def test_has_table_reports_sqlite_error(self):
+        conn = sqlite3.connect(":memory:")
+        self.addCleanup(conn.close)
+        conn.execute("CREATE TABLE probe (id INTEGER)")
+        conn.commit()
+        self.assertTrue(skills._has_table(conn, "probe"))
+        self.assertFalse(skills._has_table(conn, "нет_такой_таблицы"))
+
+    def test_has_table_returns_false_on_broken_connection(self):
+        conn = sqlite3.connect(":memory:")
+        conn.close()
+        self.assertFalse(skills._has_table(conn, "skills"))
+
+    def test_connect_creates_missing_data_dir(self):
+        target = skills.DATA_DIR / "вложенный" / "каталог"
+        saved = (skills.DATA_DIR, skills.DB_PATH)
+        self.addCleanup(setattr, skills, "DATA_DIR", saved[0])
+        self.addCleanup(setattr, skills, "DB_PATH", saved[1])
+        skills.DATA_DIR = target
+        skills.DB_PATH = target / "skills.db"
+        skills._initialized.clear()
+        conn = skills._connect()
+        self.addCleanup(conn.close)
+        self.assertTrue(target.is_dir())
+        self.assertTrue(skills._has_table(conn, "skills"))
+
+    def test_connect_propagates_schema_failure(self):
+        with mock.patch.object(skills.sqlite3, "connect") as connect:
+            instance = connect.return_value
+            instance.execute.side_effect = sqlite3.OperationalError("read only")
+            with self.assertRaises(sqlite3.OperationalError):
+                skills._connect()
+            instance.close.assert_called()
+
+
+_HUMAN = SimpleNamespace(is_bot=False, id=99, first_name="Tester", last_name="")
+_MACHINE = SimpleNamespace(is_bot=True, id=99, first_name="Bot", last_name="")
+
 
 class _FakeMessage:
-    def __init__(self, text, msg_id=1, out=False, is_reply=False, reply_msg=None):
+    def __init__(
+        self,
+        text,
+        msg_id=1,
+        out=False,
+        is_reply=False,
+        reply_msg=None,
+        from_user=_HUMAN,
+    ):
         self.message = text
         self.id = msg_id
         self.out = out
@@ -3703,6 +5525,7 @@ class _FakeMessage:
         self._reply_msg = reply_msg
         self.sender_id = 1
         self.chat_id = 1
+        self.from_user = from_user
 
     async def get_reply_message(self):
         if self._reply_msg is None:
@@ -3810,8 +5633,9 @@ class BotHandlerTest(BotTestCase):
         chat_id = kwargs.pop("chat_id", self.GROUP)
         is_private = kwargs.pop("is_private", False)
         sender_id = kwargs.pop("sender_id", 1)
+        from_user = kwargs.pop("from_user", None)
         return _FakeHandlerEvent(
-            _FakeMessage(text, **kwargs),
+            _FakeMessage(text, from_user=from_user, **kwargs),
             chat_id=chat_id,
             sender_id=sender_id,
             is_private=is_private,
@@ -3842,6 +5666,223 @@ class BotHandlerTest(BotTestCase):
     def test_empty_message_ignored(self):
         self._run(self._group_event(""))
         self.assertEqual(self.stream_calls, [])
+
+    def test_private_message_from_bot_is_ignored(self):
+        event = self._group_event(
+            "привет",
+            chat_id=555,
+            is_private=True,
+            sender_id=99,
+            from_user=_MACHINE,
+        )
+        self._run(event)
+        self.assertEqual(self.stream_calls, [])
+        self.assertEqual(event.sent, [])
+
+    def test_group_message_from_bot_is_answered(self):
+        event = self._group_event("@danybot привет", sender_id=99, from_user=_MACHINE)
+        self._run(event)
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_sender_is_bot_checks_event_message(self):
+        event = self._group_event("x", from_user=None)
+        self.assertFalse(asyncio.run(bot._sender_is_bot(event)))
+        event = self._group_event("x", from_user=_MACHINE)
+        self.assertTrue(asyncio.run(bot._sender_is_bot(event)))
+        self.assertFalse(asyncio.run(bot._sender_is_bot(SimpleNamespace())))
+        private = self._group_event("привет", chat_id=556, is_private=True, sender_id=7)
+        self._run(private)
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_bot_stats_reports_chat_state(self):
+        bot.chat_history[777] = deque([{"role": "user", "content": "a"}], maxlen=10)
+        bot.model_overrides[777] = "custom-model"
+        stats = bot._bot_stats(777)
+        self.assertEqual(stats["context_messages"], 1)
+        self.assertEqual(stats["model"], "custom-model")
+        self.assertGreaterEqual(stats["uptime_seconds"], 0)
+        self.assertEqual(bot._bot_stats(778)["model"], userbot.DANYAPI_MODEL)
+
+    def test_strip_trigger_keeps_alias_in_bot(self):
+        self.assertEqual(bot._strip_trigger(".db привет", False), ".db привет")
+        self.assertEqual(bot._strip_trigger("  .ai текст  ", False), ".ai текст")
+
+    def test_bad_command_payload_is_ignored(self):
+        def boom(_text):
+            raise TypeError("bad command")
+
+        saved = bot.handle_bot_commands
+        bot.handle_bot_commands = boom
+        self.addCleanup(setattr, bot, "handle_bot_commands", saved)
+        self._run(self._group_event("@danybot привет"))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_owner_command_denied_for_stranger(self):
+        event = self._run(self._group_event("/clear", sender_id=1))
+        self.assertIn("только владельцу", event.sent[0])
+        self.assertEqual(self.stream_calls, [])
+
+    def test_model_command_saves_state(self):
+        saved = bot.save_state
+        calls = []
+        bot.save_state = lambda: calls.append(1)
+        self.addCleanup(setattr, bot, "save_state", saved)
+        userbot.MODELS = ["m-one", "m-two"]
+        event = self._run(self._group_event("/model m-one", sender_id=self.OWNER))
+        self.assertIn("m-one", event.sent[0])
+        self.assertEqual(calls, [1])
+
+    def test_clear_command_saves_history(self):
+        saved = bot.save_history
+        calls = []
+        bot.save_history = lambda: calls.append(1)
+        self.addCleanup(setattr, bot, "save_history", saved)
+        bot.chat_history[self.GROUP] = deque(
+            [{"role": "user", "content": "x"}], maxlen=10
+        )
+        self._run(self._group_event("/clear", sender_id=self.OWNER))
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(bot.chat_history[self.GROUP]), 0)
+
+    def test_progress_callback_records_rounds_and_tools(self):
+        bot.chat_history[self.GROUP] = deque(maxlen=10)
+        self._run(self._group_event("@danybot привет", sender_id=self.OWNER))
+        record = bot.TASKS.get(self.GROUP) or {}
+        self.assertEqual(record.get("rounds"), 0)
+        self.assertEqual(record.get("tools"), 0)
+        self.assertEqual(record.get("status"), core.TASK_DONE)
+
+    def test_progress_callback_records_counters(self):
+        seen: dict = {}
+
+        async def stream(*_args, **kwargs):
+            progress = kwargs.get("progress_fn")
+            if progress is not None:
+                progress(3, 2, "остановлен по воле модели")
+            return "ответ"
+
+        saved = core.stream_answer
+        core.stream_answer = stream
+        self.addCleanup(setattr, core, "stream_answer", saved)
+        self._run(self._group_event("@danybot привет", sender_id=self.OWNER))
+        record = bot.TASKS.get(self.GROUP) or {}
+        seen["status"] = record.get("status")
+        self.assertEqual(record.get("rounds"), 3)
+        self.assertEqual(record.get("tools"), 2)
+        self.assertEqual(record.get("reason"), "остановлен по воле модели")
+        self.assertEqual(seen["status"], core.TASK_STOPPED)
+
+    def test_proxy_candidates_report_failure(self):
+        async def boom(limit=40, deadline=180.0):
+            raise RuntimeError("proxy pool down")
+
+        saved = proxies.get_proxy_candidates
+        self.addCleanup(setattr, proxies, "get_proxy_candidates", saved)
+        proxies.get_proxy_candidates = boom
+        self.assertEqual(asyncio.run(bot._proxy_candidates()), [])
+
+    def test_proxy_candidates_return_values(self):
+        async def ok(limit=40, deadline=180.0):
+            return [{"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080}]
+
+        saved = proxies.get_proxy_candidates
+        self.addCleanup(setattr, proxies, "get_proxy_candidates", saved)
+        proxies.get_proxy_candidates = ok
+        self.assertEqual(
+            asyncio.run(bot._proxy_candidates()),
+            [{"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080}],
+        )
+
+    def test_start_bot_falls_back_to_direct_without_proxies(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = _FakeAiogramClient(username="danybot_bot", uid=4)
+        seen: dict = {}
+
+        async def no_proxies():
+            return []
+
+        for attr, value in (
+            ("_proxy_candidates", no_proxies),
+            ("_connect", mock.Mock(side_effect=lambda p, dc=None: client)),
+            ("bot_client", None),
+            ("bot_username", ""),
+            ("bot_id", 0),
+        ):
+            saved = getattr(bot, attr)
+            self.addCleanup(setattr, bot, attr, saved)
+            setattr(bot, attr, value)
+
+        async def run():
+            await bot.start_bot()
+            seen["id"] = bot.bot_id
+
+        with mock.patch.object(
+            core,
+            "dc_candidates",
+            lambda *a, **k: [{"dc": 2, "address": core.DC_FALLBACK}],
+        ):
+            asyncio.run(run())
+        self.assertEqual(seen["id"], 4)
+        self.assertEqual(client.polled, 1)
+
+    def test_reply_failure_is_logged(self):
+        class Boom(_FakeHandlerEvent):
+            async def reply(self, text, buttons=None):
+                raise RPCError(request=None, message="telegram down")
+
+        event = Boom(
+            _FakeMessage("/settings"),
+            chat_id=self.GROUP,
+            sender_id=self.OWNER,
+            is_private=False,
+        )
+        asyncio.run(bot.handler(event))
+        self.assertEqual(event.sent, [])
+
+    def test_generation_error_reports_to_chat(self):
+        async def boom(*_args, **_kwargs):
+            raise OSError("api down")
+
+        saved = core.stream_answer
+        core.stream_answer = boom
+        self.addCleanup(setattr, core, "stream_answer", saved)
+        event = self._run(self._group_event("@danybot привет"))
+        self.assertIn("Ошибка", event.sent[0])
+
+    def test_cancellation_of_own_task_is_reraised(self):
+        async def boom(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        saved = core.stream_answer
+        core.stream_answer = boom
+        self.addCleanup(setattr, core, "stream_answer", saved)
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                bot.handler(self._group_event("@danybot привет", sender_id=self.OWNER))
+            )
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+
+    def test_resolve_picked_model_reports_unknown(self):
+        self.assertIsNone(bot._resolve_picked_model("#000000000000"))
+        self.assertIsNone(bot._resolve_picked_model("нет-такой"))
+        userbot.MODELS = ["m-one"]
+        self.assertEqual(bot._resolve_picked_model("m-one"), "m-one")
+        digest = bot._model_digest("m-one")
+        self.assertEqual(bot._resolve_picked_model(f"#{digest}"), "m-one")
+
+    def test_mention_helpers_without_username(self):
+        saved = bot.bot_username
+        bot.bot_username = ""
+        self.addCleanup(setattr, bot, "bot_username", saved)
+        self.assertIsNone(bot._mention_re())
+        self.assertFalse(bot._is_mentioned("@danybot привет"))
+        self.assertEqual(bot._strip_mention("@danybot привет"), "@danybot привет")
 
     def test_message_without_text_ignored(self):
         event = self._group_event("привет")
@@ -4439,16 +6480,10 @@ class CoderModeTest(BotTestCase):
         self.assertIn('mode = "coder" if coder_active else "bot"', source)
 
     def test_db_trigger_never_active(self):
-        saved = userbot.ENABLE_USERBOT
-        self.addCleanup(setattr, userbot, "ENABLE_USERBOT", saved)
-        userbot.ENABLE_USERBOT = True
-        self.assertFalse(bot._db_triggered(".db привет"))
-        self.assertFalse(bot._db_triggered(".ai привет"))
-        userbot.ENABLE_USERBOT = False
-        self.assertFalse(bot._db_triggered(".db привет"))
-        self.assertFalse(bot._db_triggered("привет .ai"))
-        self.assertFalse(bot._db_triggered("привет"))
-        self.assertFalse(bot._db_triggered(None))
+        self.assertFalse(bot.NO_TEXT_TRIGGER)
+        for text in (".db привет", ".ai привет", "привет .ai", "привет"):
+            with self.subTest(text=text):
+                self.assertEqual(bot._strip_trigger(text, bot.NO_TEXT_TRIGGER), text)
 
     def test_paths_are_confined_to_root(self):
         inside, err = tools_module._resolve_path("DanyBOT/tools.py")
@@ -4535,10 +6570,13 @@ class CoderModeTest(BotTestCase):
 
 
 class _CallbackEvent:
-    def __init__(self, data, chat_id, sender_id):
+    def __init__(self, data, chat_id, sender_id, is_private=None):
         self.data = data
         self.chat_id = chat_id
         self.sender_id = sender_id
+        self.is_private = (
+            bool(chat_id) and chat_id > 0 if is_private is None else is_private
+        )
         self.answers = []
         self.edits = []
         self.replies = []
@@ -4668,6 +6706,86 @@ class SettingsMenuTest(BotTestCase):
         asyncio.run(bot.callback_handler(event))
         self.assertEqual(event.edits, [])
         self.assertEqual(event.answers[-1][1], True)
+
+    def test_callback_without_chat_id_is_ignored(self):
+        event = _CallbackEvent("settings:reasoning", None, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(event.answers, [])
+        self.assertEqual(event.edits, [])
+
+    def test_callback_decodes_bytes_payload(self):
+        event = _CallbackEvent(b"settings:reasoning", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn(self.CHAT_ID, bot.reasoning_hidden)
+        self.assertEqual(event.edits[-1][0].splitlines()[0], "Настройки / Settings")
+
+    def test_callback_pick_reports_unavailable_model(self):
+        event = _CallbackEvent("settings:pick:нет-такой", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(event.answers[0][0], "Модель больше недоступна.")
+        self.assertEqual(event.answers[0][1], True)
+        self.assertIn("settings:model", rows_data(event.edits[-1][1]))
+
+    def test_callback_models_lists_all(self):
+        userbot.MODELS = ["m-one", "m-two"]
+        event = _CallbackEvent("settings:models", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        text = "\n".join(reply[0] for reply in event.replies)
+        self.assertIn("m-one", text)
+        self.assertIn("m-two", text)
+
+    def test_callback_prompt_reports_system_prompt(self):
+        event = _CallbackEvent("settings:prompt", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn("Режим / Mode", "\n".join(reply[0] for reply in event.replies))
+
+    def test_callback_prompt_uses_coder_mode(self):
+        bot.coder_chats.add(self.CHAT_ID)
+        self.addCleanup(bot.coder_chats.discard, self.CHAT_ID)
+        event = _CallbackEvent("settings:prompt", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn("coder", "\n".join(reply[0] for reply in event.replies))
+
+    def test_callback_back_to_main(self):
+        event = _CallbackEvent("settings:main", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn("settings:model", rows_data(event.edits[-1][1]))
+
+    def test_callback_edit_failure_is_tolerated(self):
+        class Boom(_CallbackEvent):
+            async def edit(self, text, buttons=None):
+                raise RPCError(request=None, message="message is not modified")
+
+        bot.reasoning_hidden.discard(self.CHAT_ID)
+        event = Boom("settings:reasoning", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn(self.CHAT_ID, bot.reasoning_hidden)
+        self.assertEqual(event.answers[-1][0], "Готово.")
+
+    def test_callback_coder_off_cancels_running_request(self):
+        bot.coder_chats.add(self.CHAT_ID)
+        self.addCleanup(bot.coder_chats.discard, self.CHAT_ID)
+        event = _CallbackEvent("settings:coder", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertNotIn(self.CHAT_ID, bot.coder_chats)
+        event = _CallbackEvent("settings:coder", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertIn(self.CHAT_ID, bot.coder_chats)
+
+    def test_callback_clear_uses_group_limit_in_group(self):
+        group = -100777
+        bot.chat_history[group] = deque(
+            [{"role": "user", "content": "x"}], maxlen=userbot.DM_HISTORY_LIMIT
+        )
+        self.addCleanup(bot.chat_history.pop, group, None)
+        event = _CallbackEvent("settings:clear", group, self.CHAT_ID, is_private=False)
+        asyncio.run(bot.callback_handler(event))
+        self.assertEqual(len(bot.chat_history[group]), 0)
+        self.assertEqual(bot.chat_history[group].maxlen, userbot.GROUP_HISTORY_LIMIT)
+
+    def test_settings_text_shows_dm_limit_in_private_chat(self):
+        text = bot._settings_text(self.CHAT_ID, True)
+        self.assertIn(f"/{userbot.DM_HISTORY_LIMIT}", text)
 
     def test_callback_pick_survives_long_model_name(self):
         long_name = "vendor/" + "x" * 70 + "/model"
@@ -4809,6 +6927,170 @@ class UserbotHelpersTest(BotTestCase):
                 )
             )
         )
+
+    def test_sanitize_reports_empty_response(self):
+        saved_ai = userbot.ai
+        userbot.ai = NonStreamAI(SimpleNamespace(choices=[]))
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.assertEqual(
+            asyncio.run(userbot.sanitize_tool_output("secret", "m")),
+            "[вывод скрыт: пустой ответ санитайзера]",
+        )
+
+    def test_sanitize_joins_list_content(self):
+        saved_ai = userbot.ai
+        userbot.ai = NonStreamAI(
+            NonStreamResponse(NonStreamMessage(content=["AL", "LOW"]))
+        )
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.assertEqual(
+            asyncio.run(userbot.sanitize_tool_output("secret", "m")), "ALLOW"
+        )
+
+    def test_sanitize_hides_blank_content(self):
+        saved_ai = userbot.ai
+        userbot.ai = NonStreamAI(NonStreamResponse(NonStreamMessage(content="   ")))
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.assertEqual(
+            asyncio.run(userbot.sanitize_tool_output("secret", "m")),
+            "[вывод скрыт: пустой ответ санитайзера]",
+        )
+
+    def test_get_sender_returns_none_on_error(self):
+        class _Boom:
+            sender_id = 3
+
+            async def get_sender(self):
+                raise RPCError(request=None, message="down")
+
+        self.assertIsNone(asyncio.run(userbot._get_sender(_Boom())))
+        self.assertFalse(asyncio.run(userbot._sender_is_bot(_Boom())))
+
+    def test_get_sender_label_without_names(self):
+        class _Event:
+            sender_id = 77
+
+            def __init__(self, username):
+                self._username = username
+
+            async def get_sender(self):
+                return SimpleNamespace(
+                    first_name="", last_name="", username=self._username
+                )
+
+        self.assertEqual(asyncio.run(userbot.get_sender_label(_Event(None))), "77")
+        self.assertEqual(asyncio.run(userbot.get_sender_label(_Event("only"))), "@only")
+
+    def test_fetch_live_messages_reports_failure(self):
+        class _Boom:
+            async def get_messages(self, chat_id, limit=20):
+                raise RPCError(request=None, message="down")
+
+        self.assertEqual(asyncio.run(userbot.fetch_live_messages(1, 5, _Boom())), [])
+
+    def test_fetch_live_messages_skips_empty_and_reverses(self):
+        class _Client:
+            async def get_messages(self, chat_id, limit=20):
+                return [
+                    SimpleNamespace(message="свежее", out=True),
+                    SimpleNamespace(message="старое", out=False),
+                    SimpleNamespace(message="   ", out=False),
+                    SimpleNamespace(message=None, out=False),
+                ]
+
+        out = asyncio.run(userbot.fetch_live_messages(1, 5, _Client()))
+        self.assertEqual(
+            out,
+            [
+                {"role": "user", "content": "старое"},
+                {"role": "assistant", "content": "свежее"},
+            ],
+        )
+
+    def test_refresh_models_reports_api_error(self):
+        async def _list():
+            raise OSError("danyapi down")
+
+        saved_ai = userbot.ai
+        saved_models = userbot.MODELS
+        userbot.ai = SimpleNamespace(models=SimpleNamespace(list=_list))
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        self.addCleanup(setattr, userbot, "MODELS", saved_models)
+        with self.assertLogs("danybot", level="WARNING") as captured:
+            asyncio.run(userbot.refresh_models())
+        self.assertTrue(userbot.MODELS)
+        self.assertIn("Не удалось загрузить модели", captured.output[0])
+
+    def test_disconnect_quietly_closes_client(self):
+        class _Client:
+            def __init__(self):
+                self.disconnected = 0
+
+            async def disconnect(self):
+                self.disconnected += 1
+                return True
+
+        class _Boom(_Client):
+            async def disconnect(self):
+                raise RuntimeError("down")
+
+        saver = _FakeSaver()
+        saved_saver = userbot.HISTORY_SAVER
+        saved_client = userbot.client
+        userbot.HISTORY_SAVER = saver
+        self.addCleanup(setattr, userbot, "HISTORY_SAVER", saved_saver)
+        self.addCleanup(setattr, userbot, "client", saved_client)
+        client = _Client()
+        userbot.client = client
+        asyncio.run(userbot.disconnect_quietly())
+        self.assertEqual(client.disconnected, 1)
+        self.assertEqual(saver.flushed, 1)
+        userbot.client = _Boom()
+        asyncio.run(userbot.disconnect_quietly())
+        userbot.client = None
+        asyncio.run(userbot.disconnect_quietly())
+
+    def test_close_ai_survives_client_error(self):
+        class _AI:
+            def __init__(self):
+                self.closed = 0
+
+            async def close(self):
+                self.closed += 1
+                return True
+
+        class _Boom:
+            async def close(self):
+                raise RuntimeError("down")
+
+        saved_ai = userbot.ai
+        self.addCleanup(setattr, userbot, "ai", saved_ai)
+        fake = _AI()
+        userbot.ai = fake
+        asyncio.run(userbot.close_ai())
+        self.assertEqual(fake.closed, 1)
+        userbot.ai = _Boom()
+        asyncio.run(userbot.close_ai())
+
+    def test_proxy_candidates_report_failure(self):
+        async def boom(*_args, **_kwargs):
+            raise OSError("no network")
+
+        with (
+            mock.patch.object(proxies, "get_proxy_candidates", boom),
+            self.assertLogs("danybot", level="WARNING") as captured,
+        ):
+            self.assertEqual(asyncio.run(userbot._proxy_candidates()), [])
+        self.assertIn("Не удалось получить прокси", captured.output[0])
+
+    def test_proxy_candidates_return_list(self):
+        marker = [{"proxy_type": "socks5", "addr": "1.1.1.1", "port": 1080}]
+
+        async def fake(*_args, **_kwargs):
+            return list(marker)
+
+        with mock.patch.object(proxies, "get_proxy_candidates", fake):
+            self.assertEqual(asyncio.run(userbot._proxy_candidates()), marker)
 
 
 class BotModuleTest(BotTestCase):
@@ -5306,6 +7588,14 @@ class BotAdapterTest(BotTestCase):
         self.assertEqual(inner.session.closed, 1)
 
 
+class _BoomTools:
+    def __init__(self, handler):
+        self._handler = handler
+
+    def __getattr__(self, name):
+        return self._handler
+
+
 class SubagentsTest(BotTestCase):
     def setUp(self):
         super().setUp()
@@ -5656,6 +7946,24 @@ class SubagentsTest(BotTestCase):
         self.assertTrue(healthy[0]["ok"])
         self.assertEqual(healthy[0]["task"], "c")
 
+    def test_cancelled_tool_call_inside_subagent_is_reraised(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", '{"expression":"2+2"}')]),
+                ("готово", None),
+            ]
+        )
+
+        async def cancel(*_args, **_kwargs):
+            raise asyncio.CancelledError
+
+        saved = tools_module.execute_tool
+        tools_module.execute_tool = cancel
+        self.addCleanup(setattr, tools_module, "execute_tool", saved)
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(subagents.run_subagent("посчитай"))
+
     def test_cancelled_worker_is_not_swallowed(self):
         async def cancel(spec):
             raise asyncio.CancelledError
@@ -5665,6 +7973,155 @@ class SubagentsTest(BotTestCase):
 
         with self.assertRaises(asyncio.CancelledError):
             asyncio.run(run())
+
+    def test_task_spec_cannot_escalate_privileges(self):
+        seen = {}
+
+        async def fake_run_subagent(task, **kwargs):
+            seen["task"] = task
+            seen.update(kwargs)
+            return {
+                "name": kwargs.get("subagent_name", ""),
+                "task": task,
+                "ok": True,
+                "rounds": 1,
+                "tools_used": [],
+                "result": "x",
+            }
+
+        spec = {
+            "task": "что-то",
+            "unrestricted": True,
+            "chat_id": -999,
+            "model": "чужая-модель",
+            "max_rounds": 10**6,
+            "name": "N" * 500,
+            "tools": "read_file",
+        }
+        saved = subagents.run_subagent
+        subagents.run_subagent = fake_run_subagent
+        self.addCleanup(setattr, subagents, "run_subagent", saved)
+        asyncio.run(
+            subagents.run_subagents(
+                [spec],
+                chat_id=42,
+                client="real-client",
+                model="real-model",
+                verify=True,
+                unrestricted=False,
+            )
+        )
+        self.assertEqual(seen["task"], "что-то")
+        self.assertEqual(seen["chat_id"], 42)
+        self.assertEqual(seen["client"], "real-client")
+        self.assertEqual(seen["model"], "real-model")
+        self.assertFalse(seen["unrestricted"])
+        self.assertTrue(seen["verify"])
+        self.assertEqual(seen["max_rounds"], 10**6)
+        self.assertEqual(seen["tool_names"], ["read_file"])
+        self.assertEqual(len(seen["subagent_name"]), subagents.MAX_NAME_CHARS)
+
+    def test_no_round_limit_by_default(self):
+        rounds = 12
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call(f"c{index}", "get_time", "{}")])
+                for index in range(rounds)
+            ]
+            + [("готово", None)]
+        )
+        subagents.configure(
+            ai=ai, model="m", verifier=self._allow, enabled=True, max_rounds=None
+        )
+        subagents._RUNTIME["max_rounds"] = None
+        result = asyncio.run(subagents.run_subagent("долгая задача"))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["rounds"], rounds + 1)
+
+    def test_model_rounds_clamps_to_positive_int(self):
+        self.assertEqual(subagents._model_rounds(None, 7), 7)
+        self.assertEqual(subagents._model_rounds("12", 7), 12)
+        self.assertEqual(subagents._model_rounds("nope", 7), 7)
+        self.assertEqual(subagents._model_rounds(0, 7), 1)
+        self.assertEqual(subagents._model_rounds(-5, 7), 1)
+
+    def test_tool_names_normalises_input(self):
+        self.assertIsNone(subagents._tool_names(None))
+        self.assertIsNone(subagents._tool_names(5))
+        self.assertIsNone(subagents._tool_names([]))
+        self.assertEqual(subagents._tool_names(" read_file "), ["read_file"])
+        self.assertEqual(subagents._tool_names(["a", " b ", 5]), ["a", "b", "5"])
+
+    def test_configure_clamps_bounds(self):
+        subagents.configure(concurrency=0, max_tokens=1, timeout=0, max_rounds=0)
+        self.assertEqual(subagents._RUNTIME["concurrency"], 1)
+        self.assertEqual(subagents._RUNTIME["max_tokens"], 64)
+        self.assertEqual(subagents._RUNTIME["timeout"], 1.0)
+        self.assertEqual(subagents._RUNTIME["max_rounds"], 1)
+
+    def test_call_tool_wraps_tool_crash(self):
+        async def boom(*_args, **_kwargs):
+            raise RuntimeError("tool down")
+
+        name, text, ran = asyncio.run(
+            subagents._call_tool(
+                _BoomTools(boom), None, "evaluate", {}, "m", 1, None, None, None, False
+            )
+        )
+        self.assertEqual(name, "evaluate")
+        self.assertIn("tool down", text)
+        self.assertTrue(ran)
+
+    def test_run_subagent_reports_api_error(self):
+        class Boom:
+            def __getattr__(self, _name):
+                raise OSError("api down")
+
+        subagents.configure(ai=Boom(), model="m", verifier=None, enabled=True)
+        result = asyncio.run(subagents.run_subagent("задача"))
+        self.assertFalse(result["ok"])
+        self.assertIn("Ошибка субагента", result["result"])
+
+    def test_run_subagent_reports_tool_crash(self):
+        ai = self._ToolAI(
+            [
+                ("", [self._tool_call("c1", "evaluate", "{}")]),
+                ("готово", None),
+            ]
+        )
+
+        async def boom(*_args, **_kwargs):
+            raise ZeroDivisionError("div")
+
+        saved = tools_module.execute_tool
+        tools_module.execute_tool = boom
+        self.addCleanup(setattr, tools_module, "execute_tool", saved)
+        subagents.configure(ai=ai, model="m", verifier=self._allow, enabled=True)
+        result = asyncio.run(subagents.run_subagent("считай"))
+        self.assertEqual(result["tools_used"], [])
+        self.assertIn(
+            "Ошибка инструмента evaluate: div", self._tool_messages(ai)[0]["content"]
+        )
+
+    def test_run_subagent_reports_round_limit_without_answer(self):
+        rounds = 4
+        ai = self._ToolAI(
+            [("", [self._tool_call(f"c{i}", "get_time", "{}")]) for i in range(rounds)]
+        )
+        subagents.configure(
+            ai=ai, model="m", verifier=self._allow, enabled=True, max_rounds=rounds
+        )
+        result = asyncio.run(subagents.run_subagent("долгая"))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["rounds"], rounds)
+        self.assertEqual(result["result"], "Достигнут лимит шагов субагента.")
+
+    def test_run_subagents_rejects_bad_input(self):
+        self.assertEqual(asyncio.run(subagents.run_subagents(5)), [])
+        self.assertEqual(asyncio.run(subagents.run_subagents([])), [])
+        self.assertEqual(asyncio.run(subagents.run_subagents([None, 0, ""])), [])
+        results = asyncio.run(subagents.run_subagents("одна задача"))
+        self.assertEqual(len(results), 1)
 
 
 class _FakeTelegramClient:
@@ -6283,6 +8740,40 @@ class UserbotHandlerTest(BotTestCase):
         )
         self.assertEqual(len(self.stream_calls), 1)
         self.assertIn("неизвестная команда", self._group_prompt())
+
+    def test_bad_command_payload_is_ignored(self):
+        def boom(_text):
+            raise TypeError("bad command")
+
+        saved = userbot.handle_commands
+        userbot.handle_commands = boom
+        self.addCleanup(setattr, userbot, "handle_commands", saved)
+        self._run(self._event(".db привет", msg_id=50))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_cancellation_of_own_task_is_reraised(self):
+        started = asyncio.Event()
+
+        async def slow(*_args, **_kwargs):
+            started.set()
+            await asyncio.sleep(5)
+            return "долгий ответ"
+
+        core.stream_answer = slow
+        self.addCleanup(userbot.SESSIONS.cancel_all)
+
+        async def scenario():
+            task = asyncio.ensure_future(
+                userbot.handler(self._event(".db привет", chat_id=4242))
+            )
+            await started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        asyncio.run(scenario())
+        record = userbot.TASKS.get(4242) or {}
+        self.assertEqual(record.get("status"), core.TASK_INTERRUPTED)
 
 
 class HardeningTest(BotTestCase):
@@ -7004,6 +9495,50 @@ class HardeningTest(BotTestCase):
         _owner_tool("run_subagent", {"task": "t", "tools": []}, 1)
         self.assertIsNone(seen["tools"])
 
+    def test_run_subagent_max_rounds_is_accepted(self):
+        seen = {}
+
+        async def fake_run(tasks, **kwargs):
+            seen["max_rounds"] = kwargs.get("max_rounds")
+            return []
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        out = _owner_tool("run_subagent", {"task": "t", "max_rounds": 3}, 1)
+        self.assertEqual(seen["max_rounds"], 3)
+        self.assertNotIn("Ошибка инструмента", out)
+        _owner_tool("run_subagent", {"task": "t"}, 1)
+        self.assertIsNone(seen["max_rounds"])
+        _owner_tool("run_subagent", {"task": "t", "max_rounds": "junk"}, 1)
+        self.assertEqual(seen["max_rounds"], 1)
+
+    def test_drain_timeout_defaults_and_override(self):
+        self.assertEqual(core.DRAIN_TIMEOUT, 5.0)
+        registry = core.SessionRegistry()
+        held = []
+
+        async def scenario():
+            async def slow():
+                try:
+                    await asyncio.sleep(5)
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.05)
+                    held.append(1)
+                    raise
+
+            registry.start(1, slow(), scope="owner")
+            await asyncio.sleep(0)
+            registry.cancel_all()
+            await registry.drain(1)
+
+        asyncio.run(scenario())
+        self.assertEqual(held, [1])
+
     def test_get_time_weekday_is_deterministic(self):
         import datetime
 
@@ -7107,6 +9642,211 @@ class HardeningTest(BotTestCase):
         asyncio.run(userbot.refresh_models())
         self.assertEqual(userbot.MODELS, ["good"])
 
+    def test_read_file_reports_missing_path(self):
+        tmp = self._tmp_dir("danybot_rf_")
+        self._use_coder_root(tmp)
+        out = _owner_tool("read_file", {"path": "нет.txt"}, 1)
+        self.assertIn("Файл не найден", out)
+
+    def test_read_file_reports_empty_window(self):
+        tmp = self._tmp_dir("danybot_rf2_")
+        (tmp / "a.txt").write_text("одна\nвторая", encoding="utf-8")
+        self._use_coder_root(tmp)
+        out = _owner_tool("read_file", {"path": "a.txt", "offset": 50}, 1)
+        self.assertIn("(пусто)", out)
+
+    def test_read_file_reports_read_error(self):
+        tmp = self._tmp_dir("danybot_rf3_")
+        (tmp / "a.txt").write_text("текст", encoding="utf-8")
+        self._use_coder_root(tmp)
+        with mock.patch.object(Path, "read_text", side_effect=OSError("сбой ввода")):
+            out = _owner_tool("read_file", {"path": "a.txt"}, 1)
+        self.assertIn("Ошибка чтения", out)
+
+    def test_read_file_rejects_directory(self):
+        tmp = self._tmp_dir("danybot_rf4_")
+        (tmp / "sub").mkdir()
+        self._use_coder_root(tmp)
+        out = _owner_tool("read_file", {"path": "sub"}, 1)
+        self.assertIn("Используй list_dir", out)
+
+    def test_write_file_rejects_path_outside_root(self):
+        out = _owner_tool("write_file", {"path": "/etc/hosts", "content": "x"}, 1)
+        self.assertIn("вне разрешённого корня", out)
+
+    def test_write_file_rejects_oversized_content(self):
+        tmp = self._tmp_dir("danybot_wf_")
+        self._use_coder_root(tmp)
+        saved = tools_module.MAX_WRITE_BYTES
+        self.addCleanup(setattr, tools_module, "MAX_WRITE_BYTES", saved)
+        tools_module.MAX_WRITE_BYTES = 10
+        out = _owner_tool("write_file", {"path": "a.txt", "content": "я" * 100}, 1)
+        self.assertIn("Слишком большой объём", out)
+        self.assertEqual(list(tmp.iterdir()), [])
+
+    def test_write_file_rejects_directory_target(self):
+        tmp = self._tmp_dir("danybot_wf2_")
+        (tmp / "sub").mkdir()
+        self._use_coder_root(tmp)
+        out = _owner_tool("write_file", {"path": "sub", "content": "x"}, 1)
+        self.assertIn("Это каталог", out)
+
+    def test_write_file_reports_mkdir_error(self):
+        tmp = self._tmp_dir("danybot_wf3_")
+        self._use_coder_root(tmp)
+        with mock.patch.object(Path, "mkdir", side_effect=OSError("нет прав")):
+            out = _owner_tool("write_file", {"path": "sub/a.txt", "content": "x"}, 1)
+        self.assertIn("Ошибка записи", out)
+
+    def test_write_file_reports_overwrite(self):
+        tmp = self._tmp_dir("danybot_wf4_")
+        self._use_coder_root(tmp)
+        self.assertIn(
+            "Создан", _owner_tool("write_file", {"path": "a.txt", "content": "x"}, 1)
+        )
+        self.assertIn(
+            "Перезаписан",
+            _owner_tool("write_file", {"path": "a.txt", "content": "y"}, 1),
+        )
+
+    def test_edit_file_rejects_path_outside_root(self):
+        out = _owner_tool(
+            "edit_file",
+            {"path": "/etc/hosts", "old_string": "a", "new_string": "b"},
+            1,
+        )
+        self.assertIn("вне разрешённого корня", out)
+
+    def test_edit_file_reports_bad_arguments(self):
+        tmp = self._tmp_dir("danybot_ef_")
+        (tmp / "a.txt").write_text("alpha", encoding="utf-8")
+        self._use_coder_root(tmp)
+        cases = (
+            (
+                {"path": "нет.txt", "old_string": "a", "new_string": "b"},
+                "Файл не найден",
+            ),
+            (
+                {"path": "a.txt", "old_string": "", "new_string": "b"},
+                "Пустой old_string.",
+            ),
+            (
+                {"path": "a.txt", "old_string": "alpha", "new_string": "alpha"},
+                "совпадают",
+            ),
+            (
+                {"path": "a.txt", "old_string": "zz", "new_string": "b"},
+                "Фрагмент не найден",
+            ),
+        )
+        for arguments, expected in cases:
+            with self.subTest(expected=expected):
+                self.assertIn(expected, _owner_tool("edit_file", arguments, 1))
+
+    def test_edit_file_requires_replace_all_for_repeats(self):
+        tmp = self._tmp_dir("danybot_ef2_")
+        (tmp / "a.txt").write_text("x\nx\n", encoding="utf-8")
+        self._use_coder_root(tmp)
+        out = _owner_tool(
+            "edit_file", {"path": "a.txt", "old_string": "x", "new_string": "y"}, 1
+        )
+        self.assertIn("встречается 2 раз", out)
+        out = _owner_tool(
+            "edit_file",
+            {
+                "path": "a.txt",
+                "old_string": "x",
+                "new_string": "y",
+                "replace_all": True,
+            },
+            1,
+        )
+        self.assertIn("Изменён", out)
+        self.assertEqual((tmp / "a.txt").read_text(encoding="utf-8"), "y\ny\n")
+
+    def test_edit_file_reports_read_error(self):
+        tmp = self._tmp_dir("danybot_ef3_")
+        (tmp / "a.txt").write_text("alpha", encoding="utf-8")
+        self._use_coder_root(tmp)
+        with mock.patch.object(Path, "read_text", side_effect=OSError("сбой ввода")):
+            out = _owner_tool(
+                "edit_file",
+                {"path": "a.txt", "old_string": "alpha", "new_string": "b"},
+                1,
+            )
+        self.assertIn("Ошибка чтения", out)
+
+    def test_list_dir_reports_bad_paths(self):
+        tmp = self._tmp_dir("danybot_ld_")
+        (tmp / "a.txt").write_text("x", encoding="utf-8")
+        self._use_coder_root(tmp)
+        self.assertIn(
+            "вне разрешённого корня", _owner_tool("list_dir", {"path": "/etc"}, 1)
+        )
+        self.assertIn("Каталог не найден", _owner_tool("list_dir", {"path": "нет"}, 1))
+        self.assertIn("Это файл", _owner_tool("list_dir", {"path": "a.txt"}, 1))
+
+    def test_list_dir_reports_empty_and_scandir_error(self):
+        tmp = self._tmp_dir("danybot_ld2_")
+        (tmp / "sub").mkdir()
+        self._use_coder_root(tmp)
+        self.assertIn("(пусто)", _owner_tool("list_dir", {"path": "sub"}, 1))
+
+        def failing(_path):
+            raise OSError("нет доступа")
+
+        with mock.patch.object(tools_module, "_list_entries", failing):
+            out = _owner_tool("list_dir", {"path": "."}, 1)
+        self.assertIn("Ошибка чтения каталога", out)
+
+    def test_list_dir_falls_back_to_name_for_broken_entry(self):
+        tmp = self._tmp_dir("danybot_ld3_")
+        link = tmp / "битый.txt"
+        try:
+            link.symlink_to(tmp / "нет.txt")
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unavailable")
+        self._use_coder_root(tmp)
+        out = _owner_tool("list_dir", {"path": "."}, 1)
+        self.assertIn("битый.txt", out)
+
+    def test_search_files_reports_bad_paths_and_patterns(self):
+        tmp = self._tmp_dir("danybot_sf_")
+        (tmp / "a.txt").write_text("строка", encoding="utf-8")
+        self._use_coder_root(tmp)
+        self.assertEqual(
+            _owner_tool("search_files", {"pattern": ""}, 1), "Пустой pattern."
+        )
+        self.assertIn(
+            "вне разрешённого корня",
+            _owner_tool("search_files", {"pattern": "x", "path": "/etc"}, 1),
+        )
+        self.assertIn(
+            "Путь не найден",
+            _owner_tool("search_files", {"pattern": "x", "path": "нет"}, 1),
+        )
+        self.assertIn(
+            "Некорректное выражение", _owner_tool("search_files", {"pattern": "["}, 1)
+        )
+
+    def test_search_files_reports_total_timeout(self):
+        tmp = self._tmp_dir("danybot_sf2_")
+        (tmp / "a.txt").write_text("строка", encoding="utf-8")
+        self._use_coder_root(tmp)
+        saved = tools_module.SEARCH_TIMEOUT
+        self.addCleanup(setattr, tools_module, "SEARCH_TIMEOUT", saved)
+        tools_module.SEARCH_TIMEOUT = 0
+        out = _owner_tool("search_files", {"pattern": "строка"}, 1)
+        self.assertIn("Таймаут поиска", out)
+
+    def test_search_files_matches_whole_line_pattern(self):
+        tmp = self._tmp_dir("danybot_sf3_")
+        (tmp / "a.txt").write_text("игла\nигол", encoding="utf-8")
+        self._use_coder_root(tmp)
+        out = _owner_tool("search_files", {"pattern": "игла$"}, 1)
+        self.assertIn("a.txt:1", out)
+        self.assertNotIn("a.txt:2", out)
+
 
 class StartupTest(BotTestCase):
     def setUp(self):
@@ -7122,6 +9862,7 @@ class StartupTest(BotTestCase):
         userbot.API_ID = 123
         userbot.API_HASH = "hash"
         userbot.BOT_TOKEN = NO_AUTH
+        self._single_dc()
 
     def _install_proxies(self, values):
         async def candidates():
@@ -7137,6 +9878,15 @@ class StartupTest(BotTestCase):
         self.addCleanup(setattr, mod, attr, saved)
         setattr(mod, attr, factory)
 
+    def _single_dc(self):
+        self.enterContext(
+            mock.patch.object(
+                core,
+                "dc_candidates",
+                lambda *a, **k: [{"dc": 2, "address": core.DC_ADDRESSES[2]}],
+            )
+        )
+
     def test_userbot_requires_credentials(self):
         userbot.API_ID = 0
         self.assertIsNone(asyncio.run(userbot.start_userbot()))
@@ -7150,7 +9900,7 @@ class StartupTest(BotTestCase):
         proxy_b = {"proxy_type": "socks5", "addr": "2.2.2.2", "port": 1080}
         self._install_proxies([proxy_a, proxy_b])
         client = _FakeTelegramClient(fail_times=1, username="meuser")
-        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, lambda _dc=None: client, "get_client")
         self._install_client(userbot, client, "client")
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.starts, 2)
@@ -7161,7 +9911,7 @@ class StartupTest(BotTestCase):
     def test_userbot_without_proxies_uses_direct_connection(self):
         self._install_proxies([])
         client = _FakeTelegramClient(username="meuser")
-        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, lambda _dc=None: client, "get_client")
         self._install_client(userbot, client, "client")
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.proxies, [])
@@ -7172,11 +9922,11 @@ class StartupTest(BotTestCase):
         client = _FakeTelegramClient(
             error=AuthKeyError(request=None, message="AUTH_KEY_UNREGISTERED")
         )
-        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, lambda _dc=None: client, "get_client")
         self._install_client(userbot, client, "client")
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.starts, 1)
-        self.assertEqual(client.disconnects, 0)
+        self.assertEqual(client.disconnects, 1)
 
     def test_userbot_gives_up_after_all_proxies(self):
         self._install_proxies(
@@ -7186,7 +9936,7 @@ class StartupTest(BotTestCase):
             ]
         )
         client = _FakeTelegramClient(fail_times=5)
-        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, lambda _dc=None: client, "get_client")
         self._install_client(userbot, client, "client")
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.starts, 2)
@@ -7196,7 +9946,7 @@ class StartupTest(BotTestCase):
         self._install_proxies([{"proxy_type": "socks5", "addr": "6.6.6.6", "port": 1}])
         client = _FakeTelegramClient(username="meuser")
         client.set_proxy = mock.Mock(side_effect=RuntimeError("still connected"))
-        self._install_client(userbot, lambda: client, "get_client")
+        self._install_client(userbot, lambda _dc=None: client, "get_client")
         self._install_client(userbot, client, "client")
         asyncio.run(userbot.start_userbot())
         self.assertEqual(client.starts, 0)
@@ -7205,7 +9955,7 @@ class StartupTest(BotTestCase):
         queue = list(clients)
         seen = []
 
-        def connect(_proxy):
+        def connect(_proxy, _dc=None):
             seen.append(_proxy)
             return queue.pop(0)
 
