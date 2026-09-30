@@ -133,6 +133,9 @@ DC_ORDER = (2, 1, 3, 4, 5)
 
 DC_PORT = 443
 
+API_HOST = "api.telegram.org"
+API_BASE_URL = f"https://{API_HOST}"
+
 DRAIN_TIMEOUT = 5.0
 
 
@@ -196,10 +199,15 @@ def dc_address(dc=None) -> str:
 
 
 def dc_api_url(dc=None) -> str | None:
-    address = dc_address(dc)
-    if not address:
+    if not dc_address(dc):
         return None
-    return f"https://{address}"
+    return API_BASE_URL
+
+
+def dc_api_pin(dc=None) -> str:
+    if dc is None:
+        return dc_fallback()
+    return dc_address(dc)
 
 
 def dc_candidates(extra=()) -> list[dict]:

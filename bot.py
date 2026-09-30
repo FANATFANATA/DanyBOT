@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import logging
 import re
+import socket
 import time
 from collections import deque
 from pathlib import Path
@@ -26,6 +27,8 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.token import TokenValidationError
+from aiohttp.abc import AbstractResolver, ResolveResult
+from aiohttp.resolver import DefaultResolver
 from telethon.errors import FloodWaitError, RPCError
 
 import core
@@ -296,7 +299,7 @@ def _bot_stats(chat_id):
 def get_bot_client() -> BotClient:
     global bot_client
     if bot_client is None:
-        bot_client = BotClient(Bot(token=userbot.BOT_TOKEN, session=AiohttpSession()))
+        bot_client = BotClient(Bot(token=userbot.BOT_TOKEN, session=_session_for(None)))
     return bot_client
 
 
@@ -322,17 +325,56 @@ def _proxy_url(proxy) -> str | None:
     return f"{PROXY_SCHEMES.get(protocol.lower(), 'socks5')}://{host}:{port}"
 
 
-def _session_for(proxy, dc=None):
+class _PinnedResolver(AbstractResolver):
+    def __init__(self, host: str, address: str) -> None:
+        self._host = host.strip().lower()
+        self._address = address.strip()
+        self._default: AbstractResolver | None = None
+
+    def _fallback(self) -> AbstractResolver:
+        if self._default is None:
+            self._default = DefaultResolver()
+        return self._default
+
+    async def resolve(
+        self, host: str, port: int = 0, family: socket.AddressFamily = socket.AF_INET
+    ) -> list[ResolveResult]:
+        if host.rstrip(".").lower() == self._host and family != socket.AF_INET6:
+            return [
+                {
+                    "hostname": host,
+                    "host": self._address,
+                    "port": port,
+                    "family": socket.AF_INET,
+                    "proto": socket.IPPROTO_TCP,
+                    "flags": socket.AI_NUMERICHOST | socket.AI_NUMERICSERV,
+                }
+            ]
+        return await self._fallback().resolve(host, port, family)
+
+    async def close(self) -> None:
+        if self._default is not None:
+            await self._default.close()
+            self._default = None
+
+
+def _session_for(proxy, dc=None, address=""):
     url = _proxy_url(proxy)
     kwargs: dict[str, Any] = {"proxy": url} if url else {}
     base = core.dc_api_url(dc)
     if base:
         kwargs["api"] = TelegramAPIServer.from_base(base)
-    return AiohttpSession(**kwargs)
+    session = AiohttpSession(**kwargs)
+    pin = address or core.dc_api_pin(dc)
+    if pin:
+        session._connector_init["resolver"] = _PinnedResolver(core.API_HOST, pin)
+    return session
 
 
-def _connect(proxy, dc=None) -> BotClient:
-    return BotClient(Bot(token=userbot.BOT_TOKEN, session=_session_for(proxy, dc)))
+def _connect(proxy, dc=None, address="") -> BotClient:
+    return BotClient(
+        Bot(token=userbot.BOT_TOKEN, session=_session_for(proxy, dc, address))
+    )
 
 
 _MENTION_RX = None
@@ -985,7 +1027,7 @@ async def _connect_all(dc, candidates):
             )
         attempt = None
         try:
-            attempt = _connect(proxy, dc["dc"] or None)
+            attempt = _connect(proxy, dc["dc"] or None, dc["address"])
             me = await asyncio.wait_for(attempt.resolve(), timeout=CONNECT_TIMEOUT)
         except (TelegramUnauthorizedError, TokenValidationError) as exc:
             logger.error("Токен бота невалиден: %s", exc)

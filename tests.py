@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import stat
 import subprocess
@@ -4761,9 +4762,23 @@ class DatacenterTest(BotTestCase):
         self.assertEqual(tools_module._opt_int_arg({"n": 99}, "n", 1, 20), 20)
 
     def test_dc_api_url(self):
-        self.assertEqual(core.dc_api_url(2), f"https://{core.DC_FALLBACK}")
+        self.assertEqual(core.dc_api_url(2), core.API_BASE_URL)
+        self.assertEqual(core.dc_api_url(2), f"https://{core.API_HOST}")
         self.assertIsNone(core.dc_api_url(9))
         self.assertIsNone(core.dc_api_url(None))
+        self.assertIsNone(core.dc_api_url(True))
+        self.assertIsNone(core.dc_api_url([2]))
+
+    def test_dc_api_pin(self):
+        self.assertEqual(core.dc_api_pin(2), core.DC_FALLBACK)
+        self.assertEqual(core.dc_api_pin(4), core.DC_ADDRESSES[4])
+        self.assertEqual(core.dc_api_pin(None), core.dc_fallback())
+        self.assertEqual(core.dc_api_pin(9), "")
+        self.assertEqual(core.dc_api_pin("junk"), "")
+
+    def test_dc_api_pin_reads_fallback_from_env(self):
+        with mock.patch.dict(os.environ, {"DC_FALLBACK": "10.0.0.9"}):
+            self.assertEqual(core.dc_api_pin(None), "10.0.0.9")
 
     def test_dc_order_default_and_env(self):
         with mock.patch.dict(os.environ):
@@ -4867,16 +4882,104 @@ class DatacenterTest(BotTestCase):
     def test_connect_uses_dc_api_url(self):
         userbot.BOT_TOKEN = BOT_TOKEN_VALUE
         client = bot._connect(None, 2)
-        self.assertTrue(
-            client.bot.session.api.base.startswith(f"https://{core.DC_FALLBACK}")
+        session = client.bot.session
+        self.assertTrue(session.api.base.startswith(core.API_BASE_URL))
+        self.assertEqual(session._connector_init["resolver"]._address, core.DC_FALLBACK)
+        self.assertEqual(session._connector_init["resolver"]._host, core.API_HOST)
+        asyncio.run(client.close())
+
+    def test_connect_pins_candidate_address(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = bot._connect(None, 0, core.DC_ADDRESSES[4])
+        session = client.bot.session
+        self.assertEqual(
+            session._connector_init["resolver"]._address, core.DC_ADDRESSES[4]
         )
         asyncio.run(client.close())
 
     def test_connect_without_dc_uses_default_api_url(self):
         userbot.BOT_TOKEN = BOT_TOKEN_VALUE
         client = bot._connect(None)
-        self.assertNotIn(core.DC_FALLBACK, client.bot.session.api.base)
+        session = client.bot.session
+        self.assertNotIn(core.DC_FALLBACK, session.api.base)
+        self.assertEqual(
+            session._connector_init["resolver"]._address, core.dc_fallback()
+        )
         asyncio.run(client.close())
+
+    def test_connect_with_unknown_dc_keeps_system_resolver(self):
+        userbot.BOT_TOKEN = BOT_TOKEN_VALUE
+        client = bot._connect(None, 9)
+        self.assertNotIn("resolver", client.bot.session._connector_init)
+        asyncio.run(client.close())
+
+    def test_pinned_resolver_serves_api_host(self):
+        resolver = bot._PinnedResolver(core.API_HOST, "149.154.167.220")
+
+        async def run():
+            return await resolver.resolve("API.Telegram.org.", 443, socket.AF_INET)
+
+        results = asyncio.run(run())
+        self.assertEqual(
+            results,
+            [
+                {
+                    "hostname": "API.Telegram.org.",
+                    "host": "149.154.167.220",
+                    "port": 443,
+                    "family": socket.AF_INET,
+                    "proto": socket.IPPROTO_TCP,
+                    "flags": socket.AI_NUMERICHOST | socket.AI_NUMERICSERV,
+                }
+            ],
+        )
+        asyncio.run(resolver.close())
+
+    def test_pinned_resolver_falls_back_to_system_dns(self):
+        resolver = bot._PinnedResolver(core.API_HOST, "149.154.167.220")
+        seen = []
+
+        class _FakeDefault:
+            async def resolve(self, host, port=0, family=socket.AF_INET):
+                seen.append((host, port, family))
+                return [
+                    {
+                        "hostname": host,
+                        "host": "1.2.3.4",
+                        "port": port,
+                        "family": socket.AF_INET,
+                        "proto": socket.IPPROTO_TCP,
+                        "flags": 0,
+                    }
+                ]
+
+            async def close(self):
+                seen.append("closed")
+
+        saved = bot.DefaultResolver
+        self.addCleanup(setattr, bot, "DefaultResolver", saved)
+        bot.DefaultResolver = lambda *a, **k: _FakeDefault()
+
+        results = asyncio.run(resolver.resolve("example.org", 443))
+        self.assertEqual([item["host"] for item in results], ["1.2.3.4"])
+        self.assertEqual(seen, [("example.org", 443, socket.AF_INET)])
+        asyncio.run(resolver.close())
+        self.assertEqual(seen[-1], "closed")
+
+    def test_pinned_resolver_ignores_ipv6_requests(self):
+        resolver = bot._PinnedResolver(core.API_HOST, "149.154.167.220")
+        saved = bot.DefaultResolver
+        self.addCleanup(setattr, bot, "DefaultResolver", saved)
+
+        class _FakeDefault:
+            async def resolve(self, _host, _port=0, family=socket.AF_INET):
+                return family
+
+        bot.DefaultResolver = lambda *a, **k: _FakeDefault()
+        self.assertEqual(
+            asyncio.run(resolver.resolve(core.API_HOST, 443, socket.AF_INET6)),
+            socket.AF_INET6,
+        )
 
     def _client_with_memory_session(self, dc):
         saved_client = userbot.client
@@ -6085,7 +6188,7 @@ class BotHandlerTest(BotTestCase):
 
         for attr, value in (
             ("_proxy_candidates", no_proxies),
-            ("_connect", mock.Mock(side_effect=lambda p, dc=None: client)),
+            ("_connect", mock.Mock(side_effect=lambda p, dc=None, address="": client)),
             ("bot_client", None),
             ("bot_username", ""),
             ("bot_id", 0),
@@ -10285,7 +10388,7 @@ class StartupTest(BotTestCase):
         queue = list(clients)
         seen = []
 
-        def connect(_proxy, _dc=None):
+        def connect(_proxy, _dc=None, _address=""):
             seen.append(_proxy)
             return queue.pop(0)
 
