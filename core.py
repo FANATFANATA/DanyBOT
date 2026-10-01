@@ -4,6 +4,7 @@ import json
 import math
 import os
 import re
+import secrets
 import stat
 import tempfile
 import threading
@@ -332,6 +333,84 @@ def handle_bot_commands(text) -> tuple[str, Any] | None:
     return (cmd, None)
 
 
+BOT_COMMAND_TITLES = {
+    "help": "Справка / Help",
+    "clear": "Очистить контекст / Clear",
+    "model": "Текущая модель / Current model",
+    "models": "Список моделей / Models",
+    "settings": "Настройки / Settings",
+    "coder": "Кодер-режим / Coder mode",
+    "reasoning": "Рассуждения / Reasoning",
+    "tools": "Инструменты / Tools",
+    "prompt": "Системный промпт / System prompt",
+    "task": "Журнал задач / Task log",
+}
+
+INLINE_OWNER_COMMANDS = (
+    "clear",
+    "model",
+    "models",
+    "settings",
+    "coder",
+    "reasoning",
+    "tools",
+    "prompt",
+    "task",
+)
+
+
+def inline_command_matches(query, is_owner) -> list[tuple[str, str]]:
+    stripped = (query or "").strip()
+    if not stripped.startswith("/"):
+        return []
+    parts = stripped[1:].split()
+    if not parts:
+        return []
+    head = parts[0].split("@", 1)[0].strip().lower()
+    if not head:
+        return []
+    parsed = handle_bot_commands(stripped)
+    if parsed is None:
+        names = [name for name in BOT_COMMAND_TITLES if name.startswith(head)]
+    else:
+        name = parsed[0].removesuffix("_status")
+        names = [name] if name in BOT_COMMAND_TITLES else []
+    return [
+        (f"/{name}", BOT_COMMAND_TITLES[name])
+        for name in names
+        if is_owner or name not in INLINE_OWNER_COMMANDS
+    ]
+
+
+INLINE_MARK = "\u2063"
+INLINE_TOKEN_LEN = 12
+INLINE_MARK_RE = re.compile(
+    f"{INLINE_MARK}([0-9a-f]{{{INLINE_TOKEN_LEN}}}){INLINE_MARK}"
+)
+INLINE_MARK_WIDTH = 2 * len(INLINE_MARK) + INLINE_TOKEN_LEN + 1
+
+INLINE_TOKEN_TTL = 300.0
+
+
+def new_inline_token() -> str:
+    return secrets.token_hex(INLINE_TOKEN_LEN // 2)
+
+
+def inline_marked_text(token: str, text: str) -> str:
+    mark = f"{INLINE_MARK}{token}{INLINE_MARK}"
+    body = (text or "").strip()
+    return f"{mark} {body}" if body else mark
+
+
+def inline_token_of(text) -> str | None:
+    match = INLINE_MARK_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def strip_inline_mark(text) -> str:
+    return INLINE_MARK_RE.sub("", text or "", count=1).strip()
+
+
 def strip_role_tag(text: str, bot_name: str = "DanyBOT") -> str:
     low = text.strip().lower()
     if low.startswith(f"{bot_name.lower()}:"):
@@ -379,13 +458,16 @@ def _int_set(raw) -> set[int]:
 def parse_state_data(data):
     if not isinstance(data, dict):
         raise TypeError("state must be an object")
-    return {
+    state = {
         "model_overrides": _int_map(data.get("model_overrides", {})),
         "coder_chats": _int_set(data.get("coder_chats", [])),
         "reasoning_hidden": _int_set(data.get("reasoning_hidden", [])),
         "tools_hidden": _int_set(data.get("tools_hidden", [])),
         "tasks": data.get("tasks", {}),
     }
+    if isinstance(data.get("inline_mode"), bool):
+        state["inline_mode"] = data["inline_mode"]
+    return state
 
 
 def load_state_file(path):
@@ -473,6 +555,8 @@ def save_state_file(path, state):
         }
         if state.get("tasks"):
             data["tasks"] = state["tasks"]
+        if isinstance(state.get("inline_mode"), bool):
+            data["inline_mode"] = state["inline_mode"]
         return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
 
     return _write_text_atomic(path, snapshot)
@@ -516,6 +600,7 @@ _MODE_KEYS = (
     "recent_reply_ids",
     "last_chat_activity",
     "seen_msg_keys",
+    "inline_mode",
 )
 
 SAVER_ERRORS: tuple[type[BaseException], ...] = (
@@ -610,7 +695,10 @@ class ModeStore:
 
     def __getattr__(self, name):
         if name in _MODE_KEYS:
-            return self._ns[name]
+            try:
+                return self._ns[name]
+            except KeyError as exc:
+                raise AttributeError(name) from exc
         raise AttributeError(name)
 
     def __setattr__(self, name, value):
@@ -632,6 +720,8 @@ def load_state_into(store, state_file, logger=None, journal=None):
     store.coder_chats = state["coder_chats"]
     store.reasoning_hidden = state["reasoning_hidden"]
     store.tools_hidden = state["tools_hidden"]
+    if "inline_mode" in state:
+        store.inline_mode = state["inline_mode"]
     if journal is not None:
         journal.restore(state.get("tasks"))
 
@@ -643,6 +733,9 @@ def save_state_from(store, state_file, logger, journal=None) -> bool:
         "reasoning_hidden": store.reasoning_hidden,
         "tools_hidden": store.tools_hidden,
     }
+    inline = getattr(store, "inline_mode", None)
+    if isinstance(inline, bool):
+        payload["inline_mode"] = inline
     if journal is not None:
         payload["tasks"] = journal.snapshot()
     if save_state_file(state_file, payload):
@@ -678,8 +771,12 @@ def _evict_oldest(target, limit: int) -> None:
     overflow = len(target) - limit
     if overflow <= 0:
         return
+    mapping = isinstance(target, dict)
     for key in list(target)[: min(overflow, _EVICT_BATCH)]:
-        target.discard(key)
+        if mapping:
+            target.pop(key, None)
+        else:
+            target.discard(key)
 
 
 def _remember_key(target, key, limit: int) -> None:

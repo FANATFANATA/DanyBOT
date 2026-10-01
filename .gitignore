@@ -20,4 +20,5 @@ toolrun.log
 subagent_cache.json
 collected.xml
 collecter.py
+AGENTS.md
 data/

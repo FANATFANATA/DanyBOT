@@ -129,6 +129,7 @@ CODER_SYSTEM_PROMPT = _env_str(
 ENABLE_USERBOT = _env_bool("ENABLE_USERBOT", True)
 ENABLE_BOT = _env_bool("ENABLE_BOT", False)
 BOT_TOKEN = _env_str("BOT_TOKEN", "")
+INLINE_MODE = _env_bool("INLINE_MODE", True)
 
 
 def _env_pos_int(name: str) -> int | None:
