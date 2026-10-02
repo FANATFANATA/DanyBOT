@@ -24,6 +24,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultArticle,
+    InputTextMessageContent,
     Message,
 )
 from aiogram.utils.token import TokenValidationError
@@ -47,17 +50,27 @@ TYPING_INTERVAL = 4.0
 CONNECT_TIMEOUT = 25
 POLL_TIMEOUT = 10
 PROXY_SCHEMES = {"socks5": "socks5", "socks4": "socks4", "http": "http"}
+INLINE_TITLE_LIMIT = 64
+INLINE_DESC_LIMIT = 100
+INLINE_TEXT_LIMIT = 4000
+INLINE_MAX_RESULTS = 20
+INLINE_CACHE_TIME = 0
+INLINE_PENDING_MAX = 2000
+INLINE_SUGGESTIONS = ("help", "models", "task", "clear")
 
 model_overrides: dict[int, str] = {}
 coder_chats: set[int] = set()
 reasoning_hidden: set[int] = set()
 tools_hidden: set[int] = set()
+inline_mode: bool = userbot.INLINE_MODE
 
 chat_history: dict[int, deque] = {}
 ctx_lock = asyncio.Lock()
 recent_reply_ids: set[tuple[int, int]] = set()
 seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
+inline_tokens: dict[str, tuple[int, float]] = {}
+inline_prompts: dict[tuple[int, str], float] = {}
 
 STORE: core.ModeStore = core.ModeStore(globals())
 SESSIONS = core.SessionRegistry()
@@ -236,6 +249,14 @@ class BotCallbackEvent:
         return SentMessage(sent)
 
 
+class BotInlineEvent:
+    def __init__(self, query: InlineQuery):
+        self._query = query
+        self.inline_query_id = query.id
+        self.query = (query.query or "").strip()
+        self.sender_id = _sender_id(query)
+
+
 class BotClient:
     def __init__(self, bot):
         self.bot = bot
@@ -248,6 +269,16 @@ class BotClient:
             await _tg_call(self.bot.set_my_commands(_menu_commands()))
         except (RPCError, OSError, ValueError, TypeError) as exc:
             logger.warning("Не удалось задать меню команд: %s", exc)
+
+    async def answer_inline(self, inline_query_id, results) -> None:
+        await _tg_call(
+            self.bot.answer_inline_query(
+                inline_query_id=inline_query_id,
+                results=list(results),
+                cache_time=INLINE_CACHE_TIME,
+                is_personal=True,
+            )
+        )
 
     async def poll(self) -> None:
         await build_dispatcher().start_polling(
@@ -312,8 +343,12 @@ def build_dispatcher() -> Dispatcher:
     async def on_callback(query: CallbackQuery) -> None:
         await callback_handler(BotCallbackEvent(query))
 
+    async def on_inline(query: InlineQuery) -> None:
+        await inline_handler(BotInlineEvent(query))
+
     dispatcher.message.register(on_message)
     dispatcher.callback_query.register(on_callback)
+    dispatcher.inline_query.register(on_inline)
     return dispatcher
 
 
@@ -410,6 +445,49 @@ def _strip_trigger(text, triggered):
     return text.strip()
 
 
+def _clip(text, limit):
+    body = " ".join(str(text or "").split())
+    if len(body) <= limit:
+        return body
+    return body[: max(1, limit - 1)].rstrip() + "…"
+
+
+def _prune_inline(now):
+    for key, entry in list(inline_tokens.items()):
+        if entry[1] <= now:
+            del inline_tokens[key]
+    for key, deadline in list(inline_prompts.items()):
+        if deadline <= now:
+            del inline_prompts[key]
+    core._evict_oldest(inline_tokens, INLINE_PENDING_MAX)
+    core._evict_oldest(inline_prompts, INLINE_PENDING_MAX)
+
+
+def _register_inline(sender_id, text):
+    _prune_inline(time.monotonic())
+    deadline = time.monotonic() + core.INLINE_TOKEN_TTL
+    token = core.new_inline_token()
+    inline_tokens[token] = (int(sender_id), deadline)
+    plain = core.strip_inline_mark(text)
+    if plain:
+        inline_prompts[(int(sender_id), plain.lower())] = deadline
+    return token
+
+
+def _claim_inline(sender_id, text):
+    _prune_inline(time.monotonic())
+    plain = core.strip_inline_mark(text)
+    key = (int(sender_id), plain.lower())
+    token = core.inline_token_of(text)
+    if token is not None:
+        owner = inline_tokens.get(token)
+        if owner is not None and owner[0] == int(sender_id):
+            del inline_tokens[token]
+            inline_prompts.pop(key, None)
+            return True
+    return inline_prompts.pop(key, None) is not None
+
+
 BOT_HELP_TEXT = (
     "DanyBOT - команды / commands:\n"
     "/help /start - справка / help\n"
@@ -418,7 +496,9 @@ BOT_HELP_TEXT = (
     "/task - журнал последней задачи / last task log\n\n"
     "Модель, рассуждения, инструменты, кодер-режим и системный\n"
     "промпт - в меню /settings.\n\n"
-    "Также работает / Also works: @упоминание, реплай боту."
+    "Также работает / Also works: @упоминание, реплай боту.\n"
+    "Инлайн-режим: набери @бота в любом чате.\n"
+    "Inline mode: type @bot in any chat."
 )
 
 
@@ -493,6 +573,10 @@ async def handler(event: Any):
     if is_private and await _sender_is_bot(event):
         return
     triggered = NO_TEXT_TRIGGER
+    if _claim_inline(sender_id, text):
+        triggered = True
+        text = core.strip_inline_mark(text)
+        logger.info("Бот: инлайн-запрос из чата %s от %s", chat_id, sender_id)
     mentioned = _is_mentioned(text)
     now = time.monotonic()
 
@@ -816,6 +900,12 @@ def _settings_rows(chat_id) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text=f"Инлайн-режим: {_global_on_off_label(inline_mode)}",
+                    callback_data="settings:inline",
+                )
+            ],
+            [
+                InlineKeyboardButton(
                     text="Очистить контекст", callback_data="settings:clear"
                 )
             ],
@@ -893,6 +983,10 @@ def _on_off_label(chat_id, active) -> str:
     return "вкл" if chat_id in active else "выкл"
 
 
+def _global_on_off_label(active) -> str:
+    return "вкл" if active else "выкл"
+
+
 def _settings_text(chat_id, is_private=None):
     limit = core.history_limit(
         chat_id, is_private, userbot.DM_HISTORY_LIMIT, userbot.GROUP_HISTORY_LIMIT
@@ -904,6 +998,7 @@ def _settings_text(chat_id, is_private=None):
         f"Рассуждения / Reasoning: {_state_label(chat_id, reasoning_hidden)}\n"
         f"Инструменты / Tools: {_state_label(chat_id, tools_hidden)}\n"
         f"Кодер-режим / Coder: {_on_off_label(chat_id, coder_chats)}\n"
+        f"Инлайн-режим / Inline: {_global_on_off_label(inline_mode)}\n"
         f"Контекст / Context: {ctx_len}/{limit}\n"
         f"Задача / Task: {core.task_state_label(TASKS.get(chat_id))}"
     )
@@ -948,6 +1043,10 @@ async def callback_handler(event: Any):
         save_state()
         if chat_id not in coder_chats:
             SESSIONS.cancel(chat_id, reason="кодер выключен", logger=logger)
+    elif action == "inline":
+        global inline_mode
+        inline_mode = not inline_mode
+        save_state()
     elif action == "clear":
         limit = core.history_limit(
             chat_id,
@@ -1000,6 +1099,69 @@ async def callback_handler(event: Any):
         return
     await _answer(event, "Готово.")
     await _edit_settings(event, chat_id)
+
+
+def _inline_article(article_id, title, sender_id, text):
+    token = _register_inline(sender_id, text)
+    return InlineQueryResultArticle(
+        id=article_id,
+        title=_clip(title, INLINE_TITLE_LIMIT),
+        description=_clip(text, INLINE_DESC_LIMIT),
+        input_message_content=InputTextMessageContent(
+            message_text=core.inline_marked_text(
+                token, _clip(text, INLINE_TEXT_LIMIT - core.INLINE_MARK_WIDTH)
+            ),
+            disable_web_page_preview=True,
+        ),
+    )
+
+
+def _inline_available(sender_id):
+    return int(sender_id) in userbot.OWNER_IDS
+
+
+def _inline_suggestions(sender_id):
+    owner = _inline_available(sender_id)
+    return [
+        _inline_article(
+            f"cmd:{name}",
+            core.BOT_COMMAND_TITLES.get(name, name),
+            sender_id,
+            f"/{name}",
+        )
+        for name in INLINE_SUGGESTIONS
+        if owner or name not in core.INLINE_OWNER_COMMANDS
+    ]
+
+
+def build_inline_results(query, sender_id):
+    text = (query or "").strip()
+    commands = core.inline_command_matches(text, _inline_available(sender_id))
+    if commands:
+        return [
+            _inline_article(f"cmd:{cmd[1:]}", title, sender_id, cmd)
+            for cmd, title in commands[:INLINE_MAX_RESULTS]
+        ]
+    if text:
+        return [_inline_article("ask", userbot.BOT_NAME, sender_id, text)]
+    return _inline_suggestions(sender_id)
+
+
+async def inline_handler(event: Any):
+    results = build_inline_results(event.query, event.sender_id) if inline_mode else []
+    try:
+        await (bot_client or get_bot_client()).answer_inline(
+            event.inline_query_id, results
+        )
+    except (
+        TelegramAPIError,
+        RPCError,
+        OSError,
+        ValueError,
+        TypeError,
+        OverflowError,
+    ) as exc:
+        logger.warning("Инлайн-запрос не обработан: %r", exc)
 
 
 async def _proxy_candidates():
@@ -1091,12 +1253,22 @@ async def start_bot():
     bot_client = client
     await client.set_commands()
     logger.info("Бот запущен как @%s (id %s)", bot_username or "?", bot_id)
+    if inline_mode:
+        logger.info(
+            "Инлайн-режим включён: набери @%s в любом чате. "
+            "Если бота нет в списке, выполни /setinline у @BotFather",
+            bot_username or "bot",
+        )
+    else:
+        logger.info("Инлайн-режим выключен в настройках бота")
     await client.poll()
 
 
 async def disconnect_quietly(timeout=10):
     SESSIONS.cancel_all(reason="остановка", logger=logger)
     await SESSIONS.drain(timeout)
+    inline_tokens.clear()
+    inline_prompts.clear()
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if bot_client is None:

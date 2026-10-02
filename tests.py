@@ -37,6 +37,7 @@ from aiogram.types import (
     CallbackQuery,
     Chat,
     InaccessibleMessage,
+    InlineQuery,
     Message,
     Update,
     User,
@@ -165,6 +166,7 @@ _MODE_ATTRS = (
     "tools_hidden",
     "chat_history",
 )
+_MODE_BOOL_ATTRS = ("inline_mode",)
 
 
 def _snapshot_module(mod):
@@ -177,6 +179,8 @@ def _snapshot_module(mod):
             snap[attr] = dict(value)
         else:
             snap[attr] = set(value)
+    for attr in _MODE_BOOL_ATTRS:
+        snap[attr] = getattr(mod, attr, None)
     return snap
 
 
@@ -6024,6 +6028,46 @@ class BotHandlerTest(BotTestCase):
         self._run(self._group_event(""))
         self.assertEqual(self.stream_calls, [])
 
+    def _inline_text(self, query="привет как дела", sender_id=1):
+        self.addCleanup(bot.inline_tokens.clear)
+        self.addCleanup(bot.inline_prompts.clear)
+        return inline_marked_text(bot.build_inline_results(query, sender_id))
+
+    def test_inline_message_answers_group(self):
+        marked = self._inline_text(sender_id=1)
+        self._run(self._group_event(marked, sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertTrue(self._prompt().endswith("привет как дела"))
+
+    def test_inline_message_still_answers_after_edit(self):
+        marked = self._inline_text(sender_id=1)
+        self._run(self._group_event(f"{marked}, подробнее", sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertTrue(self._prompt().endswith("привет как дела, подробнее"))
+
+    def test_inline_token_is_not_reused(self):
+        marked = self._inline_text(sender_id=1)
+        self._run(self._group_event(marked, sender_id=1))
+        self._run(self._group_event(marked, sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_plain_copy_of_inline_query_answers_once(self):
+        self._inline_text(sender_id=1)
+        self._run(self._group_event("привет как дела", sender_id=1))
+        self._run(self._group_event("привет как дела", sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_inline_command_runs_prompt_reply(self):
+        marked = self._inline_text(query="/help", sender_id=self.OWNER)
+        event = self._run(self._group_event(marked, sender_id=self.OWNER))
+        self.assertEqual(self.stream_calls, [])
+        self.assertIn("DanyBOT - команды", event.sent[0])
+
+    def test_inline_prompt_has_no_invisible_mark(self):
+        marked = self._inline_text(sender_id=self.OWNER)
+        self._run(self._group_event(marked, sender_id=self.OWNER))
+        self.assertNotIn(core.INLINE_MARK, self._prompt())
+
     def test_private_message_from_bot_is_ignored(self):
         event = self._group_event(
             "привет",
@@ -7060,10 +7104,45 @@ class SettingsMenuTest(BotTestCase):
                 "settings:reasoning",
                 "settings:tools",
                 "settings:coder",
+                "settings:inline",
                 "settings:clear",
                 "settings:prompt",
             },
         )
+
+    def test_callback_toggles_inline_mode(self):
+        saved = bot.inline_mode
+        self.addCleanup(setattr, bot, "inline_mode", saved)
+        bot.inline_mode = True
+        event = _CallbackEvent("settings:inline", self.CHAT_ID, self.CHAT_ID)
+        asyncio.run(bot.callback_handler(event))
+        self.assertFalse(bot.inline_mode)
+        self.assertIn("Инлайн-режим / Inline: выкл", bot._settings_text(self.CHAT_ID))
+        asyncio.run(bot.callback_handler(event))
+        self.assertTrue(bot.inline_mode)
+
+    def test_inline_mode_survives_restart(self):
+        saved = bot.inline_mode
+        self.addCleanup(setattr, bot, "inline_mode", saved)
+        bot.inline_mode = False
+        bot.save_state()
+        bot.inline_mode = True
+        bot.load_state()
+        self.assertFalse(bot.inline_mode)
+
+    def test_settings_rows_report_inline_state(self):
+        saved = bot.inline_mode
+        self.addCleanup(setattr, bot, "inline_mode", saved)
+        bot.inline_mode = False
+        labels = [
+            btn.text for btn in rows_data_buttons(bot._settings_rows(self.CHAT_ID))
+        ]
+        self.assertIn("Инлайн-режим: выкл", labels)
+        bot.inline_mode = True
+        labels = [
+            btn.text for btn in rows_data_buttons(bot._settings_rows(self.CHAT_ID))
+        ]
+        self.assertIn("Инлайн-режим: вкл", labels)
 
     def test_settings_text_reports_state(self):
         text = bot._settings_text(self.CHAT_ID)
@@ -7242,6 +7321,392 @@ class SettingsMenuTest(BotTestCase):
             if btn_data(btn) == "settings:reasoning"
         )
         self.assertIn("видно", text)
+
+
+class InlineMarkTest(BotTestCase):
+    def test_token_is_hex_and_unique(self):
+        tokens = {core.new_inline_token() for _ in range(200)}
+        self.assertEqual(len(tokens), 200)
+        for token in tokens:
+            self.assertRegex(token, "^[0-9a-f]+$")
+            self.assertEqual(len(token), core.INLINE_TOKEN_LEN)
+
+    def test_mark_round_trip(self):
+        token = core.new_inline_token()
+        marked = core.inline_marked_text(token, "  привет  ")
+        self.assertNotIn(core.INLINE_MARK, core.strip_inline_mark(marked))
+        self.assertEqual(core.strip_inline_mark(marked), "привет")
+        self.assertEqual(core.inline_token_of(marked), token)
+
+    def test_mark_without_body_keeps_token(self):
+        token = core.new_inline_token()
+        marked = core.inline_marked_text(token, "   ")
+        self.assertEqual(core.inline_token_of(marked), token)
+        self.assertEqual(core.strip_inline_mark(marked), "")
+
+    def test_plain_text_has_no_token(self):
+        for text in ("привет", "", None, "@danybot привет"):
+            with self.subTest(text=text):
+                self.assertIsNone(core.inline_token_of(text))
+                self.assertEqual(core.strip_inline_mark(text), (text or "").strip())
+
+    def test_foreign_mark_is_ignored(self):
+        self.assertIsNone(
+            core.inline_token_of(f"{core.INLINE_MARK}zz{core.INLINE_MARK}")
+        )
+
+    def test_command_matches_exact(self):
+        self.assertEqual(
+            core.inline_command_matches("/help", False), [("/help", "Справка / Help")]
+        )
+        self.assertEqual(
+            core.inline_command_matches("  /Help@danybot_bot  ", False),
+            [("/help", "Справка / Help")],
+        )
+
+    def test_command_matches_prefix_offers_each_variant(self):
+        self.assertEqual(
+            [cmd for cmd, _ in core.inline_command_matches("/mo", True)],
+            ["/model", "/models"],
+        )
+
+    def test_command_matches_gate_owner_commands(self):
+        self.assertEqual(core.inline_command_matches("/mo", False), [])
+        self.assertEqual(core.inline_command_matches("/clear", False), [])
+        self.assertEqual(
+            [cmd for cmd, _ in core.inline_command_matches("/clear", True)], ["/clear"]
+        )
+
+    def test_command_matches_ignore_unknown(self):
+        for text in ("привет", "/zzz", "/", "", "help", "/помоги"):
+            with self.subTest(text=text):
+                self.assertEqual(core.inline_command_matches(text, True), [])
+
+    def test_command_matches_hide_status_command(self):
+        self.assertEqual(
+            [cmd for cmd, _ in core.inline_command_matches("/coder", True)], ["/coder"]
+        )
+
+    def test_state_round_trip_keeps_inline_mode(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_inline_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "state.json"
+        base = {
+            "model_overrides": {},
+            "coder_chats": set(),
+            "reasoning_hidden": set(),
+            "tools_hidden": set(),
+        }
+        self.assertTrue(core.save_state_file(target, {**base, "inline_mode": False}))
+        loaded = core.load_state_file(target)
+        self.assertIsNotNone(loaded)
+        self.assertFalse(cast(Any, loaded)["inline_mode"])
+        self.assertTrue(core.save_state_file(target, {**base, "inline_mode": True}))
+        self.assertTrue(cast(Any, core.load_state_file(target))["inline_mode"])
+
+    def test_state_omits_missing_inline_mode(self):
+        parsed = core.parse_state_data(
+            {
+                "model_overrides": {},
+                "coder_chats": [],
+                "reasoning_hidden": [],
+                "tools_hidden": [],
+            }
+        )
+        self.assertNotIn("inline_mode", parsed)
+
+    def test_state_ignores_non_bool_inline_mode(self):
+        parsed = core.parse_state_data({"inline_mode": "yes"})
+        self.assertNotIn("inline_mode", parsed)
+
+    def test_mode_store_hides_absent_inline_mode(self):
+        store = core.ModeStore({"model_overrides": {}})
+        self.assertIsNone(getattr(store, "inline_mode", None))
+
+
+def inline_marked_text(results, index=0):
+    content = cast(Any, results[index].input_message_content)
+    return cast(str, content.message_text)
+
+
+def inline_texts(results):
+    return [inline_marked_text(results, index) for index in range(len(results))]
+
+
+class InlineResultsTest(BotTestCase):
+    OWNER = 5
+    STRANGER = 6
+
+    def setUp(self):
+        super().setUp()
+        saved = userbot.OWNER_IDS
+        self.addCleanup(setattr, userbot, "OWNER_IDS", saved)
+        userbot.OWNER_IDS = {self.OWNER}
+        self._clear_tokens()
+        self.addCleanup(self._clear_tokens)
+
+    def _clear_tokens(self):
+        bot.inline_tokens.clear()
+        bot.inline_prompts.clear()
+
+    def test_ask_result_carries_query_and_token(self):
+        results = bot.build_inline_results("  привет как дела  ", self.STRANGER)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].id, "ask")
+        self.assertEqual(results[0].title, userbot.BOT_NAME)
+        self.assertEqual(results[0].description, "привет как дела")
+        marked = inline_marked_text(results)
+        self.assertEqual(core.strip_inline_mark(marked), "привет как дела")
+        self.assertIsNotNone(core.inline_token_of(marked))
+        content = cast(Any, results[0].input_message_content)
+        self.assertTrue(content.disable_web_page_preview)
+
+    def test_empty_query_lists_owner_commands(self):
+        results = bot.build_inline_results("", self.OWNER)
+        self.assertEqual(
+            [item.id for item in results],
+            ["cmd:help", "cmd:models", "cmd:task", "cmd:clear"],
+        )
+        for text in inline_texts(results):
+            self.assertIsNotNone(core.inline_token_of(text))
+
+    def test_empty_query_hides_owner_commands_from_stranger(self):
+        self.assertEqual(
+            [item.id for item in bot.build_inline_results("", self.STRANGER)],
+            ["cmd:help"],
+        )
+
+    def test_query_command_replaces_ask_result(self):
+        results = bot.build_inline_results("/he", self.STRANGER)
+        self.assertEqual([item.id for item in results], ["cmd:help"])
+        self.assertEqual(core.strip_inline_mark(inline_marked_text(results)), "/help")
+
+    def test_long_query_is_clipped(self):
+        results = bot.build_inline_results("я" * 9000, self.STRANGER)
+        marked = inline_marked_text(results)
+        self.assertLessEqual(len(marked), bot.INLINE_TEXT_LIMIT)
+        self.assertLessEqual(
+            len(cast(str, results[0].description) or ""), bot.INLINE_DESC_LIMIT
+        )
+        self.assertLessEqual(len(results[0].title), bot.INLINE_TITLE_LIMIT)
+
+    def test_result_ids_are_unique(self):
+        first = bot.build_inline_results("привет", self.STRANGER)[0]
+        second = bot.build_inline_results("привет", self.STRANGER)[0]
+        self.assertEqual(first.id, second.id)
+        self.assertNotEqual(inline_marked_text([first]), inline_marked_text([second]))
+
+    def test_disabled_mode_answers_with_nothing(self):
+        calls = []
+
+        class _Client:
+            async def answer_inline(self, query_id, results):
+                calls.append((query_id, results))
+
+        saved_client = bot.bot_client
+        saved_mode = bot.inline_mode
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        self.addCleanup(setattr, bot, "inline_mode", saved_mode)
+        bot.bot_client = _Client()
+        bot.inline_mode = False
+        asyncio.run(
+            bot.inline_handler(
+                cast(Any, SimpleNamespace(inline_query_id="iq", query="x", sender_id=6))
+            )
+        )
+        self.assertEqual(calls, [("iq", [])])
+
+    def test_handler_answers_with_results(self):
+        calls = []
+
+        class _Client:
+            async def answer_inline(self, query_id, results):
+                calls.append((query_id, list(results)))
+
+        saved_client = bot.bot_client
+        saved_mode = bot.inline_mode
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        self.addCleanup(setattr, bot, "inline_mode", saved_mode)
+        bot.bot_client = _Client()
+        bot.inline_mode = True
+        asyncio.run(
+            bot.inline_handler(
+                cast(
+                    Any,
+                    SimpleNamespace(inline_query_id="iq", query="привет", sender_id=6),
+                )
+            )
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "iq")
+        self.assertEqual([item.id for item in calls[0][1]], ["ask"])
+
+    def test_handler_survives_client_error(self):
+        class _Client:
+            async def answer_inline(self, query_id, results):
+                raise TelegramBadRequest(_NO_METHOD, "query is too old")
+
+        saved_client = bot.bot_client
+        saved_mode = bot.inline_mode
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        self.addCleanup(setattr, bot, "inline_mode", saved_mode)
+        bot.bot_client = _Client()
+        bot.inline_mode = True
+        with self.assertLogs("danybot.bot", level="WARNING"):
+            asyncio.run(
+                bot.inline_handler(
+                    cast(
+                        Any,
+                        SimpleNamespace(
+                            inline_query_id="iq", query="привет", sender_id=6
+                        ),
+                    )
+                )
+            )
+
+    def test_inline_event_reads_fields(self):
+        event = bot.BotInlineEvent(
+            cast(
+                Any,
+                InlineQuery(
+                    id="iq7",
+                    from_user=User(id=8, is_bot=False, first_name="A"),
+                    query="  привет  ",
+                    offset="",
+                ),
+            )
+        )
+        self.assertEqual(event.inline_query_id, "iq7")
+        self.assertEqual(event.query, "привет")
+        self.assertEqual(event.sender_id, 8)
+
+    def test_client_sends_payload_without_none(self):
+        inner = _FakeAiogramBot()
+        client = bot.BotClient(inner)
+        results = bot.build_inline_results("привет", 6)
+        asyncio.run(client.answer_inline("iq", results))
+        self.assertEqual(len(inner.inline_calls), 1)
+        call = inner.inline_calls[0]
+        self.assertEqual(call["id"], "iq")
+        self.assertEqual(call["cache_time"], bot.INLINE_CACHE_TIME)
+        self.assertTrue(call["is_personal"])
+        self.assertEqual([item.id for item in call["results"]], ["ask"])
+        self.assertEqual(call["results"], results)
+
+    def test_client_serializes_results_for_api(self):
+        session = cast(Any, _local_bot()).session
+        results = bot.build_inline_results("привет", 6)
+        prepared = session.prepare_value(
+            {
+                "results": results,
+                "inline_query_id": "iq",
+                "cache_time": bot.INLINE_CACHE_TIME,
+                "is_personal": True,
+            },
+            bot=cast(Any, _local_bot()),
+            files={},
+        )
+        payload = json.loads(prepared)
+        self.assertEqual(payload["results"][0]["type"], "article")
+        self.assertNotIn("thumbnail", payload["results"][0])
+        self.assertEqual(
+            core.strip_inline_mark(
+                payload["results"][0]["input_message_content"]["message_text"]
+            ),
+            "привет",
+        )
+
+    def test_client_error_becomes_rpc(self):
+        client = bot.BotClient(
+            _FakeAiogramBot(inline_error=TelegramBadRequest(_NO_METHOD, "too old"))
+        )
+        with self.assertRaises(RPCError):
+            asyncio.run(client.answer_inline("iq", []))
+
+
+class InlineClaimTest(BotTestCase):
+    def setUp(self):
+        super().setUp()
+        bot.inline_tokens.clear()
+        bot.inline_prompts.clear()
+        self.addCleanup(bot.inline_tokens.clear)
+        self.addCleanup(bot.inline_prompts.clear)
+
+    def _marked(self, query="привет", sender_id=6):
+        return inline_marked_text(bot.build_inline_results(query, sender_id))
+
+    def test_token_claim_is_single_use(self):
+        marked = self._marked()
+        self.assertTrue(bot._claim_inline(6, marked))
+        self.assertFalse(bot._claim_inline(6, marked))
+
+    def test_token_claim_still_works_after_edit(self):
+        marked = self._marked()
+        self.assertTrue(bot._claim_inline(6, f"{marked}, подробнее"))
+
+    def test_token_claim_requires_sender(self):
+        marked = self._marked()
+        self.assertFalse(bot._claim_inline(7, marked))
+        self.assertTrue(bot._claim_inline(6, marked))
+
+    def test_plain_text_fallback_survives_lost_mark(self):
+        self._marked()
+        self.assertTrue(bot._claim_inline(6, "привет"))
+        self.assertFalse(bot._claim_inline(6, "привет"))
+
+    def test_plain_text_fallback_is_case_insensitive(self):
+        bot.build_inline_results("Привет", 6)
+        self.assertTrue(bot._claim_inline(6, "привет"))
+
+    def test_plain_text_fallback_belongs_to_sender(self):
+        bot.build_inline_results("привет", 6)
+        self.assertFalse(bot._claim_inline(7, "привет"))
+
+    def test_expired_tokens_are_dropped(self):
+        marked = self._marked()
+        past = time.monotonic() - 1
+        for key in list(bot.inline_tokens):
+            bot.inline_tokens[key] = (6, past)
+        for key in list(bot.inline_prompts):
+            bot.inline_prompts[key] = past
+        self.assertFalse(bot._claim_inline(6, marked))
+        self.assertEqual(bot.inline_tokens, {})
+        self.assertEqual(bot.inline_prompts, {})
+
+    def test_register_keeps_query_for_bare_command(self):
+        self.assertTrue(bot._claim_inline(6, self._marked("/help")))
+
+    def test_unknown_text_is_not_claimed(self):
+        self.assertFalse(bot._claim_inline(6, "просто сообщение"))
+
+    def test_pending_stores_stay_bounded(self):
+        saved_max = bot.INLINE_PENDING_MAX
+        self.addCleanup(setattr, bot, "INLINE_PENDING_MAX", saved_max)
+        bot.INLINE_PENDING_MAX = 4
+        for index in range(20):
+            bot._register_inline(6, f"запрос {index}")
+        self.assertLessEqual(len(bot.inline_tokens), 5)
+        self.assertLessEqual(len(bot.inline_prompts), 5)
+
+    def test_evict_oldest_handles_dicts_and_sets(self):
+        mapping = {index: index for index in range(10)}
+        bucket = set(range(10))
+        core._evict_oldest(mapping, 6)
+        core._evict_oldest(bucket, 6)
+        self.assertEqual(len(mapping), 6)
+        self.assertEqual(len(bucket), 6)
+        self.assertEqual(sorted(mapping), list(range(4, 10)))
+
+    def test_disconnect_drops_pending_inline(self):
+        marked = self._marked()
+        client = _FakeAiogramBot()
+        saved_client = bot.bot_client
+        self.addCleanup(setattr, bot, "bot_client", saved_client)
+        bot.bot_client = bot.BotClient(client)
+        asyncio.run(bot.disconnect_quietly())
+        self.assertEqual(bot.inline_tokens, {})
+        self.assertEqual(bot.inline_prompts, {})
+        self.assertFalse(bot._claim_inline(6, marked))
 
 
 class UserbotHelpersTest(BotTestCase):
@@ -7925,6 +8390,37 @@ class BotAdapterTest(BotTestCase):
         self.assertEqual(len(seen), 1)
         self.assertIsInstance(seen[0], bot.BotCallbackEvent)
         self.assertEqual((seen[0].chat_id, seen[0].sender_id), (5, 8))
+
+    def test_dispatcher_feeds_inline_query_to_handler(self):
+        seen: list[Any] = []
+        saved = bot.inline_handler
+        self.addCleanup(setattr, bot, "inline_handler", saved)
+
+        async def inline_handler(event):
+            seen.append(event)
+
+        bot.inline_handler = inline_handler
+        query = InlineQuery(
+            id="iq1",
+            from_user=User(id=8, is_bot=False, first_name="A"),
+            query="привет",
+            offset="",
+        )
+        dispatcher = bot.build_dispatcher()
+        asyncio.run(
+            dispatcher.feed_update(
+                _local_bot(), Update(update_id=3, inline_query=query)
+            )
+        )
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], bot.BotInlineEvent)
+        self.assertEqual((seen[0].inline_query_id, seen[0].query), ("iq1", "привет"))
+
+    def test_dispatcher_requests_inline_query_updates(self):
+        dispatcher = bot.build_dispatcher()
+        self.assertIn("inline_query", dispatcher.resolve_used_update_types())
+        self.assertIn("message", dispatcher.resolve_used_update_types())
+        self.assertIn("callback_query", dispatcher.resolve_used_update_types())
 
     def test_chat_ref_normalizes_input(self):
         self.assertEqual(bot._chat_ref(5), 5)
@@ -8637,13 +9133,21 @@ class _FakeBotSession:
 
 
 class _FakeAiogramBot:
-    def __init__(self, commands_error=None, chat_error=None, count_error=None):
+    def __init__(
+        self,
+        commands_error=None,
+        chat_error=None,
+        count_error=None,
+        inline_error=None,
+    ):
         self.commands_error = commands_error
         self.chat_error = chat_error
         self.count_error = count_error
+        self.inline_error = inline_error
         self.commands = []
         self.actions = []
         self.edits = []
+        self.inline_calls = []
         self.session = _FakeBotSession()
 
     async def get_me(self):
@@ -8659,6 +9163,21 @@ class _FakeAiogramBot:
         if self.commands_error is not None:
             raise self.commands_error
         self.commands = list(commands)
+        return True
+
+    async def answer_inline_query(
+        self, inline_query_id=None, results=None, cache_time=None, is_personal=None
+    ):
+        if self.inline_error is not None:
+            raise self.inline_error
+        self.inline_calls.append(
+            {
+                "id": inline_query_id,
+                "results": list(results or ()),
+                "cache_time": cache_time,
+                "is_personal": is_personal,
+            }
+        )
         return True
 
     async def get_chat(self, key):
