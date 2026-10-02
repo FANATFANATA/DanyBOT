@@ -97,6 +97,7 @@ LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
 MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
 MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
 TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 60))
+TOOL_MAX_ROUNDS = max(1, _env_int("TOOL_MAX_ROUNDS", 200))
 REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
@@ -172,6 +173,8 @@ HANDLER_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 SANITIZED_TOOLS = ("run_shell", "execute_script", "run_subagent")
+
+TOOL_ROUND_LIMIT_NOTE = "Остановлено: достигнут лимит раундов инструментов ({limit})."
 
 
 def _read_extra_system(path):
@@ -570,6 +573,12 @@ async def sanitize_tool_output(
     return content
 
 
+def _merge_tool_name(current: str, incoming: str, allowed) -> str:
+    if current and current in allowed:
+        return current
+    return current + incoming
+
+
 async def stream_with_tools(
     messages: list,
     model: str,
@@ -591,6 +600,12 @@ async def stream_with_tools(
     allowed = tools_module.tool_names_of(tools if tools is not None else TOOLS)
     calls_made = 0
     while True:
+        if rounds >= TOOL_MAX_ROUNDS:
+            reason = f"лимит раундов инструментов: {TOOL_MAX_ROUNDS}"
+            _report_progress(on_progress, rounds, calls_made, reason)
+            answer = "".join(all_parts)
+            note = TOOL_ROUND_LIMIT_NOTE.format(limit=TOOL_MAX_ROUNDS)
+            return f"{answer}\n\n{note}" if answer.strip() else note
         rounds += 1
         working = core.trim_tool_history(working, TOOL_CONTEXT_MESSAGES)
         tool_calls: dict[int, dict[str, str]] = {}
@@ -638,7 +653,9 @@ async def stream_with_tools(
                             slot["id"] = tc.id
                         if tc.function:
                             if tc.function.name:
-                                slot["name"] += tc.function.name
+                                slot["name"] = _merge_tool_name(
+                                    slot["name"], tc.function.name, allowed
+                                )
                             if tc.function.arguments:
                                 slot["arguments"] += tc.function.arguments
         finally:
@@ -653,7 +670,7 @@ async def stream_with_tools(
                 "content": "".join(content_parts),
                 "tool_calls": [
                     {
-                        "id": slot["id"],
+                        "id": slot["id"] or f"call_{rounds}_{_idx}",
                         "type": "function",
                         "function": {
                             "name": slot["name"],
@@ -664,7 +681,10 @@ async def stream_with_tools(
                 ],
             }
         )
-        slots = [slot for _idx, slot in sorted(tool_calls.items())]
+        slots = [
+            (slot["id"] or f"call_{rounds}_{_idx}", slot)
+            for _idx, slot in sorted(tool_calls.items())
+        ]
         calls_made += len(slots)
         _report_progress(on_progress, rounds, calls_made)
 
@@ -702,9 +722,11 @@ async def stream_with_tools(
             return result
 
         results: list[Any] = list(
-            await asyncio.gather(*(run_slot(s) for s in slots), return_exceptions=True)
+            await asyncio.gather(
+                *(run_slot(slot) for _call_id, slot in slots), return_exceptions=True
+            )
         )
-        for slot, outcome in zip(slots, results, strict=True):
+        for (call_id, slot), outcome in zip(slots, results, strict=True):
             if isinstance(outcome, asyncio.CancelledError):
                 raise outcome
             if isinstance(outcome, BaseException):
@@ -715,7 +737,7 @@ async def stream_with_tools(
             working.append(
                 {
                     "role": "tool",
-                    "tool_call_id": slot["id"],
+                    "tool_call_id": call_id,
                     "content": content,
                 }
             )
@@ -813,7 +835,7 @@ HELP_TEXT = (
     ".db model <id> - сменить модель / set model\n"
     ".db models - список моделей / list models\n"
     ".db model - показать текущую модель / show current model\n"
-    ".db clear - очистить контекст / clear context\n"
+    ".db clear - очистить сохранённый контекст, история из Telegram / clear stored context, live history stays\n"
     ".db coder - кодер-режим живёт в боте / coder mode lives in the bot\n"
     ".db reasoning on/off - показ рассуждений / show reasoning\n"
     ".db tools on/off - показ вызовов инструментов / show tool calls\n"

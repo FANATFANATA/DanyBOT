@@ -98,6 +98,7 @@ _SUBPROCESS_ENV_DENY = frozenset(
         "API_HASH",
         "BOT_TOKEN",
         "DANYAPI_KEY",
+        "OWNER_IDS",
         "SESSION_NAME",
         "VALIDATE_API_ID",
         "VALIDATE_API_HASH",
@@ -256,7 +257,7 @@ MAX_OPT_INT = 1_000_000
 def _int_arg(arguments, key, default, lo, hi):
     try:
         value = int(arguments.get(key, default))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         value = default
     return max(lo, min(value, hi))
 
@@ -1153,17 +1154,26 @@ async def _resolve_addrs(host, port):
     return [info[4][0] for info in infos]
 
 
+NAT64_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+IPV4_COMPAT_PREFIX = ipaddress.IPv6Network("::/96")
+
+
 def _is_public_addr(addr) -> bool:
     try:
         ip = ipaddress.ip_address(addr)
     except ValueError:
         return False
     if isinstance(ip, ipaddress.IPv6Address):
-        embedded = ip.ipv4_mapped or ip.sixtofour
-        if embedded is not None:
+        embedded = ip.ipv4_mapped
+        if embedded is None:
+            embedded = ip.sixtofour
+        if embedded is None and ip.teredo is not None:
+            embedded = ip.teredo[1]
+        if embedded is None:
+            if ip in NAT64_PREFIX or ip in IPV4_COMPAT_PREFIX:
+                return False
+        else:
             ip = embedded
-        elif int(ip) >> 32 == 0 or int(ip) >> 96 == 0x0064FF9B:
-            return False
     return bool(
         ip.is_global
         and not ip.is_multicast
@@ -1365,30 +1375,38 @@ def _tool_name_list(raw) -> list[str] | None:
     return [str(item).strip() for item in raw if str(item).strip()] or None
 
 
-def _report_item(item, result_chars) -> dict[str, Any]:
+def _report_item(item, result_chars, tool_chars) -> dict[str, Any]:
+    used = [str(name) for name in (item.get("tools_used") or [])][: max(0, tool_chars)]
     return {
         "name": str(item.get("name", "universal"))[:SUBAGENT_NAME_CHARS],
         "task": str(item.get("task", ""))[:SUBAGENT_TASK_CHARS],
         "ok": bool(item.get("ok")),
         "rounds": item.get("rounds", 0),
-        "tools_used": item.get("tools_used", []),
+        "tools_used": used,
         "result": str(item.get("result", ""))[:result_chars],
     }
 
 
 def _subagent_report(results) -> str:
     items = list(results)
-    for result_chars in (SUBAGENT_RESULT_CHARS, 400, 100, 0):
-        payload = [_report_item(item, result_chars) for item in items]
+    for result_chars, tool_chars in (
+        (SUBAGENT_RESULT_CHARS, 60),
+        (400, 30),
+        (100, 10),
+        (0, 0),
+    ):
+        payload = [_report_item(item, result_chars, tool_chars) for item in items]
         text = json.dumps(payload, ensure_ascii=False)
         if len(text) <= SUBAGENT_REPORT_CHARS:
             return text
     while len(items) > 1:
         items = items[:-1]
-        text = json.dumps([_report_item(item, 0) for item in items], ensure_ascii=False)
+        text = json.dumps(
+            [_report_item(item, 0, 0) for item in items], ensure_ascii=False
+        )
         if len(text) <= SUBAGENT_REPORT_CHARS:
             return text
-    return json.dumps([_report_item(items[0], 0)], ensure_ascii=False)
+    return json.dumps([_report_item(items[0], 0, 0)], ensure_ascii=False)
 
 
 async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=False):
@@ -1397,9 +1415,15 @@ async def _tool_run_subagent(arguments, chat_id, client, stats, unrestricted=Fal
     if not subagents.is_configured():
         return "Субагенты недоступны."
     tasks = arguments.get("tasks")
-    if not tasks:
+    if tasks is None:
         single = _str_arg(arguments, "task")
         tasks = [single] if single else []
+    elif isinstance(tasks, str):
+        tasks = [tasks] if tasks.strip() else []
+    elif not isinstance(tasks, (list, tuple)):
+        return "Поле tasks должно быть списком строк."
+    else:
+        tasks = [str(item).strip() for item in tasks if str(item).strip()]
     if not tasks:
         return "Нужна задача: task или tasks."
     results = await subagents.run_subagents(
@@ -1619,11 +1643,18 @@ def _reconfigure_stream(stream) -> None:
 def _scan_worker_main() -> None:
     for stream in (sys.stdin, sys.stdout):
         _reconfigure_stream(stream)
+    allowed_env = _subprocess_env()
+    for name in [key for key in os.environ if key not in allowed_env]:
+        del os.environ[name]
+    os.environ.update(allowed_env)
     request = json.loads(sys.stdin.read())
     for name, value in (request.get("limits") or {}).items():
         if name in SCAN_LIMIT_KEYS:
             setattr(sys.modules[__name__], name, value)
     stop = threading.Event()
+    timer = threading.Timer(max(1.0, SEARCH_TIMEOUT - 5.0), stop.set)
+    timer.daemon = True
+    timer.start()
     try:
         matches, note = _scan_files(
             Path(request["root"]),
@@ -1636,6 +1667,8 @@ def _scan_worker_main() -> None:
         payload = {"matches": [], "note": "", "error": repr(exc)}
     else:
         payload = {"matches": matches, "note": note, "error": ""}
+    finally:
+        timer.cancel()
     sys.stdout.write(json.dumps(payload, ensure_ascii=False))
 
 
@@ -1672,6 +1705,7 @@ async def _run_search_subprocess(root, glob_pat, pattern, limit) -> tuple[list, 
         )
     except TimeoutError:
         await _kill_process(proc)
+        _close_pipes(proc)
         return [], f"Таймаут поиска: {SEARCH_TIMEOUT}s"
     if proc.returncode != 0:
         detail = err.decode("utf-8", errors="replace").strip()[-200:]

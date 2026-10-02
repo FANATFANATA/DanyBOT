@@ -81,7 +81,7 @@ def _clean_tags(raw):
     if raw is None:
         return ""
     if isinstance(raw, (list, tuple)):
-        parts = [str(x).strip() for x in raw]
+        parts = [str(x).strip().replace(",", " ") for x in raw]
     else:
         parts = [x.strip() for x in str(raw).replace(";", ",").split(",")]
     kept = []
@@ -91,7 +91,7 @@ def _clean_tags(raw):
             continue
         extra = len(part) + (1 if kept else 0)
         if extra > MAX_TAGS - used:
-            break
+            continue
         kept.append(part)
         used += extra
     return ",".join(kept)

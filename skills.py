@@ -64,12 +64,12 @@ def _connect():
     return conn
 
 
-def _prune(conn) -> None:
+def _prune(conn, keep="") -> None:
     conn.execute(
-        "DELETE FROM skills WHERE id NOT IN ("
+        "DELETE FROM skills WHERE name <> ? AND id NOT IN ("
         "SELECT id FROM skills ORDER BY uses DESC, updated_at DESC, id DESC LIMIT ?"
         ")",
-        (MAX_SKILLS,),
+        (keep, MAX_SKILLS),
     )
 
 
@@ -81,7 +81,7 @@ def _clean_tags(raw):
     if raw is None:
         return ""
     if isinstance(raw, (list, tuple)):
-        parts = [str(x).strip() for x in raw]
+        parts = [str(x).strip().replace(",", " ") for x in raw]
     else:
         parts = [x.strip() for x in str(raw).replace(";", ",").split(",")]
     kept = []
@@ -91,7 +91,7 @@ def _clean_tags(raw):
             continue
         extra = len(part) + (1 if kept else 0)
         if extra > MAX_TAGS - used:
-            break
+            continue
         kept.append(part)
         used += extra
     return ",".join(kept)
@@ -135,7 +135,7 @@ def save_skill(name: str, description: str, body: str, tags: Any = None) -> dict
             (name, description, body, tags_clean, now, now),
         )
         row = cur.fetchone()
-        _prune(conn)
+        _prune(conn, name)
         conn.commit()
     action = "created" if row["created_at"] == now else "updated"
     return {"ok": True, "action": action, "id": row["id"], "name": name}

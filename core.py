@@ -567,7 +567,17 @@ def load_history_file(path, dm_limit, group_limit):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, ValueError, KeyError, TypeError, AttributeError):
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+    ):
+        return None
+    if not isinstance(data, dict):
         return None
     history = {}
     for key, value in data.items():
@@ -637,9 +647,13 @@ class AsyncSaver:
 
     def mark_dirty(self):
         self._dirty = True
-        if self._task is None or self._task.done():
-            with contextlib.suppress(RuntimeError):
-                self._task = asyncio.create_task(self._run())
+        if self._task is not None and not self._task.done():
+            return
+        coro = self._run()
+        try:
+            self._task = asyncio.create_task(coro)
+        except RuntimeError:
+            coro.close()
 
     async def _write(self) -> bool:
         try:
@@ -678,7 +692,7 @@ class AsyncSaver:
     async def flush(self):
         task = self._task
         if task is not None and not task.done():
-            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError):
+            with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(asyncio.shield(task), timeout=self._delay + 10)
             if not task.done():
                 task.cancel()
@@ -780,8 +794,8 @@ def _evict_oldest(target, limit: int) -> None:
 
 
 def _remember_key(target, key, limit: int) -> None:
-    _evict_oldest(target, limit)
     target.add(key)
+    _evict_oldest(target, limit)
 
 
 async def safe_reply(event, text, attempts, recent_ids):
@@ -907,7 +921,10 @@ def compose_prompt(prompt, replied_text, limit):
     if not prompt:
         return quoted
     header = QUOTE_HEADER.format(quoted=quoted)
-    return header + prompt[: max(1, limit - len(header))]
+    if len(header) >= limit:
+        room = max(0, limit - len(QUOTE_HEADER.format(quoted="")))
+        header = QUOTE_HEADER.format(quoted=replied_text[:room])
+    return (header + prompt)[:limit]
 
 
 def check_cooldown(
@@ -921,6 +938,8 @@ def check_cooldown(
     if len(last_chat_activity) > cleanup_threshold:
         cutoff = now - cleanup_age
         for k in list(last_chat_activity):
+            if k == chat_id:
+                continue
             if last_chat_activity[k] < cutoff:
                 del last_chat_activity[k]
     if cooldown > 0:
@@ -1116,10 +1135,15 @@ class SessionRegistry:
             return []
         return [task for task in slot["tasks"] if not task.done()]
 
+    def _owner_live(self, slot, live) -> bool:
+        scopes = slot["scopes"]
+        return any(scopes.get(id(task)) == "owner" for task in live)
+
     def _drop(self, chat_id, task, coro) -> None:
         self._draining.discard(task)
         slot = self._slots.get(chat_id)
         if slot is not None:
+            slot["scopes"].pop(id(task), None)
             if task in slot["tasks"]:
                 slot["tasks"].remove(task)
             if not slot["tasks"] and self._slots.get(chat_id) is slot:
@@ -1138,7 +1162,7 @@ class SessionRegistry:
         slot = self._slots.get(chat_id)
         if not live:
             task = asyncio.ensure_future(coro)
-        elif scope != "owner" and slot is not None and slot["scope"] == "owner":
+        elif scope != "owner" and slot is not None and self._owner_live(slot, live):
             if logger is not None:
                 logger.info(
                     "Запрос в чате %s ждёт завершения работы владельца", chat_id
@@ -1149,11 +1173,10 @@ class SessionRegistry:
             slot = None
             task = asyncio.ensure_future(coro)
         if slot is None:
-            slot = {"tasks": [], "scope": "other"}
+            slot = {"tasks": [], "scopes": {}}
             self._slots[chat_id] = slot
         slot["tasks"].append(task)
-        if scope == "owner":
-            slot["scope"] = "owner"
+        slot["scopes"][id(task)] = scope
         task.add_done_callback(self._watcher(chat_id, coro))
         return task
 
@@ -1278,8 +1301,16 @@ class TaskJournal:
         return [dict(item) for item in items[: max(1, limit)]]
 
     def _trim(self) -> None:
-        if len(self._tasks) <= self._limit:
+        overflow = len(self._tasks) - self._limit
+        if overflow <= 0:
             return
+        ordered = sorted(self._tasks.items(), key=lambda kv: kv[1]["updated"])
+        for chat_id, record in ordered:
+            if len(self._tasks) <= self._limit:
+                return
+            if record["status"] == TASK_RUNNING:
+                continue
+            self._tasks.pop(chat_id, None)
         ordered = sorted(self._tasks.items(), key=lambda kv: kv[1]["updated"])
         for chat_id, _record in ordered[: len(self._tasks) - self._limit]:
             self._tasks.pop(chat_id, None)

@@ -70,7 +70,11 @@ PY_FILES = (
     "tests.py",
 )
 WHITELIST_FILE = "vulture_whitelist.py"
-BANDIT_SKIP = "B404,B603,B607,B608"
+REQUIREMENTS_FILE = "requirements.txt"
+COVERAGE_SOURCE = ",".join(
+    path.removesuffix(".py") for path in PY_FILES if path not in ("tests.py",)
+)
+BANDIT_SKIP = "B104,B404,B603,B607,B608"
 VULTURE_IGNORE_NAMES = "test_*,setUp"
 LOG_FILE = PROJECT_DIR / "toolrun.log"
 AUTH_PART = "123456"
@@ -159,34 +163,61 @@ def patch_paths(testcase):
     return tmp
 
 
-_MODE_ATTRS = (
+_MODE_DICT_ATTRS = (
     "model_overrides",
+    "chat_history",
+    "last_chat_activity",
+    "inline_tokens",
+    "inline_prompts",
+)
+_MODE_SET_ATTRS = (
     "coder_chats",
     "reasoning_hidden",
     "tools_hidden",
-    "chat_history",
+    "recent_reply_ids",
+    "seen_msg_keys",
 )
 _MODE_BOOL_ATTRS = ("inline_mode",)
+_ABSENT_KEY = "__absent_attrs__"
 
 
 def _snapshot_module(mod):
     snap = {}
-    for attr in _MODE_ATTRS:
+    absent = set()
+    for attr in _MODE_DICT_ATTRS:
+        if not hasattr(mod, attr):
+            absent.add(attr)
+            continue
         value = getattr(mod, attr)
         if attr == "chat_history":
             snap[attr] = {k: deque(v, maxlen=v.maxlen) for k, v in value.items()}
-        elif attr == "model_overrides":
-            snap[attr] = dict(value)
         else:
-            snap[attr] = set(value)
+            snap[attr] = dict(value)
+    for attr in _MODE_SET_ATTRS:
+        if not hasattr(mod, attr):
+            absent.add(attr)
+            continue
+        snap[attr] = set(getattr(mod, attr))
     for attr in _MODE_BOOL_ATTRS:
-        snap[attr] = getattr(mod, attr, None)
+        if hasattr(mod, attr):
+            snap[attr] = getattr(mod, attr)
+        else:
+            absent.add(attr)
+    snap[_ABSENT_KEY] = absent
     return snap
 
 
 def _restore_module(mod, snap):
+    absent = snap.get(_ABSENT_KEY) or set()
     for attr, value in snap.items():
+        if attr == _ABSENT_KEY:
+            continue
         setattr(mod, attr, value)
+    for attr in absent:
+        try:
+            delattr(mod, attr)
+        except AttributeError:
+            pass
 
 
 def snapshot_mode_state():
@@ -783,6 +814,36 @@ class ProxyToggleTest(BotTestCase):
                 {"proxy_type": "socks5", "addr": "9.9.9.9", "port": 1080},
             ],
         )
+
+    def test_static_proxy_settings_are_validated(self):
+        async def fail_get_working(*_args, **_kwargs):
+            raise AssertionError("get_working_proxies не должен вызываться")
+
+        fallback = {"proxy_type": "socks5", "addr": "1.2.3.4", "port": 1080}
+        for env, expected_log, expected in (
+            ({"PROXY_TYPE": "ftp", "PROXY_PORT": "1080"}, "PROXY_TYPE=ftp", [fallback]),
+            ({"PROXY_TYPE": "socks5", "PROXY_PORT": "0"}, "PROXY_PORT=0", []),
+            ({"PROXY_TYPE": "socks5", "PROXY_PORT": "abc"}, "PROXY_PORT=abc", []),
+        ):
+            with self.subTest(env=env):
+                with (
+                    mock.patch.dict(
+                        os.environ,
+                        {
+                            "PROXY_ENABLED": "1",
+                            "PROXY_AUTO": "0",
+                            "PROXY_HOST": "1.2.3.4",
+                            **env,
+                        },
+                    ),
+                    mock.patch.object(proxies, "get_working_proxies", fail_get_working),
+                    self.assertLogs("danybot.proxy", level="ERROR") as logs,
+                ):
+                    result = asyncio.run(proxies.get_proxy_candidates(limit=5))
+                self.assertEqual(result, expected)
+                self.assertTrue(
+                    any(expected_log in line for line in logs.output), logs.output
+                )
 
 
 class ValidateManyTest(BotTestCase):
@@ -1685,6 +1746,111 @@ class StreamToolsTest(BotTestCase):
         self.assertEqual(second_messages[2]["content"], "TOOLOK")
         self.assertEqual(second_messages[2]["tool_call_id"], "call1")
 
+    def test_repeated_tool_name_is_not_duplicated(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(tool_calls=[make_tc(tc_id="c1", name="evaluate")])
+                    ),
+                    make_chunk(make_delta(tool_calls=[make_tc(name="evaluate")])),
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[make_tc(arguments='{"expression": "2+3"}')]
+                        )
+                    ),
+                ],
+                [make_chunk(make_delta(content="Итог: 5"))],
+            ]
+        )
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "посчитай"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        self.assertEqual(answer, "Итог: 5")
+        self.assertEqual(
+            self.tool_calls_made,
+            [("evaluate", {"expression": "2+3"}, self.CHAT_ID)],
+        )
+        assistant_msg = fake_ai.chat.completions.calls[1]["messages"][1]
+        self.assertEqual(assistant_msg["tool_calls"][0]["function"]["name"], "evaluate")
+
+    def test_missing_tool_call_id_is_synthesized(self):
+        fake_ai = self.install_ai(
+            [
+                [
+                    make_chunk(
+                        make_delta(
+                            tool_calls=[
+                                make_tc(
+                                    name="evaluate", arguments='{"expression": "1"}'
+                                )
+                            ]
+                        )
+                    )
+                ],
+                [make_chunk(make_delta(content="ok"))],
+            ]
+        )
+        asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "посчитай"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+            )
+        )
+        second = fake_ai.chat.completions.calls[1]["messages"]
+        assistant_id = second[1]["tool_calls"][0]["id"]
+        self.assertTrue(assistant_id)
+        self.assertEqual(second[2]["tool_call_id"], assistant_id)
+
+    def test_round_limit_stops_tool_loop(self):
+        saved_limit = userbot.TOOL_MAX_ROUNDS
+        self.addCleanup(setattr, userbot, "TOOL_MAX_ROUNDS", saved_limit)
+        userbot.TOOL_MAX_ROUNDS = 2
+        rounds = [
+            [
+                make_chunk(
+                    make_delta(
+                        tool_calls=[
+                            make_tc(
+                                tc_id="c1",
+                                name="evaluate",
+                                arguments='{"expression": "1"}',
+                            )
+                        ]
+                    )
+                )
+            ]
+            for _ in range(10)
+        ]
+        fake_ai = self.install_ai(rounds)
+        reported = []
+
+        def on_progress(count, calls, reason=""):
+            reported.append((count, calls, reason))
+
+        answer = asyncio.run(
+            userbot.stream_with_tools(
+                [{"role": "user", "content": "зациклись"}],
+                "m",
+                self.CHAT_ID,
+                lambda p: self.collect([], p),
+                lambda p: self.collect([], p),
+                on_progress=on_progress,
+            )
+        )
+        self.assertEqual(len(fake_ai.chat.completions.calls), 2)
+        self.assertIn("лимит раундов инструментов", answer)
+        self.assertTrue(reported[-1][2])
+
     def test_tool_callback_receives_call_and_result(self):
         self.install_ai(
             [
@@ -2495,6 +2661,56 @@ class _FakeResp:
             yield raw[start : start + 4096]
 
 
+def broken_async_exec(proc):
+    async def create(*_args, **_kwargs):
+        return proc
+
+    return create
+
+
+def scan_files(root, glob_pat, pattern, limit, stop=None):
+    return tools_module._scan_files(
+        Path(root),
+        glob_pat,
+        re.compile(pattern),
+        limit,
+        stop or threading.Event(),
+    )
+
+
+class _FakeStdin:
+    def __init__(self, payload):
+        self._payload = payload
+        self.calls = 0
+
+    def read(self):
+        return self._payload
+
+    def reconfigure(self, **_kwargs):
+        self.calls += 1
+
+
+class _FakeStdout:
+    def __init__(self):
+        self.chunks = []
+
+    def write(self, text):
+        self.chunks.append(text)
+
+    def reconfigure(self, **_kwargs):
+        return None
+
+
+def _run_scan_worker(request):
+    fake_out = _FakeStdout()
+    with (
+        mock.patch.object(sys, "stdin", _FakeStdin(request)),
+        mock.patch.object(sys, "stdout", fake_out),
+    ):
+        tools_module._scan_worker_main()
+    return json.loads("".join(fake_out.chunks))
+
+
 class _FakeStream:
     def __init__(self, resp):
         self._resp = resp
@@ -2822,6 +3038,16 @@ class ExtraToolsTest(BotTestCase):
         self.assertIn("Ошибка поиска", out)
         self.assertIn("HTTP 429", out)
 
+    def test_web_search_reports_timeout_label(self):
+        class _Slow:
+            def stream(self, _method, _url, **_kwargs):
+                raise httpx.ConnectTimeout("slow")
+
+        with mock.patch.object(tools_module, "_get_httpx_client", lambda: _Slow()):
+            out = self._run("web_search", {"query": "x"})
+        self.assertIn("Ошибка поиска", out)
+        self.assertIn("ConnectTimeout", out)
+
     def test_web_search_applies_result_limit(self):
         html = (
             '<a class="result__a" href="https://one.test/">One</a>'
@@ -2961,6 +3187,32 @@ class ExtraToolsTest(BotTestCase):
         out = _owner_tool("run_subagent", {}, 1)
         self.assertEqual(out, "Нужна задача: task или tasks.")
 
+    def test_run_subagent_rejects_non_list_tasks(self):
+        seen = {}
+
+        async def fake_run(tasks, **_kwargs):
+            seen["tasks"] = tasks
+            return []
+
+        for attr, value in (
+            ("run_subagents", fake_run),
+            ("is_configured", lambda: True),
+        ):
+            saved = getattr(subagents, attr)
+            self.addCleanup(setattr, subagents, attr, saved)
+            setattr(subagents, attr, value)
+        self.assertIn(
+            "списком строк",
+            _owner_tool("run_subagent", {"tasks": {"a": 1}}, 1),
+        )
+        self.assertEqual(seen, {})
+        self.assertEqual(_owner_tool("run_subagent", {"tasks": "одна задача"}, 1), "[]")
+        self.assertEqual(seen["tasks"], ["одна задача"])
+        self.assertEqual(
+            _owner_tool("run_subagent", {"tasks": ["  ", "первая", ""]}, 1), "[]"
+        )
+        self.assertEqual(seen["tasks"], ["первая"])
+
     def test_run_subagent_passes_numeric_options(self):
         seen = {}
 
@@ -3035,6 +3287,50 @@ class ToolsInternalsTest(BotTestCase):
         self.assertEqual(
             tools_module._opt_int_arg({"concurrency": 99}, "concurrency", 1, 16), 16
         )
+
+    def test_int_arg_survives_infinite_float(self):
+        self.assertEqual(tools_module._int_arg({"t": math.inf}, "t", 30, 1, 300), 30)
+        self.assertEqual(tools_module._int_arg({"t": -math.inf}, "t", 30, 1, 300), 30)
+
+    def test_report_item_bounds_tools_used(self):
+        item = {
+            "name": "n",
+            "task": "t",
+            "ok": True,
+            "rounds": 1,
+            "tools_used": ["tool"] * 500,
+            "result": "r",
+        }
+        out = tools_module._subagent_report([item])
+        self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
+        self.assertLessEqual(len(json.loads(out)[0]["tools_used"]), 60)
+        single = json.loads(
+            tools_module._subagent_report([dict(item, tools_used=["x" * 4000] * 50)])
+        )
+        self.assertLessEqual(len(single[0]["tools_used"]), 0)
+
+    def test_subagent_report_drops_items_when_needed(self):
+        results = [
+            {
+                "name": "n" * tools_module.SUBAGENT_NAME_CHARS,
+                "task": "t" * tools_module.SUBAGENT_TASK_CHARS,
+                "ok": True,
+                "rounds": 1,
+                "tools_used": ["x"] * 60,
+                "result": "",
+            }
+            for _ in range(40)
+        ]
+        out = tools_module._subagent_report(results)
+        self.assertLessEqual(len(out), tools_module.SUBAGENT_REPORT_CHARS)
+        parsed = json.loads(out)
+        self.assertLess(len(parsed), 40)
+        self.assertTrue(parsed)
+        one = tools_module._subagent_report(
+            [dict(results[0], tools_used=["y" * 200] * 300)]
+        )
+        self.assertLessEqual(len(one), tools_module.SUBAGENT_REPORT_CHARS)
+        self.assertLess(len(json.loads(one)[0]["tools_used"]), 60)
 
     def test_too_big_ignores_unreadable_path(self):
         missing = Path(tempfile.gettempdir()) / "нет.такого.py"
@@ -3180,16 +3476,26 @@ class ToolsInternalsTest(BotTestCase):
             "::a00:1",
             "::ffff:127.0.0.1",
             "::ffff:10.0.0.1",
+            "::ffff:0:0",
+            "2002:7f00:1::",
             "ff02::1",
             "224.0.0.1",
             "127.0.0.1",
             "169.254.169.254",
+            "0.0.0.0",
             "::1",
+            "::",
             "fc00::1",
+            "2001:0000:4136:e378:8000:63bf:3fff:fdd2",
         ):
             with self.subTest(addr=addr):
                 self.assertFalse(tools_module._is_public_addr(addr))
-        for addr in ("8.8.8.8", "2001:4860:4860::8888", "1.1.1.1"):
+        for addr in (
+            "8.8.8.8",
+            "2001:4860:4860::8888",
+            "1.1.1.1",
+            "::ffff:8.8.8.8",
+        ):
             with self.subTest(addr=addr):
                 self.assertTrue(tools_module._is_public_addr(addr))
 
@@ -4069,11 +4375,119 @@ class CoreHelpersTest(BotTestCase):
         parsed = core.parse_state_data({"model_overrides": {"1": 5}})
         self.assertEqual(parsed["model_overrides"], {1: "5"})
 
+    def test_parse_state_data_tolerates_bad_members(self):
+        parsed = core.parse_state_data(
+            {
+                "model_overrides": {"не число": "m", "7": "m7"},
+                "coder_chats": "строка",
+                "reasoning_hidden": ["x", 3],
+                "tools_hidden": {"1", "y"},
+            }
+        )
+        self.assertEqual(parsed["model_overrides"], {7: "m7"})
+        self.assertEqual(parsed["coder_chats"], set())
+        self.assertEqual(parsed["reasoning_hidden"], {3})
+        self.assertEqual(parsed["tools_hidden"], {1})
+        with self.assertRaises(TypeError):
+            core.parse_state_data([])
+
+    def test_inline_command_matches_ignores_empty_head(self):
+        self.assertEqual(core.inline_command_matches("/@danybot", True), [])
+        self.assertEqual(core.inline_command_matches("/", True), [])
+        self.assertEqual(core.inline_command_matches("нет слеша", True), [])
+
+    def test_async_saver_mark_dirty_reuses_live_task(self):
+        async def scenario():
+            saver = core.AsyncSaver(lambda: True, delay=0.05)
+            saver.mark_dirty()
+            first = cast(Any, saver._task)
+            self.assertIsNotNone(first)
+            saver.mark_dirty()
+            saver.mark_dirty()
+            self.assertIs(saver._task, first)
+            await asyncio.wait_for(saver.flush(), timeout=5)
+            self.assertTrue(first.done())
+
+        asyncio.run(scenario())
+
     def test_async_saver_mark_dirty_without_loop(self):
         saver = core.AsyncSaver(lambda: None)
         saver.mark_dirty()
         self.assertTrue(saver._dirty)
         self.assertIsNone(saver._task)
+
+    def test_async_saver_mark_dirty_without_loop_emits_no_warning(self):
+        saver = core.AsyncSaver(lambda: None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            saver.mark_dirty()
+
+    def test_async_saver_flush_propagates_cancellation(self):
+        async def scenario():
+            started = threading.Event()
+            release = threading.Event()
+
+            def writer():
+                started.set()
+                release.wait(5)
+                return True
+
+            saver = core.AsyncSaver(writer, delay=0.0)
+            saver.mark_dirty()
+            flush_task = asyncio.ensure_future(saver.flush())
+            for _ in range(500):
+                if started.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            self.assertTrue(started.is_set())
+            flush_task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await flush_task
+            writer_task = cast(Any, saver._task)
+            self.assertIsNotNone(writer_task)
+            writer_task.cancel()
+            for _ in range(200):
+                if writer_task.done():
+                    break
+                await asyncio.sleep(0.01)
+
+        asyncio.run(scenario())
+
+    def test_load_history_file_rejects_non_object_payload(self):
+        tmp = Path(tempfile.mkdtemp(prefix="danybot_history_"))
+        self.addCleanup(shutil.rmtree, tmp, True)
+        target = tmp / "history.json"
+        for payload in ("[]", "5", "null", '"текст"'):
+            with self.subTest(payload=payload):
+                target.write_text(payload, encoding="utf-8")
+                self.assertIsNone(core.load_history_file(target, 10, 5))
+
+    def test_remember_key_respects_limit(self):
+        target: set[int] = set()
+        for key in range(50):
+            core._remember_key(target, key, 10)
+        self.assertEqual(len(target), 10)
+        self.assertEqual(max(target), 49)
+
+    def test_check_cooldown_keeps_current_chat_activity(self):
+        activity = {7: 0.0, 8: 0.0}
+        blocked = core.check_cooldown(
+            7, 5000.0, 7200.0, activity, cleanup_threshold=1, cleanup_age=2
+        )
+        self.assertTrue(blocked)
+        self.assertIn(7, activity)
+        self.assertNotIn(8, activity)
+
+    def test_restore_module_removes_injected_attributes(self):
+        snap = _snapshot_module(userbot)
+        self.assertNotIn("inline_mode", snap)
+        userbot.__dict__["inline_mode"] = True
+        userbot.recent_reply_ids.add((4242, 777))
+        self.addCleanup(userbot.recent_reply_ids.discard, (4242, 777))
+        _restore_module(userbot, snap)
+        self.assertFalse(hasattr(userbot, "inline_mode"))
+        self.assertNotIn((4242, 777), userbot.recent_reply_ids)
 
     @unittest.skipUnless(os.name == "posix", "права файла задаёт только posix")
     def test_atomic_write_keeps_file_mode(self):
@@ -5213,6 +5627,27 @@ class TaskJournalTest(BotTestCase):
         self.assertIsNone(journal.get(0))
         self.assertIsNotNone(journal.get(4))
 
+    def test_trim_keeps_running_records(self):
+        journal = self._journal(limit=2)
+        journal.begin(1, "в работе")
+        journal.begin(2, "в работе")
+        journal.finish(2, core.TASK_DONE)
+        journal.begin(3, "третья")
+        journal.finish(3, core.TASK_DONE)
+        running = journal.get(1) or {}
+        dropped = journal.get(2)
+        latest = journal.get(3) or {}
+        self.assertEqual(running["status"], core.TASK_RUNNING)
+        self.assertIsNone(dropped)
+        self.assertEqual(latest["status"], core.TASK_DONE)
+
+    def test_trim_drops_running_only_when_needed(self):
+        journal = self._journal(limit=1)
+        journal.begin(1, "первая")
+        journal.begin(2, "вторая")
+        self.assertEqual(journal.get(1), None)
+        self.assertIsNotNone(journal.get(2))
+
     def test_recent_orders_by_update_time(self):
         journal = self._journal()
         for chat_id in range(3):
@@ -5222,10 +5657,9 @@ class TaskJournalTest(BotTestCase):
         self.assertEqual([row["prompt"] for row in recent], ["задача 1", "задача 2"])
 
     def test_state_file_keeps_tasks(self):
-        for mod, patch_paths_attr in ((userbot, "STATE_FILE"), (bot, "STATE_FILE")):
-            self.assertIs(
-                getattr(mod, patch_paths_attr), getattr(mod, patch_paths_attr)
-            )
+        for mod in (userbot, bot):
+            self.assertIn("danybot_tests_", str(mod.STATE_FILE.parent))
+            self.assertNotEqual(mod.STATE_FILE.parent, PROJECT_DIR)
         userbot.TASKS.begin(21, "задача владельца", model="m", coder=True)
         userbot.save_state()
         data = json.loads(userbot.STATE_FILE.read_text(encoding="utf-8"))
@@ -5492,6 +5926,31 @@ class SessionRegistryTest(BotTestCase):
         with warnings.catch_warnings():
             warnings.simplefilter("error", RuntimeWarning)
             asyncio.run(scenario())
+
+    def test_other_scope_resets_after_owner_run(self):
+        registry = core.SessionRegistry()
+        log = []
+
+        async def scenario():
+            async def run(tag, delay):
+                try:
+                    await asyncio.sleep(delay)
+                    log.append(tag)
+                except asyncio.CancelledError:
+                    log.append(f"{tag}-cancelled")
+                    raise
+
+            registry.start(1, run("owner", 0.05), scope="owner")
+            await asyncio.sleep(0.01)
+            second = registry.start(1, run("b", 5.0), scope="other")
+            await asyncio.sleep(0.06)
+            third = registry.start(1, run("c", 0.0), scope="other")
+            await asyncio.wait_for(third, timeout=1.0)
+            with self.assertRaises(asyncio.CancelledError):
+                await second
+
+        asyncio.run(scenario())
+        self.assertEqual(log, ["owner", "b-cancelled", "c"])
 
     def test_history_for_keeps_deque_maxlen_authoritative(self):
         history: dict[int, deque] = {1: deque(maxlen=5)}
@@ -5760,6 +6219,29 @@ class SkillsStoreTest(unittest.TestCase):
 
     def test_save_rejects_empty_name(self):
         self.assertFalse(skills.save_skill(" ", "d", "b")["ok"])
+
+    def test_prune_keeps_just_saved_skill(self):
+        saved_limit = skills.MAX_SKILLS
+        self.addCleanup(setattr, skills, "MAX_SKILLS", saved_limit)
+        skills.MAX_SKILLS = 3
+        for index in range(3):
+            skills.save_skill(f"s{index}", "d", "b")
+            skills.load_skill(f"s{index}")
+        result = skills.save_skill("fresh", "d", "b")
+        self.assertTrue(result["ok"])
+        self.assertTrue(skills.load_skill("fresh", touch=False)["ok"])
+        self.assertEqual(skills.stats()["count"], 4)
+
+    def test_clean_tags_normalizes_list_and_budget(self):
+        self.assertEqual(
+            skills._tags_list(skills._clean_tags(["x,y", "z"])), ["x y", "z"]
+        )
+        self.assertEqual(
+            memory._tags_list(memory._clean_tags(["x,y", "z"])), ["x y", "z"]
+        )
+        long_first = "a" * (skills.MAX_TAGS + 10)
+        self.assertEqual(skills._clean_tags([long_first, "short"]), "short")
+        self.assertEqual(memory._clean_tags([long_first, "short"]), "short")
 
     def test_load_missing_and_touch(self):
         self.assertFalse(skills.load_skill("none")["ok"])
@@ -8211,18 +8693,45 @@ class BotAdapterTest(BotTestCase):
         asyncio.run(scenario())
         self.assertEqual(inner.actions, [(7, "typing")])
 
-    def test_typing_action_stops_after_error(self):
+    def test_typing_action_stops_after_repeated_errors(self):
+        attempts = []
+
         class _Boom:
-            async def send_chat_action(self, _chat_id, _action):
+            async def send_chat_action(self, chat_id, action):
+                attempts.append((chat_id, action))
                 raise TelegramBadRequest(_NO_METHOD, "chat not found")
 
         action = bot.TypingAction(_Boom(), 7, "typing", interval=0.01)
 
         async def scenario():
             async with action:
-                await asyncio.sleep(0.02)
+                await asyncio.sleep(0.05)
 
         asyncio.run(scenario())
+        self.assertEqual(attempts, [(7, "typing")] * bot.TYPING_ATTEMPTS)
+
+    def test_typing_action_survives_transient_error(self):
+        attempts = []
+
+        class _Flaky:
+            async def send_chat_action(self, chat_id, action):
+                attempts.append((chat_id, action))
+                if len(attempts) <= 2:
+                    raise TelegramNetworkError(_NO_METHOD, "reset")
+                return True
+
+        action = bot.TypingAction(_Flaky(), 7, "typing", interval=0.001)
+
+        async def scenario():
+            async with action:
+                for _ in range(3000):
+                    if len(attempts) >= bot.TYPING_ATTEMPTS + 3:
+                        return
+                    await asyncio.sleep(0.001)
+
+        asyncio.run(scenario())
+        self.assertGreaterEqual(len(attempts), bot.TYPING_ATTEMPTS + 3)
+        self.assertTrue(all(item == (7, "typing") for item in attempts))
 
     def test_typing_action_without_enter_is_noop(self):
         action = bot.TypingAction(_FakeAiogramBot(), 7, "typing")
@@ -10299,6 +10808,8 @@ class HardeningTest(BotTestCase):
             self.addCleanup(os.environ.pop, key, None)
         os.environ["KEEP_ME"] = "visible"
         self.addCleanup(os.environ.pop, "KEEP_ME", None)
+        os.environ["OWNER_IDS"] = "5,7"
+        self.addCleanup(os.environ.pop, "OWNER_IDS", None)
         env = tools_module._subprocess_env()
         self.assertNotIn("BOT_TOKEN", env)
         self.assertNotIn("DANYAPI_KEY", env)
@@ -10306,8 +10817,57 @@ class HardeningTest(BotTestCase):
         self.assertNotIn("SESSION_NAME", env)
         self.assertNotIn("GH_TOKEN", env)
         self.assertNotIn("MY_PASSWORD", env)
+        self.assertNotIn("OWNER_IDS", env)
         self.assertEqual(env["KEEP_ME"], "visible")
         self.assertIn("PATH", env)
+
+    def test_search_scanner_does_not_see_secrets(self):
+        tmp = self._tmp_dir("danybot_scanenv_")
+        (tmp / "note.txt").write_text("секрет=abc\n", encoding="utf-8")
+        for key, value in (
+            ("DANYBOT_CANARY_TOKEN", "scanner-canary-77"),
+            ("BOT_TOKEN", f"{AUTH_PART}:scan-secret"),
+        ):
+            os.environ[key] = value
+            self.addCleanup(os.environ.pop, key, None)
+        probe = tmp / "probe.py"
+        probe.write_text(
+            "import json, os, sys\n"
+            f"sys.path.insert(0, r'{PROJECT_DIR}')\n"
+            "import tools\n"
+            "tools._scan_worker_main()\n"
+            "sys.stderr.write(json.dumps({k: os.environ.get(k, '') for k in "
+            "('BOT_TOKEN', 'DANYBOT_CANARY_TOKEN')}))\n",
+            encoding="utf-8",
+        )
+        env = tools_module._subprocess_env()
+        env["PYTHONPATH"] = str(PROJECT_DIR)
+        request = json.dumps(
+            {
+                "root": str(tmp),
+                "glob": "*.txt",
+                "pattern": "секрет",
+                "limit": 5,
+                "limits": {},
+            }
+        )
+        proc = subprocess.run(
+            [sys.executable, str(probe)],
+            input=request.encode("utf-8"),
+            capture_output=True,
+            env=env,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+        payload = json.loads(proc.stdout.decode("utf-8"))
+        self.assertEqual(payload["error"], "")
+        self.assertTrue(payload["matches"])
+        seen = json.loads(
+            proc.stderr.decode("utf-8", "replace").strip().splitlines()[-1]
+        )
+        self.assertEqual(seen["BOT_TOKEN"], "")
+        self.assertEqual(seen["DANYBOT_CANARY_TOKEN"], "")
 
     def test_run_shell_child_does_not_see_secrets(self):
         marker = "canary-value-42"
@@ -10515,6 +11075,11 @@ class HardeningTest(BotTestCase):
         self.assertTrue(merged.endswith("вопрос"))
         long = core.compose_prompt("x" * 500, "y" * 500, 100)
         self.assertLessEqual(len(long), 200)
+        for limit in (10, 40, 80, 200):
+            with self.subTest(limit=limit):
+                self.assertLessEqual(
+                    len(core.compose_prompt("x" * 500, "y" * 500, limit)), limit
+                )
 
     def test_fetch_replied_message_handles_errors(self):
         class _Boom:
@@ -10781,6 +11346,214 @@ class HardeningTest(BotTestCase):
             "Некорректное выражение", _owner_tool("search_files", {"pattern": "["}, 1)
         )
 
+    def test_scan_files_reports_each_budget(self):
+        tmp = self._tmp_dir("danybot_scanbudget_")
+        for index in range(3):
+            (tmp / f"f{index}.txt").write_text("hit\nother\n", encoding="utf-8")
+
+        saved = (
+            tools_module.MAX_SEARCH_FILES,
+            tools_module.MAX_SEARCH_NODES,
+            tools_module.MAX_SEARCH_FILE_BYTES,
+        )
+        self.addCleanup(
+            setattr,
+            tools_module,
+            "MAX_SEARCH_FILES",
+            saved[0],
+        )
+        self.addCleanup(
+            setattr,
+            tools_module,
+            "MAX_SEARCH_NODES",
+            saved[1],
+        )
+        self.addCleanup(
+            setattr,
+            tools_module,
+            "MAX_SEARCH_FILE_BYTES",
+            saved[2],
+        )
+
+        matches, note = scan_files(tmp, "*.txt", "hit", 10)
+        self.assertEqual(len(matches), 3)
+        self.assertEqual(note, "")
+
+        matches, note = scan_files(tmp, "*.txt", "hit", 1)
+        self.assertEqual(len(matches), 1)
+        self.assertIn("лимит результатов", note)
+
+        tools_module.MAX_SEARCH_FILES = 1
+        _matches, note = scan_files(tmp, "*.txt", "hit", 10)
+        self.assertIn("просмотрено не больше 1 файлов", note)
+
+        tools_module.MAX_SEARCH_FILES = saved[0]
+        tools_module.MAX_SEARCH_NODES = 1
+        _matches, note = scan_files(tmp, "*.txt", "hit", 10)
+        self.assertIn("обойдено не больше 1 элементов", note)
+
+        tools_module.MAX_SEARCH_NODES = saved[1]
+        tools_module.MAX_SEARCH_FILE_BYTES = 1
+        matches, note = scan_files(tmp, "*.txt", "hit", 10)
+        self.assertEqual(matches, [])
+        self.assertIn("пропущено файлов больше 1 байт: 3", note)
+
+    def test_scan_files_stops_when_flag_is_set(self):
+        tmp = self._tmp_dir("danybot_scanstop_")
+        (tmp / "a.txt").write_text("hit\n", encoding="utf-8")
+        stop = threading.Event()
+        stop.set()
+        matches, note = scan_files(tmp, "*.txt", "hit", 10, stop)
+        self.assertEqual(matches, [])
+        self.assertIn("остановлено по таймауту", note)
+
+    def test_scan_files_skips_dirs_and_escaped_links(self):
+        tmp = self._tmp_dir("danybot_scanlinks_")
+        outside = self._tmp_dir("danybot_scanoutside_")
+        (tmp / "ok.txt").write_text("hit\n", encoding="utf-8")
+        (tmp / "sub").mkdir()
+        (tmp / "sub" / "nested.txt").write_text("hit\n", encoding="utf-8")
+        (outside / "secret.txt").write_text("hit\n", encoding="utf-8")
+        link = tmp / "link.txt"
+        try:
+            link.symlink_to(outside / "secret.txt")
+        except (OSError, NotImplementedError):
+            self.skipTest("симлинки недоступны")
+        matches, _note = scan_files(tmp, "*", "hit", 10)
+        self.assertTrue(any("ok.txt" in item for item in matches))
+        self.assertTrue(any("nested.txt" in item for item in matches))
+        self.assertFalse(any("link.txt" in item for item in matches))
+
+    def test_reconfigure_stream_tolerates_any_target(self):
+        class _NoReconfigure:
+            pass
+
+        class _Broken:
+            def reconfigure(self, **_kwargs):
+                raise ValueError("поток закрыт")
+
+        tools_module._reconfigure_stream(_NoReconfigure())
+        tools_module._reconfigure_stream(_Broken())
+        tools_module._reconfigure_stream(object())
+
+    def test_scan_worker_main_reports_payload(self):
+        tmp = self._tmp_dir("danybot_scanworker_")
+        (tmp / "a.txt").write_text("hit\n", encoding="utf-8")
+        request = json.dumps(
+            {
+                "root": str(tmp),
+                "glob": "*.txt",
+                "pattern": "hit",
+                "limit": 5,
+                "limits": {"MAX_SEARCH_NODES": 100},
+            }
+        )
+        payload = _run_scan_worker(request)
+        self.assertEqual(payload["error"], "")
+        self.assertEqual(len(payload["matches"]), 1)
+        self.assertIn("a.txt", payload["matches"][0])
+
+    def test_scan_worker_main_reports_bad_request(self):
+        tmp = self._tmp_dir("danybot_scanworker2_")
+        payload = _run_scan_worker(
+            json.dumps(
+                {
+                    "root": str(tmp),
+                    "glob": "*",
+                    "pattern": "[",
+                    "limit": 5,
+                    "limits": {},
+                }
+            )
+        )
+        self.assertEqual(payload["matches"], [])
+        self.assertIn("unterminated", payload["error"])
+        with self.assertRaises(json.JSONDecodeError):
+            _run_scan_worker("{не json")
+
+    def test_search_files_reports_scanner_failures(self):
+        tmp = self._tmp_dir("danybot_sf3_")
+        (tmp / "a.txt").write_text("строка\n", encoding="utf-8")
+        self._use_coder_root(tmp)
+
+        async def broken(*_args, **_kwargs):
+            raise OSError("нет интерпретатора")
+
+        with mock.patch.object(tools_module, "_run_search_subprocess", broken):
+            self.assertIn(
+                "Ошибка запуска сканера",
+                _owner_tool("search_files", {"pattern": "x"}, 1),
+            )
+
+        class _FakeProc:
+            pid = 1
+            returncode = 1
+
+            async def communicate(self, _data=None):
+                return b"", "нет модуля tools".encode()
+
+        with mock.patch.object(
+            tools_module.asyncio, "create_subprocess_exec", broken_async_exec(_FakeProc)
+        ):
+            self.assertIn(
+                "сканер поиска не отработал",
+                _owner_tool("search_files", {"pattern": "x"}, 1),
+            )
+
+    def test_search_files_reports_scanner_garbage(self):
+        tmp = self._tmp_dir("danybot_sf4_")
+        (tmp / "a.txt").write_text("строка\n", encoding="utf-8")
+        self._use_coder_root(tmp)
+
+        class _Garbage:
+            pid = 1
+            returncode = 0
+
+            async def communicate(self, _data=None):
+                return "не json".encode(), b""
+
+        class _Failed:
+            pid = 1
+            returncode = 0
+
+            async def communicate(self, _data=None):
+                return b'{"matches": [], "note": "", "error": "boom"}', b""
+
+        for proc, expected in (
+            (_Garbage(), "сканер поиска вернул мусор"),
+            (_Failed(), "сканер поиска упал"),
+        ):
+            with (
+                self.subTest(expected=expected),
+                mock.patch.object(
+                    tools_module.asyncio,
+                    "create_subprocess_exec",
+                    broken_async_exec(proc),
+                ),
+            ):
+                self.assertIn(
+                    expected, _owner_tool("search_files", {"pattern": "x"}, 1)
+                )
+
+    def test_execute_script_reports_launch_error(self):
+        async def broken(*_args, **_kwargs):
+            raise OSError("нет интерпретатора")
+
+        with mock.patch.object(tools_module.asyncio, "create_subprocess_exec", broken):
+            self.assertIn(
+                "Ошибка запуска",
+                _owner_tool("execute_script", {"code": "print(1)"}, 1),
+            )
+
+    def test_run_shell_reports_launch_error(self):
+        async def broken(*_args, **_kwargs):
+            raise OSError("нет оболочки")
+
+        with mock.patch.object(tools_module.asyncio, "create_subprocess_shell", broken):
+            self.assertIn(
+                "Ошибка запуска", _owner_tool("run_shell", {"command": "echo 1"}, 1)
+            )
+
     def test_search_files_reports_total_timeout(self):
         tmp = self._tmp_dir("danybot_sf2_")
         (tmp / "a.txt").write_text("строка", encoding="utf-8")
@@ -10967,6 +11740,38 @@ class StartupTest(BotTestCase):
         self.assertEqual([c.closed for c in clients], [1, 1])
         self.assertIsNone(bot.bot_client)
 
+    def test_bot_logs_inline_disabled(self):
+        userbot.BOT_TOKEN = BOT_AUTH_VALUE
+        saved_mode = bot.inline_mode
+        self.addCleanup(setattr, bot, "inline_mode", saved_mode)
+        bot.inline_mode = False
+        self._install_proxies([None])
+        client = _FakeAiogramClient(username="danybot_bot", uid=77)
+        self._install_connect([client])
+        with self.assertLogs("danybot.bot", level="INFO") as logs:
+            asyncio.run(bot.start_bot())
+        self.assertTrue(
+            any("Инлайн-режим выключен" in line for line in logs.output),
+            logs.output,
+        )
+        self.assertEqual(client.polled, 1)
+
+    def test_session_for_skips_resolver_when_unsupported(self):
+        class _PlainSession:
+            def __init__(self, **_kwargs):
+                self.kwargs = _kwargs
+
+        with (
+            mock.patch.object(bot, "AiohttpSession", _PlainSession),
+            self.assertLogs("danybot.bot", level="DEBUG") as logs,
+        ):
+            session = bot._session_for(None, 2)
+        self.assertIsInstance(session, _PlainSession)
+        self.assertTrue(
+            any("не поддерживает фиксацию адреса ДЦ" in line for line in logs.output),
+            logs.output,
+        )
+
     def test_bot_stops_on_invalid_token(self):
         userbot.BOT_TOKEN = BOT_AUTH_VALUE
         self._install_proxies([None])
@@ -11024,6 +11829,15 @@ class MainRunTest(BotTestCase):
         for target, attr in (
             (userbot, "load_state"),
             (userbot, "load_history"),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+
+            def sync_noop(*_args, **_kwargs):
+                return None
+
+            setattr(target, attr, sync_noop)
+        for target, attr in (
             (userbot, "refresh_models"),
             (userbot, "disconnect_quietly"),
             (userbot, "close_ai"),
@@ -11095,7 +11909,82 @@ class MainRunTest(BotTestCase):
     def test_run_stops_when_no_mode_enabled(self):
         userbot.ENABLE_USERBOT = False
         userbot.ENABLE_BOT = False
-        asyncio.run(self.main.run())
+        with self.assertLogs("danybot.main", level="ERROR") as logs:
+            asyncio.run(self.main.run())
+        self.assertTrue(
+            any("Не включён ни один режим" in line for line in logs.output), logs.output
+        )
+
+    def test_run_stops_on_registered_signal(self):
+        async def scenario():
+            loop = asyncio.get_running_loop()
+            handlers = {}
+
+            def fake_add(sig, callback, *_args):
+                handlers[sig] = callback
+
+            async def slow():
+                await asyncio.sleep(5)
+
+            for target, attr, value in (
+                (userbot, "start_userbot", slow),
+                (bot, "start_bot", slow),
+            ):
+                saved = getattr(target, attr)
+                self.addCleanup(setattr, target, attr, saved)
+                setattr(target, attr, value)
+
+            async def fire():
+                await asyncio.sleep(0.02)
+                self.assertTrue(handlers)
+                for callback in handlers.values():
+                    callback()
+
+            with mock.patch.object(loop, "add_signal_handler", fake_add):
+                asyncio.ensure_future(fire())
+                await self.main.run()
+
+        asyncio.run(scenario())
+
+    def test_run_logs_cancelled_mode_once(self):
+        async def self_cancel():
+            current = asyncio.current_task()
+            if current is not None:
+                current.cancel()
+            await asyncio.sleep(0)
+
+        async def slow():
+            await asyncio.sleep(5)
+
+        for target, attr, value in (
+            (userbot, "start_userbot", self_cancel),
+            (bot, "start_bot", slow),
+        ):
+            saved = getattr(target, attr)
+            self.addCleanup(setattr, target, attr, saved)
+            setattr(target, attr, value)
+        with self.assertLogs("danybot.main", level="WARNING") as logs:
+            asyncio.run(self.main.run())
+        stopped = [rec for rec in logs.records if "Режим прерван" in rec.getMessage()]
+        self.assertEqual(len(stopped), 1)
+
+    def test_run_swallow_outer_cancellation(self):
+        async def scenario():
+            task = asyncio.ensure_future(self.main.run())
+            await asyncio.sleep(0.02)
+            task.cancel()
+            return await task
+
+        self.assertIsNone(asyncio.run(scenario()))
+
+    def test_main_entry_swallows_keyboard_interrupt(self):
+        async def interrupted():
+            raise KeyboardInterrupt
+
+        saved = self.main.run
+        self.addCleanup(setattr, self.main, "run", saved)
+        self.main.run = interrupted
+        self.main.main()
 
 
 def run_unit_tests():
@@ -11195,6 +12084,8 @@ def build_linters():
             cmd += ["cc", "-s", "-a", *PY_FILES]
         elif name == "codespell":
             cmd += [*PY_FILES]
+        elif name == "pip-audit":
+            cmd += ["-r", REQUIREMENTS_FILE]
         commands.append((name, cmd))
     commands.append(("coverage", []))
 
@@ -11229,7 +12120,7 @@ def run_coverage():
         [
             *base,
             "run",
-            "--source=bot,userbot,proxies,tools,core,subagents,memory,skills",
+            "--source=" + COVERAGE_SOURCE,
             "-m",
             "unittest",
             "discover",
@@ -11243,7 +12134,12 @@ def run_coverage():
         tail = (run_proc.stdout + run_proc.stderr).strip().splitlines()
         return ("coverage", "FAIL", " | ".join(tail[-2:])[:120], elapsed1)
     rep, elapsed2 = run_logged([*base, "report"])
+    if rep.returncode != 0:
+        tail = (rep.stdout + rep.stderr).strip().splitlines()
+        return ("coverage", "FAIL", " | ".join(tail[-2:])[:120], elapsed1 + elapsed2)
     note = extract_note("coverage", rep)
+    if not note:
+        return ("coverage", "FAIL", "отчёт пуст", elapsed1 + elapsed2)
     return ("coverage", "PASS", note, elapsed1 + elapsed2)
 
 
@@ -11316,9 +12212,12 @@ def print_summary(unit_result, lint_results):
         print(line)
     print("=" * 64)
     lint_failed = any(status == "FAIL" for _, status, _, _ in lint_results)
+    nothing_ran = unit_result is None and not lint_results
     verdict_ok = (
-        unit_result is None or unit_result.wasSuccessful()
-    ) and not lint_failed
+        not nothing_ran
+        and (unit_result is None or unit_result.wasSuccessful())
+        and not lint_failed
+    )
     print("ВЕРДИКТ   :", "ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ" if verdict_ok else "ЕСТЬ ПРОВАЛЫ")
     return verdict_ok
 

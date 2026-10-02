@@ -47,6 +47,7 @@ STATE_FILE = Path(__file__).parent / "state_bot.json"
 HISTORY_FILE = Path(__file__).parent / "history_bot.json"
 CALLBACK_MAX_BYTES = 64
 TYPING_INTERVAL = 4.0
+TYPING_ATTEMPTS = 3
 CONNECT_TIMEOUT = 25
 POLL_TIMEOUT = 10
 PROXY_SCHEMES = {"socks5": "socks5", "socks4": "socks4", "http": "http"}
@@ -153,12 +154,16 @@ class TypingAction:
         return False
 
     async def _loop(self) -> None:
+        failures = 0
         while True:
             try:
                 await _tg_call(self._bot.send_chat_action(self._chat_id, self._action))
+                failures = 0
             except (RPCError, OSError, ValueError, TypeError) as exc:
+                failures += 1
                 logger.debug("Индикатор набора не отправлен: %r", exc)
-                return
+                if failures >= TYPING_ATTEMPTS:
+                    return
             await asyncio.sleep(self._interval)
 
 
@@ -401,8 +406,11 @@ def _session_for(proxy, dc=None, address=""):
         kwargs["api"] = TelegramAPIServer.from_base(base)
     session = AiohttpSession(**kwargs)
     pin = address or core.dc_api_pin(dc)
-    if pin:
-        session._connector_init["resolver"] = _PinnedResolver(core.API_HOST, pin)
+    connector_init = getattr(session, "_connector_init", None)
+    if pin and isinstance(connector_init, dict):
+        connector_init["resolver"] = _PinnedResolver(core.API_HOST, pin)
+    elif pin:
+        logger.debug("Сессия aiogram не поддерживает фиксацию адреса ДЦ")
     return session
 
 
