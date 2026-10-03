@@ -57,7 +57,8 @@ INLINE_DESC_LIMIT = 100
 INLINE_TEXT_LIMIT = 4000
 INLINE_MAX_RESULTS = 20
 INLINE_CACHE_TIME = 0
-INLINE_PENDING_MAX = 2000
+INLINE_SEEN_MAX = 2000
+INLINE_SEEN_TTL = 300.0
 INLINE_SUGGESTIONS = ("help", "models", "task", "clear")
 
 model_overrides: dict[int, str] = {}
@@ -71,8 +72,7 @@ ctx_lock = asyncio.Lock()
 recent_reply_ids: set[tuple[int, int]] = set()
 seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
-inline_tokens: dict[str, tuple[int, float]] = {}
-inline_prompts: dict[tuple[int, str], float] = {}
+inline_seen: dict[tuple[int, int], float] = {}
 
 STORE: core.ModeStore = core.ModeStore(globals())
 SESSIONS = core.SessionRegistry()
@@ -463,39 +463,27 @@ def _clip(text, limit):
 
 
 def _prune_inline(now):
-    for key, entry in list(inline_tokens.items()):
-        if entry[1] <= now:
-            del inline_tokens[key]
-    for key, deadline in list(inline_prompts.items()):
+    for key, deadline in list(inline_seen.items()):
         if deadline <= now:
-            del inline_prompts[key]
-    core._evict_oldest(inline_tokens, INLINE_PENDING_MAX)
-    core._evict_oldest(inline_prompts, INLINE_PENDING_MAX)
+            del inline_seen[key]
+    core._evict_oldest(inline_seen, INLINE_SEEN_MAX)
 
 
-def _register_inline(sender_id, text):
-    _prune_inline(time.monotonic())
-    deadline = time.monotonic() + core.INLINE_TOKEN_TTL
-    token = core.new_inline_token()
-    inline_tokens[token] = (int(sender_id), deadline)
-    plain = core.strip_inline_mark(text)
-    if plain:
-        inline_prompts[(int(sender_id), plain.lower())] = deadline
-    return token
+def _is_via_own_bot(message) -> bool:
+    if not bot_id:
+        return False
+    via = getattr(message, "via_bot", None)
+    return via is not None and int(getattr(via, "id", 0) or 0) == bot_id
 
 
-def _claim_inline(sender_id, text):
-    _prune_inline(time.monotonic())
-    plain = core.strip_inline_mark(text)
-    key = (int(sender_id), plain.lower())
-    token = core.inline_token_of(text)
-    if token is not None:
-        owner = inline_tokens.get(token)
-        if owner is not None and owner[0] == int(sender_id):
-            del inline_tokens[token]
-            inline_prompts.pop(key, None)
-            return True
-    return inline_prompts.pop(key, None) is not None
+def _claim_inline(chat_id, msg_id) -> bool:
+    key = (int(chat_id), int(msg_id))
+    now = time.monotonic()
+    _prune_inline(now)
+    if key in inline_seen:
+        return False
+    inline_seen[key] = now + INLINE_SEEN_TTL
+    return True
 
 
 BOT_HELP_TEXT = (
@@ -583,9 +571,9 @@ async def handler(event: Any):
     if is_private and await _sender_is_bot(event):
         return
     triggered = NO_TEXT_TRIGGER
-    if _claim_inline(sender_id, text):
+    via_inline = _is_via_own_bot(message)
+    if via_inline and _claim_inline(chat_id, msg_id):
         triggered = True
-        text = core.strip_inline_mark(text)
         logger.info("Бот: инлайн-запрос из чата %s от %s", chat_id, sender_id)
     mentioned = _is_mentioned(text)
     now = time.monotonic()
@@ -1111,16 +1099,13 @@ async def callback_handler(event: Any):
     await _edit_settings(event, chat_id)
 
 
-def _inline_article(article_id, title, sender_id, text):
-    token = _register_inline(sender_id, text)
+def _inline_article(article_id, title, text):
     return InlineQueryResultArticle(
         id=article_id,
         title=_clip(title, INLINE_TITLE_LIMIT),
         description=_clip(text, INLINE_DESC_LIMIT),
         input_message_content=InputTextMessageContent(
-            message_text=core.inline_marked_text(
-                token, _clip(text, INLINE_TEXT_LIMIT - core.INLINE_MARK_WIDTH)
-            ),
+            message_text=_clip(text, INLINE_TEXT_LIMIT),
             disable_web_page_preview=True,
         ),
     )
@@ -1136,7 +1121,6 @@ def _inline_suggestions(sender_id):
         _inline_article(
             f"cmd:{name}",
             core.BOT_COMMAND_TITLES.get(name, name),
-            sender_id,
             f"/{name}",
         )
         for name in INLINE_SUGGESTIONS
@@ -1149,11 +1133,11 @@ def build_inline_results(query, sender_id):
     commands = core.inline_command_matches(text, _inline_available(sender_id))
     if commands:
         return [
-            _inline_article(f"cmd:{cmd[1:]}", title, sender_id, cmd)
+            _inline_article(f"cmd:{cmd[1:]}", title, cmd)
             for cmd, title in commands[:INLINE_MAX_RESULTS]
         ]
     if text:
-        return [_inline_article("ask", userbot.BOT_NAME, sender_id, text)]
+        return [_inline_article("ask", userbot.BOT_NAME, text)]
     return _inline_suggestions(sender_id)
 
 
@@ -1283,8 +1267,7 @@ async def start_bot():
 async def disconnect_quietly(timeout=10):
     SESSIONS.cancel_all(reason="остановка", logger=logger)
     await SESSIONS.drain(timeout)
-    inline_tokens.clear()
-    inline_prompts.clear()
+    inline_seen.clear()
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if bot_client is None:

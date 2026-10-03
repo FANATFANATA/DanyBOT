@@ -167,8 +167,7 @@ _MODE_DICT_ATTRS = (
     "model_overrides",
     "chat_history",
     "last_chat_activity",
-    "inline_tokens",
-    "inline_prompts",
+    "inline_seen",
 )
 _MODE_SET_ATTRS = (
     "coder_chats",
@@ -6349,6 +6348,8 @@ class SkillsStoreTest(unittest.TestCase):
 
 _HUMAN = SimpleNamespace(is_bot=False, id=99, first_name="Tester", last_name="")
 _MACHINE = SimpleNamespace(is_bot=True, id=99, first_name="Bot", last_name="")
+_BOT_SELF_ID = 42
+_VIA_BOT = SimpleNamespace(id=_BOT_SELF_ID, is_bot=True, username="danybot_bot")
 
 
 class _FakeMessage:
@@ -6360,6 +6361,7 @@ class _FakeMessage:
         is_reply=False,
         reply_msg=None,
         from_user=_HUMAN,
+        via_bot=None,
     ):
         self.message = text
         self.id = msg_id
@@ -6369,6 +6371,7 @@ class _FakeMessage:
         self.sender_id = 1
         self.chat_id = 1
         self.from_user = from_user
+        self.via_bot = via_bot
 
     async def get_reply_message(self):
         if self._reply_msg is None:
@@ -6448,6 +6451,11 @@ class BotHandlerTest(BotTestCase):
         saved_username = bot.bot_username
         self.addCleanup(setattr, bot, "bot_username", saved_username)
         bot.bot_username = "danybot"
+        saved_bot_id = bot.bot_id
+        self.addCleanup(setattr, bot, "bot_id", saved_bot_id)
+        bot.bot_id = _BOT_SELF_ID
+        bot.inline_seen.clear()
+        self.addCleanup(bot.inline_seen.clear)
         self.saver = _FakeSaver()
         for attr, value in (("HISTORY_SAVER", self.saver),):
             saved = getattr(bot, attr)
@@ -6511,44 +6519,55 @@ class BotHandlerTest(BotTestCase):
         self.assertEqual(self.stream_calls, [])
 
     def _inline_text(self, query="привет как дела", sender_id=1):
-        self.addCleanup(bot.inline_tokens.clear)
-        self.addCleanup(bot.inline_prompts.clear)
-        return inline_marked_text(bot.build_inline_results(query, sender_id))
+        self.addCleanup(bot.inline_seen.clear)
+        result = bot.build_inline_results(query, sender_id)[0]
+        return cast(Any, result.input_message_content).message_text
+
+    def _inline_event(self, text, **kwargs):
+        kwargs.setdefault("via_bot", _VIA_BOT)
+        return self._group_event(text, **kwargs)
 
     def test_inline_message_answers_group(self):
-        marked = self._inline_text(sender_id=1)
-        self._run(self._group_event(marked, sender_id=1))
+        text = self._inline_text(sender_id=1)
+        self._run(self._inline_event(text, sender_id=1))
         self.assertEqual(len(self.stream_calls), 1)
         self.assertTrue(self._prompt().endswith("привет как дела"))
 
+    def test_inline_message_text_has_no_mark(self):
+        text = self._inline_text(sender_id=1)
+        self.assertNotIn("\u2063", text)
+        self.assertEqual(text, "привет как дела")
+
     def test_inline_message_still_answers_after_edit(self):
-        marked = self._inline_text(sender_id=1)
-        self._run(self._group_event(f"{marked}, подробнее", sender_id=1))
+        text = self._inline_text(sender_id=1)
+        self._run(self._inline_event(f"{text}, подробнее", sender_id=1))
         self.assertEqual(len(self.stream_calls), 1)
         self.assertTrue(self._prompt().endswith("привет как дела, подробнее"))
 
-    def test_inline_token_is_not_reused(self):
-        marked = self._inline_text(sender_id=1)
-        self._run(self._group_event(marked, sender_id=1))
-        self._run(self._group_event(marked, sender_id=1))
-        self.assertEqual(len(self.stream_calls), 1)
+    def test_inline_message_without_via_bot_is_ignored(self):
+        text = self._inline_text(sender_id=1)
+        self._run(self._group_event(text, sender_id=1))
+        self.assertEqual(self.stream_calls, [])
 
-    def test_plain_copy_of_inline_query_answers_once(self):
-        self._inline_text(sender_id=1)
-        self._run(self._group_event("привет как дела", sender_id=1))
-        self._run(self._group_event("привет как дела", sender_id=1))
+    def test_inline_message_via_foreign_bot_is_ignored(self):
+        text = self._inline_text(sender_id=1)
+        self._run(
+            self._inline_event(text, sender_id=1, via_bot=SimpleNamespace(id=999))
+        )
+        self.assertEqual(self.stream_calls, [])
+
+    def test_inline_message_is_answered_once(self):
+        text = self._inline_text(sender_id=1)
+        event = self._inline_event(text, sender_id=1)
+        self._run(event)
+        self._run(event)
         self.assertEqual(len(self.stream_calls), 1)
 
     def test_inline_command_runs_prompt_reply(self):
-        marked = self._inline_text(query="/help", sender_id=self.OWNER)
-        event = self._run(self._group_event(marked, sender_id=self.OWNER))
+        text = self._inline_text(query="/help", sender_id=self.OWNER)
+        event = self._run(self._inline_event(text, sender_id=self.OWNER))
         self.assertEqual(self.stream_calls, [])
         self.assertIn("DanyBOT - команды", event.sent[0])
-
-    def test_inline_prompt_has_no_invisible_mark(self):
-        marked = self._inline_text(sender_id=self.OWNER)
-        self._run(self._group_event(marked, sender_id=self.OWNER))
-        self.assertNotIn(core.INLINE_MARK, self._prompt())
 
     def test_private_message_from_bot_is_ignored(self):
         event = self._group_event(
@@ -7806,36 +7825,19 @@ class SettingsMenuTest(BotTestCase):
 
 
 class InlineMarkTest(BotTestCase):
-    def test_token_is_hex_and_unique(self):
-        tokens = {core.new_inline_token() for _ in range(200)}
-        self.assertEqual(len(tokens), 200)
-        for token in tokens:
-            self.assertRegex(token, "^[0-9a-f]+$")
-            self.assertEqual(len(token), core.INLINE_TOKEN_LEN)
-
-    def test_mark_round_trip(self):
-        token = core.new_inline_token()
-        marked = core.inline_marked_text(token, "  привет  ")
-        self.assertNotIn(core.INLINE_MARK, core.strip_inline_mark(marked))
-        self.assertEqual(core.strip_inline_mark(marked), "привет")
-        self.assertEqual(core.inline_token_of(marked), token)
-
-    def test_mark_without_body_keeps_token(self):
-        token = core.new_inline_token()
-        marked = core.inline_marked_text(token, "   ")
-        self.assertEqual(core.inline_token_of(marked), token)
-        self.assertEqual(core.strip_inline_mark(marked), "")
-
-    def test_plain_text_has_no_token(self):
-        for text in ("привет", "", None, "@danybot привет"):
-            with self.subTest(text=text):
-                self.assertIsNone(core.inline_token_of(text))
-                self.assertEqual(core.strip_inline_mark(text), (text or "").strip())
-
-    def test_foreign_mark_is_ignored(self):
-        self.assertIsNone(
-            core.inline_token_of(f"{core.INLINE_MARK}zz{core.INLINE_MARK}")
-        )
+    def test_inline_helpers_are_gone(self):
+        for name in (
+            "INLINE_MARK",
+            "INLINE_MARK_RE",
+            "INLINE_MARK_WIDTH",
+            "INLINE_TOKEN_LEN",
+            "new_inline_token",
+            "inline_marked_text",
+            "inline_token_of",
+            "strip_inline_mark",
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(core, name))
 
     def test_command_matches_exact(self):
         self.assertEqual(
@@ -7924,22 +7926,14 @@ class InlineResultsTest(BotTestCase):
         saved = userbot.OWNER_IDS
         self.addCleanup(setattr, userbot, "OWNER_IDS", saved)
         userbot.OWNER_IDS = {self.OWNER}
-        self._clear_tokens()
-        self.addCleanup(self._clear_tokens)
 
-    def _clear_tokens(self):
-        bot.inline_tokens.clear()
-        bot.inline_prompts.clear()
-
-    def test_ask_result_carries_query_and_token(self):
+    def test_ask_result_carries_query_without_mark(self):
         results = bot.build_inline_results("  привет как дела  ", self.STRANGER)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].id, "ask")
         self.assertEqual(results[0].title, userbot.BOT_NAME)
         self.assertEqual(results[0].description, "привет как дела")
-        marked = inline_marked_text(results)
-        self.assertEqual(core.strip_inline_mark(marked), "привет как дела")
-        self.assertIsNotNone(core.inline_token_of(marked))
+        self.assertEqual(inline_marked_text(results), "привет как дела")
         content = cast(Any, results[0].input_message_content)
         self.assertTrue(content.disable_web_page_preview)
 
@@ -7950,7 +7944,7 @@ class InlineResultsTest(BotTestCase):
             ["cmd:help", "cmd:models", "cmd:task", "cmd:clear"],
         )
         for text in inline_texts(results):
-            self.assertIsNotNone(core.inline_token_of(text))
+            self.assertNotIn("\u2063", text)
 
     def test_empty_query_hides_owner_commands_from_stranger(self):
         self.assertEqual(
@@ -7961,7 +7955,7 @@ class InlineResultsTest(BotTestCase):
     def test_query_command_replaces_ask_result(self):
         results = bot.build_inline_results("/he", self.STRANGER)
         self.assertEqual([item.id for item in results], ["cmd:help"])
-        self.assertEqual(core.strip_inline_mark(inline_marked_text(results)), "/help")
+        self.assertEqual(inline_marked_text(results), "/help")
 
     def test_long_query_is_clipped(self):
         results = bot.build_inline_results("я" * 9000, self.STRANGER)
@@ -7972,11 +7966,11 @@ class InlineResultsTest(BotTestCase):
         )
         self.assertLessEqual(len(results[0].title), bot.INLINE_TITLE_LIMIT)
 
-    def test_result_ids_are_unique(self):
+    def test_result_ids_are_stable(self):
         first = bot.build_inline_results("привет", self.STRANGER)[0]
         second = bot.build_inline_results("привет", self.STRANGER)[0]
         self.assertEqual(first.id, second.id)
-        self.assertNotEqual(inline_marked_text([first]), inline_marked_text([second]))
+        self.assertEqual(inline_marked_text([first]), inline_marked_text([second]))
 
     def test_disabled_mode_answers_with_nothing(self):
         calls = []
@@ -8091,10 +8085,9 @@ class InlineResultsTest(BotTestCase):
         payload = json.loads(prepared)
         self.assertEqual(payload["results"][0]["type"], "article")
         self.assertNotIn("thumbnail", payload["results"][0])
+        self.assertNotIn("\u2063", payload["results"][0])
         self.assertEqual(
-            core.strip_inline_mark(
-                payload["results"][0]["input_message_content"]["message_text"]
-            ),
+            payload["results"][0]["input_message_content"]["message_text"],
             "привет",
         )
 
@@ -8109,66 +8102,56 @@ class InlineResultsTest(BotTestCase):
 class InlineClaimTest(BotTestCase):
     def setUp(self):
         super().setUp()
-        bot.inline_tokens.clear()
-        bot.inline_prompts.clear()
-        self.addCleanup(bot.inline_tokens.clear)
-        self.addCleanup(bot.inline_prompts.clear)
+        bot.inline_seen.clear()
+        self.addCleanup(bot.inline_seen.clear)
+        saved_bot_id = bot.bot_id
+        self.addCleanup(setattr, bot, "bot_id", saved_bot_id)
+        bot.bot_id = _BOT_SELF_ID
 
-    def _marked(self, query="привет", sender_id=6):
-        return inline_marked_text(bot.build_inline_results(query, sender_id))
+    def test_message_claim_is_single_use(self):
+        self.assertTrue(bot._claim_inline(6, 10))
+        self.assertFalse(bot._claim_inline(6, 10))
 
-    def test_token_claim_is_single_use(self):
-        marked = self._marked()
-        self.assertTrue(bot._claim_inline(6, marked))
-        self.assertFalse(bot._claim_inline(6, marked))
+    def test_message_claim_is_per_chat(self):
+        self.assertTrue(bot._claim_inline(6, 10))
+        self.assertTrue(bot._claim_inline(7, 10))
 
-    def test_token_claim_still_works_after_edit(self):
-        marked = self._marked()
-        self.assertTrue(bot._claim_inline(6, f"{marked}, подробнее"))
+    def test_message_claim_is_per_message(self):
+        self.assertTrue(bot._claim_inline(6, 10))
+        self.assertTrue(bot._claim_inline(6, 11))
 
-    def test_token_claim_requires_sender(self):
-        marked = self._marked()
-        self.assertFalse(bot._claim_inline(7, marked))
-        self.assertTrue(bot._claim_inline(6, marked))
-
-    def test_plain_text_fallback_survives_lost_mark(self):
-        self._marked()
-        self.assertTrue(bot._claim_inline(6, "привет"))
-        self.assertFalse(bot._claim_inline(6, "привет"))
-
-    def test_plain_text_fallback_is_case_insensitive(self):
-        bot.build_inline_results("Привет", 6)
-        self.assertTrue(bot._claim_inline(6, "привет"))
-
-    def test_plain_text_fallback_belongs_to_sender(self):
-        bot.build_inline_results("привет", 6)
-        self.assertFalse(bot._claim_inline(7, "привет"))
-
-    def test_expired_tokens_are_dropped(self):
-        marked = self._marked()
+    def test_expired_entries_are_dropped(self):
+        self.assertTrue(bot._claim_inline(6, 10))
         past = time.monotonic() - 1
-        for key in list(bot.inline_tokens):
-            bot.inline_tokens[key] = (6, past)
-        for key in list(bot.inline_prompts):
-            bot.inline_prompts[key] = past
-        self.assertFalse(bot._claim_inline(6, marked))
-        self.assertEqual(bot.inline_tokens, {})
-        self.assertEqual(bot.inline_prompts, {})
+        for key in list(bot.inline_seen):
+            bot.inline_seen[key] = past
+        self.assertTrue(bot._claim_inline(6, 10))
+        self.assertEqual(list(bot.inline_seen), [(6, 10)])
 
-    def test_register_keeps_query_for_bare_command(self):
-        self.assertTrue(bot._claim_inline(6, self._marked("/help")))
+    def test_via_bot_detection_matches_own_bot(self):
+        self.assertTrue(bot._is_via_own_bot(_FakeMessage("x", via_bot=_VIA_BOT)))
 
-    def test_unknown_text_is_not_claimed(self):
-        self.assertFalse(bot._claim_inline(6, "просто сообщение"))
+    def test_via_bot_detection_ignores_foreign_bot(self):
+        self.assertFalse(
+            bot._is_via_own_bot(_FakeMessage("x", via_bot=SimpleNamespace(id=999)))
+        )
 
-    def test_pending_stores_stay_bounded(self):
-        saved_max = bot.INLINE_PENDING_MAX
-        self.addCleanup(setattr, bot, "INLINE_PENDING_MAX", saved_max)
-        bot.INLINE_PENDING_MAX = 4
+    def test_via_bot_detection_ignores_plain_message(self):
+        self.assertFalse(bot._is_via_own_bot(_FakeMessage("x")))
+
+    def test_via_bot_detection_requires_bot_id(self):
+        saved = bot.bot_id
+        self.addCleanup(setattr, bot, "bot_id", saved)
+        bot.bot_id = 0
+        self.assertFalse(bot._is_via_own_bot(_FakeMessage("x", via_bot=_VIA_BOT)))
+
+    def test_seen_stores_stay_bounded(self):
+        saved_max = bot.INLINE_SEEN_MAX
+        self.addCleanup(setattr, bot, "INLINE_SEEN_MAX", saved_max)
+        bot.INLINE_SEEN_MAX = 4
         for index in range(20):
-            bot._register_inline(6, f"запрос {index}")
-        self.assertLessEqual(len(bot.inline_tokens), 5)
-        self.assertLessEqual(len(bot.inline_prompts), 5)
+            bot._claim_inline(6, index)
+        self.assertLessEqual(len(bot.inline_seen), 5)
 
     def test_evict_oldest_handles_dicts_and_sets(self):
         mapping = {index: index for index in range(10)}
@@ -8179,16 +8162,14 @@ class InlineClaimTest(BotTestCase):
         self.assertEqual(len(bucket), 6)
         self.assertEqual(sorted(mapping), list(range(4, 10)))
 
-    def test_disconnect_drops_pending_inline(self):
-        marked = self._marked()
+    def test_disconnect_drops_seen_inline(self):
+        bot._claim_inline(6, 10)
         client = _FakeAiogramBot()
         saved_client = bot.bot_client
         self.addCleanup(setattr, bot, "bot_client", saved_client)
         bot.bot_client = bot.BotClient(client)
         asyncio.run(bot.disconnect_quietly())
-        self.assertEqual(bot.inline_tokens, {})
-        self.assertEqual(bot.inline_prompts, {})
-        self.assertFalse(bot._claim_inline(6, marked))
+        self.assertEqual(bot.inline_seen, {})
 
 
 class UserbotHelpersTest(BotTestCase):

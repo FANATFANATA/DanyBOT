@@ -4,7 +4,6 @@ import json
 import math
 import os
 import re
-import secrets
 import stat
 import tempfile
 import threading
@@ -380,35 +379,6 @@ def inline_command_matches(query, is_owner) -> list[tuple[str, str]]:
         for name in names
         if is_owner or name not in INLINE_OWNER_COMMANDS
     ]
-
-
-INLINE_MARK = "\u2063"
-INLINE_TOKEN_LEN = 12
-INLINE_MARK_RE = re.compile(
-    f"{INLINE_MARK}([0-9a-f]{{{INLINE_TOKEN_LEN}}}){INLINE_MARK}"
-)
-INLINE_MARK_WIDTH = 2 * len(INLINE_MARK) + INLINE_TOKEN_LEN + 1
-
-INLINE_TOKEN_TTL = 3600.0
-
-
-def new_inline_token() -> str:
-    return secrets.token_hex(INLINE_TOKEN_LEN // 2)
-
-
-def inline_marked_text(token: str, text: str) -> str:
-    mark = f"{INLINE_MARK}{token}{INLINE_MARK}"
-    body = (text or "").strip()
-    return f"{mark} {body}" if body else mark
-
-
-def inline_token_of(text) -> str | None:
-    match = INLINE_MARK_RE.search(text or "")
-    return match.group(1) if match else None
-
-
-def strip_inline_mark(text) -> str:
-    return INLINE_MARK_RE.sub("", text or "", count=1).strip()
 
 
 def strip_role_tag(text: str, bot_name: str = "DanyBOT") -> str:
