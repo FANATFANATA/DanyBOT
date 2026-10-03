@@ -6540,7 +6540,8 @@ class BotHandlerTest(BotTestCase):
 
     def test_inline_message_still_answers_after_edit(self):
         text = self._inline_text(sender_id=1)
-        self._run(self._inline_event(f"{text}, подробнее", sender_id=1))
+        event = self._inline_event(f"{text}, подробнее", sender_id=1, msg_id=1)
+        self._run(event)
         self.assertEqual(len(self.stream_calls), 1)
         self.assertTrue(self._prompt().endswith("привет как дела, подробнее"))
 
@@ -6568,6 +6569,32 @@ class BotHandlerTest(BotTestCase):
         event = self._run(self._inline_event(text, sender_id=self.OWNER))
         self.assertEqual(self.stream_calls, [])
         self.assertIn("DanyBOT - команды", event.sent[0])
+
+    def test_inline_message_via_bot_wrapper_is_detected(self):
+        inner = _aiogram_message(text="привет как дела", chat_id=self.GROUP)
+        inner = inner.model_copy(
+            update={
+                "via_bot": User(
+                    id=_BOT_SELF_ID,
+                    is_bot=True,
+                    first_name="bot",
+                    username="danybot_bot",
+                )
+            }
+        )
+        event = bot.BotEvent(inner)
+        event.sender_id = self.OWNER
+        self._run(event)
+        self.assertEqual(len(self.stream_calls), 1)
+        self.assertNotIn("\u2063", self._prompt())
+
+    def test_inline_message_without_via_bot_falls_back_to_via_bot_before_bot_id(self):
+        saved_bot_id = bot.bot_id
+        self.addCleanup(setattr, bot, "bot_id", saved_bot_id)
+        bot.bot_id = 0
+        text = self._inline_text(sender_id=1)
+        self._run(self._inline_event(text, sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
 
     def test_private_message_from_bot_is_ignored(self):
         event = self._group_event(

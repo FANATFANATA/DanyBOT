@@ -202,6 +202,10 @@ class BotMessage:
     def is_reply(self) -> bool:
         return self._message.reply_to_message is not None
 
+    @property
+    def via_bot(self):
+        return getattr(self._message, "via_bot", None)
+
     async def get_reply_message(self):
         replied = self._message.reply_to_message
         if replied is None:
@@ -470,10 +474,18 @@ def _prune_inline(now):
 
 
 def _is_via_own_bot(message) -> bool:
-    if not bot_id:
-        return False
     via = getattr(message, "via_bot", None)
-    return via is not None and int(getattr(via, "id", 0) or 0) == bot_id
+    if via is None:
+        return False
+    if bot_id and int(getattr(via, "id", 0) or 0) == bot_id:
+        return True
+    via_username = (getattr(via, "username", None) or "").strip().lower()
+    own_username = (bot_username or "").strip().lower()
+    return bool(
+        via_username
+        and own_username
+        and (via_username in own_username or own_username in via_username)
+    )
 
 
 def _claim_inline(chat_id, msg_id) -> bool:
