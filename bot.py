@@ -73,6 +73,7 @@ recent_reply_ids: set[tuple[int, int]] = set()
 seen_msg_keys: set[tuple[int, int]] = set()
 last_chat_activity: dict[int, float] = {}
 inline_seen: dict[tuple[int, int], float] = {}
+inline_prompts: dict[tuple[int, str], float] = {}
 
 STORE: core.ModeStore = core.ModeStore(globals())
 SESSIONS = core.SessionRegistry()
@@ -488,6 +489,31 @@ def _is_via_own_bot(message) -> bool:
     )
 
 
+def _prune_prompts(now):
+    for key, deadline in list(inline_prompts.items()):
+        if deadline <= now:
+            del inline_prompts[key]
+    core._evict_oldest(inline_prompts, INLINE_SEEN_MAX)
+
+
+def _register_prompt(sender_id, text):
+    plain = (text or "").strip()
+    if not plain:
+        return
+    now = time.monotonic()
+    _prune_prompts(now)
+    inline_prompts[(int(sender_id), plain.lower())] = now + INLINE_SEEN_TTL
+
+
+def _claim_prompt(sender_id, text) -> bool:
+    plain = (text or "").strip()
+    if not plain:
+        return False
+    now = time.monotonic()
+    _prune_prompts(now)
+    return inline_prompts.pop((int(sender_id), plain.lower()), None) is not None
+
+
 def _claim_inline(chat_id, msg_id) -> bool:
     key = (int(chat_id), int(msg_id))
     now = time.monotonic()
@@ -583,10 +609,18 @@ async def handler(event: Any):
     if is_private and await _sender_is_bot(event):
         return
     triggered = NO_TEXT_TRIGGER
+    via_msg = getattr(message, "via_bot", None)
     via_inline = _is_via_own_bot(message)
-    if via_inline and _claim_inline(chat_id, msg_id):
+    if via_inline:
+        if _claim_inline(chat_id, msg_id):
+            triggered = True
+            _claim_prompt(sender_id, text)
+            logger.info("Бот: инлайн-запрос из чата %s от %s", chat_id, sender_id)
+    elif via_msg is not None:
+        logger.debug("Бот: инлайн через чужой бот %r, игнорирую", via_msg)
+    elif _claim_prompt(sender_id, text):
         triggered = True
-        logger.info("Бот: инлайн-запрос из чата %s от %s", chat_id, sender_id)
+        logger.info("Бот: инлайн-запрос (текст) из чата %s от %s", chat_id, sender_id)
     mentioned = _is_mentioned(text)
     now = time.monotonic()
 
@@ -1111,13 +1145,16 @@ async def callback_handler(event: Any):
     await _edit_settings(event, chat_id)
 
 
-def _inline_article(article_id, title, text):
+def _inline_article(article_id, title, text, sender_id=None):
+    body = _clip(text, INLINE_TEXT_LIMIT)
+    if sender_id is not None:
+        _register_prompt(sender_id, body)
     return InlineQueryResultArticle(
         id=article_id,
         title=_clip(title, INLINE_TITLE_LIMIT),
         description=_clip(text, INLINE_DESC_LIMIT),
         input_message_content=InputTextMessageContent(
-            message_text=_clip(text, INLINE_TEXT_LIMIT),
+            message_text=body,
             disable_web_page_preview=True,
         ),
     )
@@ -1134,6 +1171,7 @@ def _inline_suggestions(sender_id):
             f"cmd:{name}",
             core.BOT_COMMAND_TITLES.get(name, name),
             f"/{name}",
+            sender_id,
         )
         for name in INLINE_SUGGESTIONS
         if owner or name not in core.INLINE_OWNER_COMMANDS
@@ -1145,11 +1183,11 @@ def build_inline_results(query, sender_id):
     commands = core.inline_command_matches(text, _inline_available(sender_id))
     if commands:
         return [
-            _inline_article(f"cmd:{cmd[1:]}", title, cmd)
+            _inline_article(f"cmd:{cmd[1:]}", title, cmd, sender_id)
             for cmd, title in commands[:INLINE_MAX_RESULTS]
         ]
     if text:
-        return [_inline_article("ask", userbot.BOT_NAME, text)]
+        return [_inline_article("ask", userbot.BOT_NAME, text, sender_id)]
     return _inline_suggestions(sender_id)
 
 
@@ -1280,6 +1318,7 @@ async def disconnect_quietly(timeout=10):
     SESSIONS.cancel_all(reason="остановка", logger=logger)
     await SESSIONS.drain(timeout)
     inline_seen.clear()
+    inline_prompts.clear()
     with contextlib.suppress(Exception):
         await HISTORY_SAVER.flush()
     if bot_client is None:

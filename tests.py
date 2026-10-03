@@ -168,6 +168,7 @@ _MODE_DICT_ATTRS = (
     "chat_history",
     "last_chat_activity",
     "inline_seen",
+    "inline_prompts",
 )
 _MODE_SET_ATTRS = (
     "coder_chats",
@@ -6455,7 +6456,9 @@ class BotHandlerTest(BotTestCase):
         self.addCleanup(setattr, bot, "bot_id", saved_bot_id)
         bot.bot_id = _BOT_SELF_ID
         bot.inline_seen.clear()
+        bot.inline_prompts.clear()
         self.addCleanup(bot.inline_seen.clear)
+        self.addCleanup(bot.inline_prompts.clear)
         self.saver = _FakeSaver()
         for attr, value in (("HISTORY_SAVER", self.saver),):
             saved = getattr(bot, attr)
@@ -6519,7 +6522,7 @@ class BotHandlerTest(BotTestCase):
         self.assertEqual(self.stream_calls, [])
 
     def _inline_text(self, query="привет как дела", sender_id=1):
-        self.addCleanup(bot.inline_seen.clear)
+        self.addCleanup(bot.inline_prompts.clear)
         result = bot.build_inline_results(query, sender_id)[0]
         return cast(Any, result.input_message_content).message_text
 
@@ -6545,13 +6548,34 @@ class BotHandlerTest(BotTestCase):
         self.assertEqual(len(self.stream_calls), 1)
         self.assertTrue(self._prompt().endswith("привет как дела, подробнее"))
 
-    def test_inline_message_without_via_bot_is_ignored(self):
+    def test_inline_message_without_via_bot_falls_back_to_prompt(self):
         text = self._inline_text(sender_id=1)
         self._run(self._group_event(text, sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_inline_message_without_via_bot_and_prompt_is_ignored(self):
+        self._run(self._group_event("привет как дела", sender_id=1))
         self.assertEqual(self.stream_calls, [])
+
+    def test_inline_prompt_is_single_use(self):
+        text = self._inline_text(sender_id=1)
+        self._run(self._group_event(text, sender_id=1))
+        self._run(self._group_event(text, sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
+
+    def test_inline_prompt_belongs_to_sender(self):
+        text = self._inline_text(sender_id=1)
+        self._run(self._group_event(text, sender_id=2))
+        self.assertEqual(self.stream_calls, [])
+
+    def test_inline_prompt_is_case_insensitive(self):
+        self._inline_text(query="Привет", sender_id=1)
+        self._run(self._group_event("привет", sender_id=1))
+        self.assertEqual(len(self.stream_calls), 1)
 
     def test_inline_message_via_foreign_bot_is_ignored(self):
         text = self._inline_text(sender_id=1)
+        bot.inline_prompts.clear()
         self._run(
             self._inline_event(text, sender_id=1, via_bot=SimpleNamespace(id=999))
         )
@@ -8130,7 +8154,9 @@ class InlineClaimTest(BotTestCase):
     def setUp(self):
         super().setUp()
         bot.inline_seen.clear()
+        bot.inline_prompts.clear()
         self.addCleanup(bot.inline_seen.clear)
+        self.addCleanup(bot.inline_prompts.clear)
         saved_bot_id = bot.bot_id
         self.addCleanup(setattr, bot, "bot_id", saved_bot_id)
         bot.bot_id = _BOT_SELF_ID
@@ -8166,11 +8192,46 @@ class InlineClaimTest(BotTestCase):
     def test_via_bot_detection_ignores_plain_message(self):
         self.assertFalse(bot._is_via_own_bot(_FakeMessage("x")))
 
-    def test_via_bot_detection_requires_bot_id(self):
-        saved = bot.bot_id
-        self.addCleanup(setattr, bot, "bot_id", saved)
+    def test_via_bot_detection_falls_back_to_username(self):
+        saved_id, saved_user = bot.bot_id, bot.bot_username
+        self.addCleanup(setattr, bot, "bot_id", saved_id)
+        self.addCleanup(setattr, bot, "bot_username", saved_user)
         bot.bot_id = 0
-        self.assertFalse(bot._is_via_own_bot(_FakeMessage("x", via_bot=_VIA_BOT)))
+        bot.bot_username = "danybot"
+        self.assertTrue(bot._is_via_own_bot(_FakeMessage("x", via_bot=_VIA_BOT)))
+        self.assertFalse(
+            bot._is_via_own_bot(
+                _FakeMessage("x", via_bot=SimpleNamespace(id=999, username="other_bot"))
+            )
+        )
+
+    def test_prompt_claim_is_single_use(self):
+        bot._register_prompt(6, "привет")
+        self.assertTrue(bot._claim_prompt(6, "привет"))
+        self.assertFalse(bot._claim_prompt(6, "привет"))
+
+    def test_prompt_claim_requires_matching_sender(self):
+        bot._register_prompt(6, "привет")
+        self.assertFalse(bot._claim_prompt(7, "привет"))
+        self.assertTrue(bot._claim_prompt(6, "привет"))
+
+    def test_prompt_claim_ignores_unknown_and_empty(self):
+        bot._register_prompt(6, "привет")
+        self.assertFalse(bot._claim_prompt(6, "просто сообщение"))
+        self.assertFalse(bot._claim_prompt(6, ""))
+        self.assertFalse(bot._claim_prompt(6, None))
+
+    def test_expired_prompts_are_dropped(self):
+        bot._register_prompt(6, "привет")
+        past = time.monotonic() - 1
+        for key in list(bot.inline_prompts):
+            bot.inline_prompts[key] = past
+        self.assertFalse(bot._claim_prompt(6, "привет"))
+        self.assertEqual(bot.inline_prompts, {})
+
+    def test_prompt_claim_survives_extra_edited_text(self):
+        bot._register_prompt(6, "привет")
+        self.assertFalse(bot._claim_prompt(6, "привет, подробнее"))
 
     def test_seen_stores_stay_bounded(self):
         saved_max = bot.INLINE_SEEN_MAX
@@ -8191,12 +8252,14 @@ class InlineClaimTest(BotTestCase):
 
     def test_disconnect_drops_seen_inline(self):
         bot._claim_inline(6, 10)
+        bot._register_prompt(6, "привет")
         client = _FakeAiogramBot()
         saved_client = bot.bot_client
         self.addCleanup(setattr, bot, "bot_client", saved_client)
         bot.bot_client = bot.BotClient(client)
         asyncio.run(bot.disconnect_quietly())
         self.assertEqual(bot.inline_seen, {})
+        self.assertEqual(bot.inline_prompts, {})
 
 
 class UserbotHelpersTest(BotTestCase):
