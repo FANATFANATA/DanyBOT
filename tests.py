@@ -2978,7 +2978,7 @@ class ExtraToolsTest(BotTestCase):
         self.assertEqual(self._run("nope", {}), "Неизвестная функция: nope")
 
     def test_run_shell_defaults_to_coder_root(self):
-        out = self._owner_run("run_shell", {"command": "pwd -P"})
+        out = self._owner_run("run_shell", {"command": "cd"})
         self.assertIn("rc=0", out)
         self.assertIn(str(tools_module.CODER_ROOT), out)
 

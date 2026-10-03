@@ -1,3 +1,4 @@
 row_factory
 auth_key
 _scan_worker_main
+AI_RETRY_DELAY
