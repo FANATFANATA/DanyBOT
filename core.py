@@ -389,7 +389,7 @@ INLINE_MARK_RE = re.compile(
 )
 INLINE_MARK_WIDTH = 2 * len(INLINE_MARK) + INLINE_TOKEN_LEN + 1
 
-INLINE_TOKEN_TTL = 300.0
+INLINE_TOKEN_TTL = 3600.0
 
 
 def new_inline_token() -> str:

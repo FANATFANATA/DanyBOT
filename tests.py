@@ -2979,7 +2979,7 @@ class ExtraToolsTest(BotTestCase):
         self.assertEqual(self._run("nope", {}), "Неизвестная функция: nope")
 
     def test_run_shell_defaults_to_coder_root(self):
-        out = self._owner_run("run_shell", {"command": "cd"})
+        out = self._owner_run("run_shell", {"command": "pwd -P"})
         self.assertIn("rc=0", out)
         self.assertIn(str(tools_module.CODER_ROOT), out)
 
@@ -3365,9 +3365,9 @@ class ToolsInternalsTest(BotTestCase):
         self.assertEqual(sink.text(), "abcd")
 
     def test_spawn_kwargs_depends_on_platform(self):
-        self.assertEqual(tools_module._spawn_kwargs(), {})
-        fake_os = SimpleNamespace(name="posix")
-        with mock.patch.object(tools_module, "os", fake_os):
+        with mock.patch.object(tools_module, "os", SimpleNamespace(name="nt")):
+            self.assertEqual(tools_module._spawn_kwargs(), {})
+        with mock.patch.object(tools_module, "os", SimpleNamespace(name="posix")):
             self.assertEqual(tools_module._spawn_kwargs(), {"start_new_session": True})
 
     def test_kill_process_now_skips_finished_process(self):

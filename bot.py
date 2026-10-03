@@ -49,7 +49,8 @@ CALLBACK_MAX_BYTES = 64
 TYPING_INTERVAL = 4.0
 TYPING_ATTEMPTS = 3
 CONNECT_TIMEOUT = 25
-POLL_TIMEOUT = 10
+POLL_TIMEOUT = 30
+HTTP_TIMEOUT = max(60, userbot._env_int("BOT_HTTP_TIMEOUT", 300))
 PROXY_SCHEMES = {"socks5": "socks5", "socks4": "socks4", "http": "http"}
 INLINE_TITLE_LIMIT = 64
 INLINE_DESC_LIMIT = 100
@@ -404,6 +405,7 @@ def _session_for(proxy, dc=None, address=""):
     base = core.dc_api_url(dc)
     if base:
         kwargs["api"] = TelegramAPIServer.from_base(base)
+    kwargs["timeout"] = HTTP_TIMEOUT
     session = AiohttpSession(**kwargs)
     pin = address or core.dc_api_pin(dc)
     connector_init = getattr(session, "_connector_init", None)
@@ -1157,19 +1159,25 @@ def build_inline_results(query, sender_id):
 
 async def inline_handler(event: Any):
     results = build_inline_results(event.query, event.sender_id) if inline_mode else []
-    try:
-        await (bot_client or get_bot_client()).answer_inline(
-            event.inline_query_id, results
-        )
-    except (
-        TelegramAPIError,
-        RPCError,
-        OSError,
-        ValueError,
-        TypeError,
-        OverflowError,
-    ) as exc:
-        logger.warning("Инлайн-запрос не обработан: %r", exc)
+    client = bot_client or get_bot_client()
+    last = None
+    for attempt in range(3):
+        try:
+            await client.answer_inline(event.inline_query_id, results)
+            return
+        except (
+            TelegramAPIError,
+            RPCError,
+            OSError,
+            ValueError,
+            TypeError,
+            OverflowError,
+        ) as exc:
+            last = exc
+            if attempt < 2:
+                await asyncio.sleep(0.5 * (attempt + 1))
+                continue
+    logger.warning("Инлайн-запрос не обработан после повторов: %r", last)
 
 
 async def _proxy_candidates():

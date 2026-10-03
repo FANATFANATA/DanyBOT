@@ -91,14 +91,16 @@ SANITIZE_PROMPT = _env_str(
 TRIGGER_RE = core.TRIGGER_RE
 
 EDIT_INTERVAL = max(0.2, _env_float("EDIT_INTERVAL", 1.0))
-GROUP_HISTORY_LIMIT = max(2, _env_int("GROUP_HISTORY_LIMIT", 40))
-DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100))
-LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 50))
-MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 4096))
-MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 8000))
-TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 60))
-TOOL_MAX_ROUNDS = max(1, _env_int("TOOL_MAX_ROUNDS", 200))
-REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 120.0))
+GROUP_HISTORY_LIMIT = max(2, _env_int("GROUP_HISTORY_LIMIT", 100000))
+DM_HISTORY_LIMIT = max(2, _env_int("DM_HISTORY_LIMIT", 100000))
+LIVE_HISTORY_LIMIT = max(2, _env_int("LIVE_HISTORY_LIMIT", 100000))
+MAX_TOKENS = max(64, _env_int("MAX_TOKENS", 65536))
+MAX_REQUEST_LEN = max(100, _env_int("MAX_REQUEST_LEN", 1000000))
+TOOL_CONTEXT_MESSAGES = max(8, _env_int("TOOL_CONTEXT_MESSAGES", 100000))
+TOOL_MAX_ROUNDS = max(1, _env_int("TOOL_MAX_ROUNDS", 100000))
+REQUEST_TIMEOUT = max(10.0, _env_float("REQUEST_TIMEOUT", 600.0))
+AI_RETRY_ATTEMPTS = max(1, _env_int("AI_RETRY_ATTEMPTS", 5))
+AI_RETRY_DELAY = max(0.0, _env_float("AI_RETRY_DELAY", 1.0))
 COOLDOWN = max(0.0, _env_float("COOLDOWN", 0.0))
 BOT_NAME = _env_str("BOT_NAME", "DanyBOT")
 SYSTEM_PROMPT_FILE = _env_str("SYSTEM_PROMPT_FILE", "")
@@ -256,7 +258,7 @@ ai = AsyncOpenAI(
     base_url=DANYAPI_URL,
     api_key=DANYAPI_KEY,
     timeout=REQUEST_TIMEOUT,
-    max_retries=1,
+    max_retries=AI_RETRY_ATTEMPTS,
 )
 
 
